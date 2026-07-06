@@ -274,6 +274,8 @@ class WideBindStack(nn.Module):
         new_state = []
         for layer, s in zip(self.layers, state):
             h, s_out = layer(h, s)
+            if s_out is not None:
+                s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
         return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state
     
