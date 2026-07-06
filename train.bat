@@ -9,7 +9,7 @@ echo   Model: 41M params, 24 layers, B=2, L=128
 echo   VRAM: ~1.9 GB peak
 echo.
 
-python train.py ^
+start /b /wait "" python train.py ^
     --data-dir "C:\Users\black\OneDrive\Desktop\fcp" ^
     --save-dir checkpoints ^
     --batch-size 2 ^
@@ -22,7 +22,8 @@ python train.py ^
     --warmup 1000 ^
     --log-interval 100 ^
     --eval-interval 1000 ^
-    --save-interval 10000
+    --save-interval 10000 ^
+    --resume auto
 
 echo.
 echo [WideBind] Training finished.

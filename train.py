@@ -30,18 +30,13 @@ def get_batch(stream, seq_len, batch_size, offset):
 
 
 def create_lr_scheduler(optimizer, warmup, max_steps, lr):
-    """Linear warmup + cosine decay.
-    Возвращает множитель (0..1) для LambdaLR.
-    """
+    """Linear warmup + cosine decay (returns multiplier 0..1 for LambdaLR)."""
     def get_lr_mult(step):
         if step < warmup:
             return step / max(warmup, 1)
         progress = (step - warmup) / max(max_steps - warmup, 1)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
-    return scheduler
 
 
 def train(cfg=None, resume_path=None):
@@ -75,6 +70,12 @@ def train(cfg=None, resume_path=None):
     # Resume
     start_step = 0
     best_val_loss = float('inf')
+    if resume_path == 'auto':
+        # Find latest interrupt checkpoint
+        ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'interrupt_step_*.pt')))
+        if ckpts:
+            resume_path = ckpts[-1]
+            print(f'Auto-resuming from latest: {resume_path}')
     if resume_path and os.path.exists(resume_path):
         print(f'Resuming from {resume_path}')
         state = torch.load(resume_path, map_location=device)
@@ -96,54 +97,68 @@ def train(cfg=None, resume_path=None):
     t0 = time.time()
     
     print(f'Starting training from step {start_step}')
-    for step in range(start_step, cfg.max_steps):
-        model.train()
-        
-        # Cycle through streams
-        stream = streams[stream_idx]
-        x, y, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, offset)
-        if offset == 0:
-            stream_idx = (stream_idx + 1) % len(streams)
-            stream = streams[stream_idx]
-            _, _, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, 0)
-            state = None  # reset state on stream boundary
-        
-        x, y = x.to(device), y.to(device)
-        
-        # Forward
-        h = model.embed_tokens(x)
-        out, state = model(h, state)
-        loss = model.compute_loss(out, y)
-        
-        # Backward
-        optimizer.zero_grad()
-        loss.backward()
-        
-        # Clip gradients
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        
-        optimizer.step()
-        scheduler.step()
-        
-        tokens_seen += cfg.batch_size * cfg.seq_len
-        current_lr = base_lr * scheduler.get_last_lr()[0]
-        
-        # Log
-        if step % cfg.log_interval == 0:
-            dt = time.time() - t0
-            tok_s = tokens_seen / max(dt, 1e-8)
-            print(f'  step={step:>6} loss={loss.item():.4f} lr={current_lr:.2e} '
-                  f'tok/s={tok_s:.0f} mem={stream_idx}/{len(streams)}')
-        
-        # Eval
-        if step > 0 and step % cfg.eval_interval == 0:
-            val_loss = evaluate(model, streams, cfg, device)
-            print(f'  EVAL step={step}: val_loss={val_loss:.4f} val_ppl={math.exp(val_loss):.2f}')
+    print('Press Ctrl+C to save checkpoint and exit gracefully.')
+    try:
+        for step in range(start_step, cfg.max_steps):
+            model.train()
             
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_path = os.path.join(cfg.save_dir, f'best.pt')
+            # Cycle through streams
+            stream = streams[stream_idx]
+            x, y, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, offset)
+            if offset == 0:
+                stream_idx = (stream_idx + 1) % len(streams)
+                stream = streams[stream_idx]
+                _, _, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, 0)
+                state = None  # reset state on stream boundary
+            
+            x, y = x.to(device), y.to(device)
+            
+            # Forward
+            h = model.embed_tokens(x)
+            out, state = model(h, state)
+            loss = model.compute_loss(out, y)
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Clip gradients
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            tokens_seen += cfg.batch_size * cfg.seq_len
+            current_lr = base_lr * scheduler.get_last_lr()[0]
+            
+            # Log
+            if step % cfg.log_interval == 0:
+                dt = time.time() - t0
+                tok_s = tokens_seen / max(dt, 1e-8)
+                print(f'  step={step:>6} loss={loss.item():.4f} lr={current_lr:.2e} '
+                      f'tok/s={tok_s:.0f} mem={stream_idx}/{len(streams)}')
+            
+            # Eval
+            if step > 0 and step % cfg.eval_interval == 0:
+                val_loss = evaluate(model, streams, cfg, device)
+                print(f'  EVAL step={step}: val_loss={val_loss:.4f} val_ppl={math.exp(val_loss):.2f}')
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_path = os.path.join(cfg.save_dir, f'best.pt')
+                    torch.save({
+                        'step': step,
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'best_val_loss': best_val_loss,
+                        'cfg': cfg,
+                    }, save_path)
+                    print(f'  Saved best model to {save_path}')
+            
+            # Save
+            if step > 0 and step % cfg.save_interval == 0:
+                save_path = os.path.join(cfg.save_dir, f'step_{step}.pt')
                 torch.save({
                     'step': step,
                     'model': model.state_dict(),
@@ -151,19 +166,20 @@ def train(cfg=None, resume_path=None):
                     'best_val_loss': best_val_loss,
                     'cfg': cfg,
                 }, save_path)
-                print(f'  Saved best model to {save_path}')
-        
-        # Save
-        if step > 0 and step % cfg.save_interval == 0:
-            save_path = os.path.join(cfg.save_dir, f'step_{step}.pt')
-            torch.save({
-                'step': step,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'best_val_loss': best_val_loss,
-                'cfg': cfg,
-            }, save_path)
-            print(f'  Saved checkpoint to {save_path}')
+                print(f'  Saved checkpoint to {save_path}')
+    except KeyboardInterrupt:
+        print('\n[WideBind] Ctrl+C detected, saving checkpoint...')
+        save_path = os.path.join(cfg.save_dir, f'interrupt_step_{step}.pt')
+        torch.save({
+            'step': step,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'best_val_loss': best_val_loss,
+            'cfg': cfg,
+        }, save_path)
+        print(f'[WideBind] Saved interrupt checkpoint to {save_path}')
+        print('[WideBind] Exiting gracefully.')
+        sys.exit(0)
     
     print('Training complete!')
 
