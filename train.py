@@ -68,7 +68,7 @@ def train(cfg=None, resume_path=None):
             print('[WideBind] OOM on first attempt, clearing cache and retrying...')
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            import time; time.sleep(1)
+            time.sleep(1)
             model = WideBindStack(cfg).to(device)
         else:
             raise
@@ -79,7 +79,6 @@ def train(cfg=None, resume_path=None):
     param_groups = model.param_groups()
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
     scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
-    base_lr = cfg.lr
     
     # Resume
     start_step = 0
@@ -144,7 +143,7 @@ def train(cfg=None, resume_path=None):
             scheduler.step()
             
             tokens_seen += cfg.batch_size * cfg.seq_len
-            current_lr = base_lr * scheduler.get_last_lr()[0]
+            current_lr = scheduler.get_last_lr()[0]
             
             # Log
             if step % cfg.log_interval == 0:
