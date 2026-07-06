@@ -46,6 +46,10 @@ def train(cfg=None, resume_path=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.float32  # no AMP for stability
     
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
     # Data
     print(f'Loading data from {cfg.data_dir}')
     stream_files = sorted(glob.glob(os.path.join(cfg.data_dir, 'token_stream_*.bin')))
@@ -56,8 +60,18 @@ def train(cfg=None, resume_path=None):
     total_tokens = sum(len(s) for s in streams)
     print(f'Found {len(streams)} files, {total_tokens:,} total tokens')
     
-    # Model
-    model = WideBindStack(cfg).to(device)
+    # Model (retry once on OOM — transient CUDA context cleanup)
+    try:
+        model = WideBindStack(cfg).to(device)
+    except RuntimeError as e:
+        if 'out of memory' in str(e) and device == 'cuda':
+            print('[WideBind] OOM on first attempt, clearing cache and retrying...')
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            import time; time.sleep(1)
+            model = WideBindStack(cfg).to(device)
+        else:
+            raise
     n_params = model.param_count()
     print(f'Model: {n_params:,} params ({n_params/1e6:.2f}M)')
     
