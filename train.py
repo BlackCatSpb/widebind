@@ -30,12 +30,15 @@ def get_batch(stream, seq_len, batch_size, offset):
 
 
 def create_lr_scheduler(optimizer, warmup, max_steps, lr):
-    """Linear warmup + cosine decay."""
-    def get_lr(step):
+    """Linear warmup + cosine decay.
+    Возвращает множитель (0..1) для LambdaLR.
+    """
+    def get_lr_mult(step):
         if step < warmup:
-            return lr * step / max(warmup, 1)
+            return step / max(warmup, 1)
         progress = (step - warmup) / max(max_steps - warmup, 1)
-        return lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
     return scheduler
@@ -67,6 +70,7 @@ def train(cfg=None, resume_path=None):
     param_groups = model.param_groups()
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
     scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
+    base_lr = cfg.lr
     
     # Resume
     start_step = 0
@@ -123,7 +127,7 @@ def train(cfg=None, resume_path=None):
         scheduler.step()
         
         tokens_seen += cfg.batch_size * cfg.seq_len
-        current_lr = scheduler.get_last_lr()[0]
+        current_lr = base_lr * scheduler.get_last_lr()[0]
         
         # Log
         if step % cfg.log_interval == 0:
