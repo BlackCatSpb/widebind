@@ -125,12 +125,15 @@ class CognitiveMirror(nn.Module):
     """
     Unified self-consistency mirror with three bounded correction paths.
     
-    Measures token h[t] against three references of internal consistency:
+    Local (per-layer) paths:
       1. Temporal:   h[t] - memory centroid    (VSA prediction error)
       2. Smoothness: h[t] - conv1x3(h[t])      (local coherence)
       3. Symmetry:   h[t] . h[t-1]              (bilinear trajectory)
     
-    All three in K-space -> rms_norm -> tanh(W_out) -> exp(log_scale).
+    Global (cross-layer) path:
+      - h[t] - global_state                     (deviation from global self-model)
+    
+    All paths in K-space -> rms_norm -> tanh(W_out) -> exp(log_scale).
     tanh guarantees bounded correction; exp(log_scale) gives per-dim amplitude.
     """
     def __init__(self, D, K):
@@ -141,6 +144,7 @@ class CognitiveMirror(nn.Module):
         self.W_out = nn.Parameter(torch.randn(K, D) * proj_std)
         
         self.w_temp = nn.Parameter(torch.randn(K))
+        self.w_global = nn.Parameter(torch.randn(K))
         
         self.conv_smooth = nn.Conv1d(K, K, 3, padding=2, groups=K, bias=False)
         nn.init.dirac_(self.conv_smooth.weight)
@@ -150,16 +154,21 @@ class CognitiveMirror(nn.Module):
         
         self.log_scale = nn.Parameter(torch.zeros(D))
     
-    def forward(self, h, mem_all):
+    def forward(self, h, mem_all, global_state=None):
         B, L, D = h.shape
         K = self.W_proj.shape[1]
         
         hp = h @ self.W_proj  # (B, L, K)
         
-        # 1. Temporal: deviation from memory centroid
+        # 1. Temporal: deviation from local memory centroid
         mem_centroid = mem_all.mean(dim=1, keepdim=True)
         mc_k = mem_centroid @ self.W_proj
         temp_k = (hp - mc_k) * self.w_temp
+        
+        # 1b. Global: deviation from cross-layer state
+        if global_state is not None:
+            gs_k = global_state @ self.W_proj
+            temp_k = temp_k + (hp - gs_k) * self.w_global
         
         # 2. Smoothness: local coherence via conv1x3
         hp_perm = hp.transpose(1, 2)
@@ -244,7 +253,7 @@ class WideBindBlock(nn.Module):
         nn.init.xavier_uniform_(self.mlp_down.weight)
         self.register_buffer('mlp_norm_w', torch.ones(cfg.D))
     
-    def forward(self, h, state=None):
+    def forward(self, h, state=None, global_state=None):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -283,8 +292,8 @@ class WideBindBlock(nn.Module):
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
         
-        # ─── Mirror (self-consistency) ───
-        mirror = self.mirror(h, mem_all)
+        # ─── Mirror (self-consistency: local + global) ───
+        mirror = self.mirror(h, mem_all, global_state=global_state)
         
         # ─── Output ───
         enhanced = bind_out + mem_read * self.w_mem2v + mirror
@@ -323,12 +332,22 @@ class WideBindStack(nn.Module):
         """h: (B, L, D) — pre-embedded tokens"""
         if state is None:
             state = [None] * len(self.layers)
+        B, L, D = h.shape
+        
+        # Global self-model: running EMA of layer memory centroids
+        global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
+        
         new_state = []
         for layer, s in zip(self.layers, state):
-            h, s_out = layer(h, s)
+            h, s_out = layer(h, s, global_state=global_state)
             if s_out is not None:
+                mem_out = s_out[0]  # (B, D) — layer's final memory state
+                # Update global state: leaky aggregation of layer memories
+                mem_avg = mem_out.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
+                global_state = 0.95 * global_state + 0.05 * mem_avg
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
+        
         return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state
     
     def embed_tokens(self, tokens):
