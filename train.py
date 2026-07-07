@@ -6,9 +6,12 @@ import os, sys, math, time, json, glob, pickle
 import torch
 import torch.nn.functional as F
 import numpy as np
+from torch.serialization import add_safe_globals
 
 from config import WideBindConfig
 from core import WideBindStack
+
+add_safe_globals([WideBindConfig])
 
 
 def load_token_stream(path):
@@ -84,18 +87,29 @@ def train(cfg=None, resume_path=None):
     start_step = 0
     best_val_loss = float('inf')
     if resume_path == 'auto':
-        # Find latest interrupt checkpoint
+        # Find latest checkpoint: interrupt > step_* > best
         ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'interrupt_step_*.pt')))
+        if not ckpts:
+            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'step_*.pt')))
+        if not ckpts:
+            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'best.pt')))
         if ckpts:
             resume_path = ckpts[-1]
             print(f'Auto-resuming from latest: {resume_path}')
     if resume_path and os.path.exists(resume_path):
         print(f'Resuming from {resume_path}')
-        state = torch.load(resume_path, map_location=device)
-        model.load_state_dict(state['model'])
-        optimizer.load_state_dict(state['optimizer'])
-        start_step = state['step']
-        best_val_loss = state.get('best_val_loss', float('inf'))
+        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        else:
+            # Old checkpoint without scheduler state — restore LR from step number
+            scheduler.last_epoch = ckpt['step'] + 1
+            for pg, lr in zip(optimizer.param_groups, scheduler.get_lr()):
+                pg['lr'] = lr
+        start_step = ckpt['step']
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
     
     # State for recurrent layers
     state = None
@@ -166,6 +180,7 @@ def train(cfg=None, resume_path=None):
                         'step': step,
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
                         'best_val_loss': best_val_loss,
                         'cfg': cfg,
                     }, save_path)
@@ -178,6 +193,7 @@ def train(cfg=None, resume_path=None):
                     'step': step,
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                     'cfg': cfg,
                 }, save_path)
@@ -189,6 +205,7 @@ def train(cfg=None, resume_path=None):
             'step': step,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'best_val_loss': best_val_loss,
             'cfg': cfg,
         }, save_path)
