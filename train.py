@@ -156,6 +156,8 @@ def train(cfg=None, resume_path=None):
             if step > 0 and step % cfg.eval_interval == 0:
                 val_loss = evaluate(model, streams, cfg, device)
                 print(f'  EVAL step={step}: val_loss={val_loss:.4f} val_ppl={math.exp(val_loss):.2f}')
+                if device == 'cuda':
+                    torch.cuda.empty_cache()  # defrag after eval
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss

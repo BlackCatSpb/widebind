@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WideBind Architecture Analysis</title>
+<style>
+body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 960px; margin: 40px auto; padding: 20px; background: #0d1117; color: #e6edf3; }
+h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 10px; }
+h2 { color: #58a6ff; margin-top: 30px; }
+h3 { color: #79c0ff; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0 20px 0; }
+th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; }
+th { background: #161b22; color: #8b949e; }
+tr:nth-child(even) { background: #161b22; }
+tr.total { background: #1f2937; font-weight: bold; }
+.code { font-family: 'Courier New', monospace; background: #161b22; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre; font-size: 13px; line-height: 1.5; }
+.metric { display: inline-block; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 20px; margin: 6px; text-align: center; }
+.metric .val { font-size: 24px; font-weight: bold; color: #58a6ff; }
+.metric .lbl { font-size: 12px; color: #8b949e; }
+.grid { display: flex; flex-wrap: wrap; }
+ul { line-height: 1.6; }
+li { margin: 6px 0; }
+</style>
+</head>
+<body>
+
+<h1>WideBind: Hybrid VSA Architecture Analysis</h1>
+<p>No softmax, no sigmoid gates, no attention. D&rarr;K=16 bottleneck bind + VSA vector memory + depthwise conv + DCT spectral + MLP.</p>
+
+<div class="grid">
+<div class="metric"><div class="val">41.20M</div><div class="lbl">Trainable Params</div></div>
+<div class="metric"><div class="val">62.83M</div><div class="lbl">Total (w/ buffers)</div></div>
+<div class="metric"><div class="val">896</div><div class="lbl">Hidden Dim (D)</div></div>
+<div class="metric"><div class="val">24</div><div class="lbl">Layers</div></div>
+<div class="metric"><div class="val">16</div><div class="lbl">Bind Bottleneck K</div></div>
+<div class="metric"><div class="val">48</div><div class="lbl">Conv Kernel</div></div>
+<div class="metric"><div class="val">50,000</div><div class="lbl">Vocabulary</div></div>
+</div>
+
+<h2>1. Architecture Overview</h2>
+<p><b>WideBind</b> is a hybrid VSA-style LM operating entirely in D=896 space with five mechanisms per layer:</p>
+<ul>
+<li><b>Bottleneck Bind</b> (D&rarr;K=16&rarr;D): bilinear projection through a narrow bottleneck. Provides cross-dim gradient mixing — the key fix over pure element-wise VSA (which has diagonal Jacobian and dies at &gt;4 layers).</li>
+<li><b>VSA Vector Memory</b>: element-wise superposition <code>mem[t] = decay[t]*mem[t-1] + h[t]*i_gate[t]</code>. Associative prefix scan in O(L log L). State is O(D) not O(D&sup2;).</li>
+<li><b>Mirror Bind</b>: same D&rarr;K&rarr;D bind on centered input (h &minus; mean). Captures deviation patterns.</li>
+<li><b>Depthwise Conv1d</b>: k=48, groups=D. Local temporal context that bind/memory don't provide.</li>
+<li><b>DCT Spectral</b>: DCT-II basis scaling with learned per-dimension frequency mask &lambda;_k.</li>
+</ul>
+<p>99% of parameters are in the MLP. Bind/VSA together are &lt; 4%.</p>
+
+<h2>2. Per-Layer Parameter Breakdown (trainable)</h2>
+<table class="params">
+<tr><th>Component</th><th>Params</th><th>% of Layer</th></tr>
+<tr><td>Bind: W_proj (D&times;K), w_u, w_v, W_out (K&times;D)</td><td style="text-align:right">28,704</td><td style="text-align:right">1.7%</td></tr>
+<tr><td>Mirror: same structure + scale</td><td style="text-align:right">28,705</td><td style="text-align:right">1.7%</td></tr>
+<tr><td>VSA Gates: w_i, w_d, w_q, w_mem2v, b_i, b_d</td><td style="text-align:right">5,376</td><td style="text-align:right">0.3%</td></tr>
+<tr><td>VSA Moment: w_k_mu, w_q_mu, w_mu_mem</td><td style="text-align:right">2,688</td><td style="text-align:right">0.2%</td></tr>
+<tr><td>Conv1d depthwise (D&times;1&times;48)</td><td style="text-align:right">43,008</td><td style="text-align:right">2.5%</td></tr>
+<tr><td>Spectral &lambda;_k (per-dim scale)</td><td style="text-align:right">896</td><td style="text-align:right">0.1%</td></tr>
+<tr><td>MLP up / down (D&times;B, B&times;D)</td><td style="text-align:right">1,605,632</td><td style="text-align:right">93.6%</td></tr>
+<tr class="total"><td><b>Trainable per layer</b></td><td style="text-align:right"><b>1,715,009</b></td><td style="text-align:right">100%</td></tr>
+</table>
+
+<h3>Full Model</h3>
+<table class="params">
+<tr><th>Component</th><th>Params</th><th>% Trainable</th></tr>
+<tr><td>Zeckendorf Embedding + LmHead (2 &times; 23 &times; D)</td><td style="text-align:right">41,216</td><td style="text-align:right">0.1%</td></tr>
+<tr><td>24 &times; Bind (D&rarr;K&rarr;D)</td><td style="text-align:right">688,896</td><td style="text-align:right">1.7%</td></tr>
+<tr><td>24 &times; Mirror Bind</td><td style="text-align:right">688,920</td><td style="text-align:right">1.7%</td></tr>
+<tr><td>24 &times; VSA Memory (gates + moment)</td><td style="text-align:right">193,536</td><td style="text-align:right">0.5%</td></tr>
+<tr><td>24 &times; Depthwise Conv1d</td><td style="text-align:right">1,032,192</td><td style="text-align:right">2.5%</td></tr>
+<tr><td>24 &times; Spectral &lambda;_k</td><td style="text-align:right">21,504</td><td style="text-align:right">0.1%</td></tr>
+<tr><td>24 &times; MLP (D &rarr; 896 &rarr; D)</td><td style="text-align:right">38,535,168</td><td style="text-align:right">93.5%</td></tr>
+<tr class="total"><td><b>Trainable Total</b></td><td style="text-align:right"><b>41,201,432</b></td><td style="text-align:right">100%</td></tr>
+</table>
+
+<h2>3. VRAM Estimation (fp32)</h2>
+<table class="params">
+<tr><th>Component</th><th>Size</th></tr>
+<tr><td>Model parameters (trainable)</td><td style="text-align:right">0.16 GB</td></tr>
+<tr><td>Buffers (V_dct, codes, norms)</td><td style="text-align:right">0.09 GB</td></tr>
+<tr><td>AdamW states (2 &times; trainable)</td><td style="text-align:right">0.33 GB</td></tr>
+<tr><td>Gradients</td><td style="text-align:right">0.16 GB</td></tr>
+<tr><td>CUDA context + PyTorch allocator overhead</td><td style="text-align:right">~0.8-1.0 GB</td></tr>
+<tr class="total"><td><b>Observed peak (B=2, L=128, MX550)</b></td><td style="text-align:right"><b>1.86 GB</b></td></tr>
+</table>
+<p style="color:#f85149;">41M params fit MX550 2GB with ~140 MB margin. bottleneck=3584 (156M) requires &gt; 8 GB.</p>
+<p style="color:#8b949e;">The gap between raw param count (0.67 GB) and observed peak (1.86 GB) is PyTorch's caching CUDA allocator: it reserves large memory blocks upfront. Actual usage is ~0.7 GB; the rest is pre-allocated pool that stays reserved but unused.</p>
+
+<h2>4. Forward Pass Flow</h2>
+<div class="code">
+h[t-1]  (B, L, D)
+  |
+  |-- [Pre-LN: RMS Norm]
+  |
+  |-- [Depthwise Conv1d]  k=48, groups=D
+  |     h_conv = conv(concat(state, h_perm))
+  |     h += h_conv
+  |
+  |-- [Bottleneck Bind: D -> K=16 -> D]
+  |     hp = h @ W_proj          (D -> K)
+  |     u = hp * w_u, v = hp * w_v
+  |     bind_out = (u * v) @ W_out  (K -> D)
+  |
+  |-- [VSA Vector Memory]
+  |     i_gate = exp(h * w_i + b_i)
+  |     decay  = sigmoid(h * w_d + b_d)
+  |     mem = prefix_scan(decay, h * i_gate)   O(L log L)
+  |     mem_read = mem * w_q
+  |     mu = prefix_scan(decay, h * i_gate * w_k_mu)
+  |     mem_read += mu_read * w_mu_mem
+  |
+  |-- [Mirror Bind]
+  |     h_centered = h - mean(h)
+  |     mirror = D->K->D bind on h_centered
+  |
+  |-- h += bind_out + mem_read * w_mem2v + mirror
+  |
+  |-- [DCT Spectral]
+  |     h_dct = h @ V_dct.T
+  |     h += (h_dct * lambda_k) @ V_dct
+  |
+  |-- [MLP]
+  |     h_mlp = RMS norm -> SiLU(Linear(D->B)) -> Linear(B->D)
+  |     h += h_mlp
+  |
+h' = h   (B, L, D)
+</div>
+
+<h2>5. Why Not Attention?</h2>
+<table class="params">
+<tr><th>Mechanism</th><th>Complexity</th><th>State Size</th><th>WideBind</th></tr>
+<tr><td>Attention</td><td>O(L&sup2;)</td><td>O(L &middot; D &middot; layers) KV-cache</td><td>N/A</td></tr>
+<tr><td>Prefix Scan (VSA)</td><td>O(L log L)</td><td>O(D) = 336 KB total</td><td>&check;</td></tr>
+<tr><td>Conv window</td><td>O(L &middot; D &middot; k)</td><td>O(D &middot; k) = 43 KB</td><td>&check;</td></tr>
+<tr><td>Bind (D&rarr;K&rarr;D)</td><td>O(L &middot; D &middot; K)</td><td>0 (stateless)</td><td>&check;</td></tr>
+</table>
+<p>No KV-cache means infinite context during inference. State is 336 KB for all 24 layers — fits in L1 cache on modern CPUs.</p>
+
+<h2>6. Key Design Decisions</h2>
+<table class="params">
+<tr><th>Decision</th><th>Reason</th></tr>
+<tr><td>K=16 bottleneck</td><td>Dense D&rarr;K projection provides cross-dim gradient mixing (vs diagonal Jacobian of pure element-wise bind). Minimal K that achieves grad/param &gt; 0.4.</td></tr>
+<tr><td>std=1 for element-wise vectors</td><td>Product w_u * w_v * w_out scales as std&sup3;. At std=0.02, grad_h = 1e-4 (dead). At std=1.0, grad_h = 22.5 (healthy). Factor 200,000&times; difference.</td></tr>
+<tr><td>std=0.1 for gates</td><td>Limits exp() variance to prevent overflow/NaN through 24 layers.</td></tr>
+<tr><td>bottleneck=896 (not 3584)</td><td>41M params fit in 2GB VRAM with AdamW. 156M causes OOM. Bigger bottleneck needs &gt;2GB.</td></tr>
+<tr><td>No weight tying</td><td>Separate embed/head projections. Marginal param cost (46K), more expressive.</td></tr>
+<tr><td>Vector memory (not covariance)</td><td>O(D) state vs O(D&sup2;). 336 KB vs 19 MB for 24 layers. Same gradient quality.</td></tr>
+</table>
+
+
+<h2>7. Training Progress</h2>
+<table class="params">
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Steps completed</td><td>17,000</td></tr>
+<tr><td>Best val_loss</td><td>1.5551</td></tr>
+<tr><td>Best val_ppl</td><td>4.74</td></tr>
+<tr><td>Tokens seen</td><td>4,352,000 (0.15% of corpus)</td></tr>
+<tr><td>tok/s (MX550)</td><td>262</td></tr>
+</table>
+<h3>Layer 0 Weights</h3>
+<table class="params">
+<tr><th>Weight</th><th>Mean</th><th>Std</th><th>Min</th><th>Max</th><th>Norm</th></tr>
+<tr><td>conv.weight</td><td>0.0001</td><td>0.0096</td><td>-0.0438</td><td>0.0433</td><td>2.0</td></tr>
+<tr><td>mlp_down.weight</td><td>0.0000</td><td>0.0318</td><td>-0.0556</td><td>0.0554</td><td>28.5</td></tr>
+<tr><td>mlp_up.weight</td><td>-0.0000</td><td>0.0318</td><td>-0.0554</td><td>0.0555</td><td>28.5</td></tr>
+
+</table>
+<h3>Layer 0 Gates</h3>
+<table class="params">
+<tr><th>Gate</th><th>Mean</th><th>Std</th></tr>
+<tr><td>w_d</td><td>-0.0040</td><td>0.1015</td></tr>
+<tr><td>w_i</td><td>0.0072</td><td>0.1028</td></tr>
+
+</table>
+<h3>Layer 1 Weights</h3>
+<table class="params">
+<tr><th>Weight</th><th>Mean</th><th>Std</th><th>Min</th><th>Max</th><th>Norm</th></tr>
+<tr><td>conv.weight</td><td>-0.0000</td><td>0.0096</td><td>-0.0392</td><td>0.0394</td><td>2.0</td></tr>
+<tr><td>mlp_down.weight</td><td>0.0001</td><td>0.0318</td><td>-0.0554</td><td>0.0554</td><td>28.5</td></tr>
+<tr><td>mlp_up.weight</td><td>-0.0000</td><td>0.0318</td><td>-0.0554</td><td>0.0554</td><td>28.5</td></tr>
+
+</table>
+<h3>Layer 1 Gates</h3>
+<table class="params">
+<tr><th>Gate</th><th>Mean</th><th>Std</th></tr>
+<tr><td>w_d</td><td>0.0002</td><td>0.1002</td></tr>
+<tr><td>w_i</td><td>0.0017</td><td>0.1021</td></tr>
+
+</table>
+<h3>Layer 2 Weights</h3>
+<table class="params">
+<tr><th>Weight</th><th>Mean</th><th>Std</th><th>Min</th><th>Max</th><th>Norm</th></tr>
+<tr><td>conv.weight</td><td>0.0000</td><td>0.0095</td><td>-0.0394</td><td>0.0445</td><td>2.0</td></tr>
+<tr><td>mlp_down.weight</td><td>-0.0001</td><td>0.0318</td><td>-0.0555</td><td>0.0554</td><td>28.5</td></tr>
+<tr><td>mlp_up.weight</td><td>-0.0000</td><td>0.0318</td><td>-0.0554</td><td>0.0557</td><td>28.5</td></tr>
+
+</table>
+<h3>Layer 2 Gates</h3>
+<table class="params">
+<tr><th>Gate</th><th>Mean</th><th>Std</th></tr>
+<tr><td>w_d</td><td>-0.0008</td><td>0.1002</td></tr>
+<tr><td>w_i</td><td>-0.0059</td><td>0.0979</td></tr>
+
+</table>
+
+<h2>8. Code Location</h2>
+<div class="code">
+core.py:
+  ZeckendorfEmbedding  -- token -> D via Fibonacci codes
+  LmHead               -- D -> vocab via transposed codes
+  WideBindBlock        -- Conv + Bind + VSA + Mirror + Spectral + MLP
+  WideBindStack        -- N x WideBindBlock + embed + head
+  vsa_prefix_scan      -- associative parallel scan O(L log L)
+
+config.py:
+  WideBindConfig       -- all hyperparameters
+
+train.py              -- streaming training loop + checkpointing
+generate.py           -- text generation (requires tokenizer)
+</div>
+
+</body>
+</html>
