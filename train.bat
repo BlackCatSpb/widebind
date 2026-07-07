@@ -25,6 +25,7 @@ start /b /wait "" python train.py ^
     --log-interval 100 ^
     --eval-interval 1000 ^
     --save-interval 5000 ^
+    --scheduler mirror ^
     --resume auto
 
 echo.

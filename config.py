@@ -21,6 +21,9 @@ class WideBindConfig:
     mlp_groups: int = 8
     mlp_expand: int = 8
 
+    # Scheduler
+    scheduler: str = 'mirror'
+
     # Conv
     conv_kernel: int = 48
 

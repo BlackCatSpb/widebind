@@ -185,6 +185,8 @@ class CognitiveMirror(nn.Module):
         mirror = torch.tanh(delta @ self.W_out)
         mirror = mirror * torch.exp(self.log_scale)
         
+        self._last_magnitude = mirror.abs().mean().item()
+        
         return mirror
 
 
@@ -415,6 +417,70 @@ class WideBindStack(nn.Module):
             {'params': decay, 'lr': lr, 'weight_decay': wd},
             {'params': no_decay, 'lr': lr, 'weight_decay': 0},
         ]
+
+
+# ─── Mirror-Adaptive LR Scheduler ────────────────────────────────────
+
+class MirrorLRScheduler:
+    """LR scheduler modulated by cognitive mirror state dynamics.
+
+    Two signals:
+    1. var(log_scale) — per-dim amplitude divergence. Starts at 0, grows
+       as mirror learns which dimensions to amplify/suppress. LR decays
+       proportionally to var / target_var.
+    2. |mirror| — mean absolute mirror correction magnitude. Large when
+       model is unstable, shrinks at convergence. Caps LR.
+
+    LR_mult = max(0.05, (1 - var/target) * min(1, mag/threshold))
+    """
+    def __init__(self, model, optimizer, base_lr, warmup=1000,
+                 target_var=0.1, mag_threshold=0.3, lr_min_ratio=0.05):
+        self.model = model
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.warmup = warmup
+        self.target_var = target_var
+        self.mag_threshold = mag_threshold
+        self.lr_min_ratio = lr_min_ratio
+        self._step = 0
+        self._last_log = 0
+
+    def _mirror_stats(self):
+        var_sum = 0.0
+        mag_sum = 0.0
+        for layer in self.model.layers:
+            ls = layer.mirror.log_scale.data
+            var_sum += ls.var().item()
+            if hasattr(layer.mirror, '_last_magnitude'):
+                mag_sum += layer.mirror._last_magnitude
+        n = len(self.model.layers)
+        return var_sum / n, mag_sum / n
+
+    def step(self):
+        self._step += 1
+        if self._step < self.warmup:
+            mult = self._step / max(self.warmup, 1)
+        else:
+            var, mag = self._mirror_stats()
+            decay = 1.0 - min(1.0, var / max(self.target_var, 1e-10))
+            mag_factor = min(1.0, max(self.lr_min_ratio, mag / max(self.mag_threshold, 1e-10)))
+            mult = max(self.lr_min_ratio, decay * mag_factor)
+
+            if self._step - self._last_log >= 500:
+                self._last_log = self._step
+                print(f'  lr_adapt: var(ls)={var:.6f} |mirror|={mag:.4f} mult={mult:.4f} lr={self.base_lr*mult:.2e}')
+
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.base_lr * mult
+
+    def get_last_lr(self):
+        return [pg['lr'] for pg in self.optimizer.param_groups]
+
+    def state_dict(self):
+        return {'step': self._step, 'type': 'MirrorLRScheduler'}
+
+    def load_state_dict(self, sd):
+        self._step = sd.get('step', 0)
 
 
 # ─── Verify ────────────────────────────────────────────────────────────

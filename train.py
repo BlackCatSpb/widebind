@@ -9,7 +9,7 @@ import numpy as np
 from torch.serialization import add_safe_globals
 
 from config import WideBindConfig
-from core import WideBindStack
+from core import WideBindStack, MirrorLRScheduler
 from analyze_checkpoint import generate_report
 
 add_safe_globals([WideBindConfig])
@@ -82,7 +82,14 @@ def train(cfg=None, resume_path=None):
     # Optimizer
     param_groups = model.param_groups()
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
-    scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
+    
+    # Scheduler: mirror-adaptive or cosine
+    if cfg.scheduler == 'mirror':
+        scheduler = MirrorLRScheduler(model, optimizer, cfg.lr, warmup=cfg.warmup_steps)
+        print(f'Scheduler: MirrorLRScheduler (target_var=0.1, mag_threshold=0.3)')
+    else:
+        scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
+        print(f'Scheduler: cosine decay')
     
     # Resume
     start_step = 0
@@ -107,12 +114,22 @@ def train(cfg=None, resume_path=None):
             print(f'  Unexpected keys (old arch): {len(unexpected)}')
         optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler'])
+            sched_sd = ckpt['scheduler']
+            if sched_sd.get('type') == 'MirrorLRScheduler':
+                scheduler.load_state_dict(sched_sd)
+            elif cfg.scheduler == 'mirror':
+                # Switching from cosine to mirror — use step only
+                scheduler._step = ckpt['step']
+                print(f'  Switched to MirrorLRScheduler at step {ckpt["step"]}')
+            else:
+                scheduler.load_state_dict(sched_sd)
         else:
-            # Old checkpoint without scheduler state — restore LR from step number
-            scheduler.last_epoch = ckpt['step'] + 1
-            for pg, lr in zip(optimizer.param_groups, scheduler.get_lr()):
-                pg['lr'] = lr
+            if cfg.scheduler == 'mirror':
+                scheduler._step = ckpt['step']
+            else:
+                scheduler.last_epoch = ckpt['step'] + 1
+                for pg, lr in zip(optimizer.param_groups, scheduler.get_lr()):
+                    pg['lr'] = lr
         start_step = ckpt['step']
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
     
@@ -269,6 +286,7 @@ if __name__ == '__main__':
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--eval-interval', type=int, default=1000)
     parser.add_argument('--save-interval', type=int, default=5000)
+    parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
     args = parser.parse_args()
     
     cfg = WideBindConfig(
@@ -287,6 +305,7 @@ if __name__ == '__main__':
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
+        scheduler=args.scheduler,
     )
     
     train(cfg, resume_path=args.resume)
