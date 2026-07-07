@@ -12,11 +12,11 @@ from config import WideBindConfig
 # ─── Utilities ──────────────────────────────────────────────────────────
 
 def dct_basis(n):
-    """DCT-II basis vectors of shape (n, n)."""
+    """DCT-II basis vectors of shape (n, n) — orthogonal rows."""
     k = torch.arange(n, dtype=torch.float32)
     v = k.unsqueeze(1) * (k.unsqueeze(0) + 0.5)
     basis = torch.cos(v * math.pi / n)
-    basis[:, 0] = basis[:, 0] / math.sqrt(2)
+    basis[0, :] = basis[0, :] / math.sqrt(2)
     return basis * math.sqrt(2.0 / n)
 
 
@@ -119,6 +119,66 @@ class LmHead(nn.Module):
         return self.proj(h) @ self.codes.T
 
 
+# ─── Cognitive Mirror ─────────────────────────────────────────────────
+
+class CognitiveMirror(nn.Module):
+    """
+    Unified self-consistency mirror with three bounded correction paths.
+    
+    Measures token h[t] against three references of internal consistency:
+      1. Temporal:   h[t] - memory centroid    (VSA prediction error)
+      2. Smoothness: h[t] - conv1x3(h[t])      (local coherence)
+      3. Symmetry:   h[t] . h[t-1]              (bilinear trajectory)
+    
+    All three in K-space -> rms_norm -> tanh(W_out) -> exp(log_scale).
+    tanh guarantees bounded correction; exp(log_scale) gives per-dim amplitude.
+    """
+    def __init__(self, D, K):
+        super().__init__()
+        proj_std = 1.0 / (D * K) ** 0.25
+        
+        self.W_proj = nn.Parameter(torch.randn(D, K) * proj_std)
+        self.W_out = nn.Parameter(torch.randn(K, D) * proj_std)
+        
+        self.w_temp = nn.Parameter(torch.randn(K))
+        
+        self.conv_smooth = nn.Conv1d(K, K, 3, padding=2, groups=K, bias=False)
+        nn.init.dirac_(self.conv_smooth.weight)
+        
+        self.w_sym_u = nn.Parameter(torch.randn(K))
+        self.w_sym_v = nn.Parameter(torch.randn(K))
+        
+        self.log_scale = nn.Parameter(torch.zeros(D))
+    
+    def forward(self, h, mem_all):
+        B, L, D = h.shape
+        K = self.W_proj.shape[1]
+        
+        hp = h @ self.W_proj  # (B, L, K)
+        
+        # 1. Temporal: deviation from memory centroid
+        mem_centroid = mem_all.mean(dim=1, keepdim=True)
+        mc_k = mem_centroid @ self.W_proj
+        temp_k = (hp - mc_k) * self.w_temp
+        
+        # 2. Smoothness: local coherence via conv1x3
+        hp_perm = hp.transpose(1, 2)
+        hp_smooth = self.conv_smooth(hp_perm)[:, :, :L].transpose(1, 2)
+        smooth_k = hp - hp_smooth
+        
+        # 3. Symmetry: h[t] . h[t-1] bilinear
+        hp_prev = torch.cat([hp[:, 0:1], hp[:, :-1]], dim=1)
+        sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
+        
+        delta = temp_k + smooth_k + sym_k
+        delta = F.rms_norm(delta, (K,))
+        
+        mirror = torch.tanh(delta @ self.W_out)
+        mirror = mirror * torch.exp(self.log_scale)
+        
+        return mirror
+
+
 # ─── WideBind Block ────────────────────────────────────────────────────
 
 class WideBindBlock(nn.Module):
@@ -151,20 +211,16 @@ class WideBindBlock(nn.Module):
         self.w_v = nn.Parameter(torch.randn(cfg.bind_K))
         self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
         
-        # Mirror bind
-        self.W_proj_m = nn.Parameter(torch.randn(cfg.D, cfg.bind_K) * proj_std)
-        self.w_u_m = nn.Parameter(torch.randn(cfg.bind_K))
-        self.w_v_m = nn.Parameter(torch.randn(cfg.bind_K))
-        self.W_out_m = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
-        self.mirror_scale = nn.Parameter(torch.tensor(0.1))
+        # Cognitive Mirror (self-consistency correction)
+        self.mirror = CognitiveMirror(cfg.D, cfg.bind_K)
         
         # ─── VSA Memory (gates) ───
-        self.w_i = nn.Parameter(torch.randn(cfg.D) * 0.1)
-        self.w_d = nn.Parameter(torch.randn(cfg.D) * 0.1)
+        self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
+        self.w_d = nn.Parameter(torch.randn(cfg.D) * 0.1)    # content-dependent decay
         self.w_q = nn.Parameter(torch.randn(cfg.D))
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         self.b_i = nn.Parameter(torch.full((cfg.D,), 1.0))
-        self.b_d = nn.Parameter(torch.zeros(cfg.D))
+        self.b_d = nn.Parameter(torch.full((cfg.D,), 5.0))    # high init → τ ≈ 150
         
         # First moment
         self.w_k_mu = nn.Parameter(torch.randn(cfg.D))
@@ -227,12 +283,8 @@ class WideBindBlock(nn.Module):
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
         
-        # ─── Mirror ───
-        h_centered = h - h.mean(dim=1, keepdim=True)
-        hp_m = h_centered @ self.W_proj_m
-        mirror_u = (h @ self.W_proj_m) * self.w_v_m
-        mirror = ((hp_m * self.w_u_m) * mirror_u) @ self.W_out_m
-        mirror = mirror * self.mirror_scale
+        # ─── Mirror (self-consistency) ───
+        mirror = self.mirror(h, mem_all)
         
         # ─── Output ───
         enhanced = bind_out + mem_read * self.w_mem2v + mirror

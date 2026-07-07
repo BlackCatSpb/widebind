@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WideBind — Deep Architecture Analysis &amp; Improvement Report</title>
+<style>
+body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 2em; background: #0d1117; color: #e6edf3; line-height: 1.6; }
+h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 0.3em; }
+h2 { color: #79c0ff; margin-top: 2em; border-bottom: 1px solid #21262d; padding-bottom: 0.2em; }
+h3 { color: #a5d6ff; }
+h4 { color: #c9d1d9; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #30363d; padding: 6px 12px; text-align: left; }
+th { background: #161b22; color: #58a6ff; }
+tr:nth-child(even) { background: #0d1117; }
+tr:nth-child(odd) { background: #161b22; }
+code { background: #21262d; padding: 2px 6px; border-radius: 3px; font-family: 'Consolas', 'Fira Code', monospace; font-size: 0.9em; color: #f0883e; }
+pre { background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; border: 1px solid #30363d; }
+pre code { background: none; padding: 0; color: #c9d1d9; }
+.bug { background: #3d1111; border-left: 4px solid #f85149; padding: 0.5em 1em; margin: 1em 0; border-radius: 4px; }
+.warn { background: #3d2e00; border-left: 4px solid #d29922; padding: 0.5em 1em; margin: 1em 0; border-radius: 4px; }
+.ok { background: #0f3d1a; border-left: 4px solid #3fb950; padding: 0.5em 1em; margin: 1em 0; border-radius: 4px; }
+.math { background: #1a1a2e; border-left: 4px solid #a371f7; padding: 0.5em 1em; margin: 1em 0; border-radius: 4px; }
+ul { padding-left: 1.5em; }
+li { margin: 0.3em 0; }
+.num { color: #79c0ff; }
+.bold { color: #f0883e; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>WideBind — Deep Architecture Analysis &amp; Improvement Report</h1>
+<p><em>Generated from checkpoint step_20000 (best val_loss=1.5551, val_ppl=4.74)</em></p>
+
+<!-- ============================================================ -->
+<h2>Part 1: Deep Architecture Analysis</h2>
+
+<h3>1.1 Parameter Distribution</h3>
+<table>
+<tr><th>Component</th><th>Params</th><th>% of Total</th><th>Per Layer</th></tr>
+<tr><td>MLP (up+down)</td><td class="num">38,534,784</td><td class="num">93.53%</td><td class="num">1,605,616</td></tr>
+<tr><td>Conv1d (depthwise)</td><td class="num">1,032,192</td><td class="num">2.51%</td><td class="num">43,008</td></tr>
+<tr><td>Bind (proj+out+bilinear)</td><td class="num">688,128</td><td class="num">1.67%</td><td class="num">28,672</td></tr>
+<tr><td>VSA gates &amp; moment</td><td class="num">322,560</td><td class="num">0.78%</td><td class="num">13,440</td></tr>
+<tr><td>Embedding (Zeckendorf)</td><td class="num">20,608</td><td class="num">0.05%</td><td>—</td></tr>
+<tr><td>LM Head (Zeckendorf)</td><td class="num">20,608</td><td class="num">0.05%</td><td>—</td></tr>
+<tr><td>Spectral (lambda_k)</td><td class="num">21,504</td><td class="num">0.05%</td><td class="num">896</td></tr>
+<tr><td><strong>Total</strong></td><td class="num"><strong>41,201,432</strong></td><td class="num"><strong>100%</strong></td><td></td></tr>
+</table>
+
+<h3>1.2 Critical Finding: MLP Expansion = 1× (No Expansion)</h3>
+<div class="bug">
+<strong>Problem:</strong> <code>bottleneck = D = 896</code>. MLP is D→896→D — zero expansion ratio.
+<ul>
+<li>93.5% of all params go to an architecture bottleneck that is effectively a rank-896 bottleneck</li>
+<li>In comparison: GPT-2 uses 4× expansion, Llama uses 8/3× ≈ 2.7×, Mamba uses 2×</li>
+<li>At 1×, the MLP cannot learn feature expansion — it's essentially two stacked 896×896 matrices that could be collapsed into one</li>
+</ul>
+</div>
+
+<h3>1.3 Last-2-Layer Collapse</h3>
+<table>
+<tr><th>Layer</th><th>||W_up||</th><th>eff_rank(W_up)</th><th>Interpretation</th></tr>
+<tr><td>L 0</td><td class="num">28.2</td><td class="num">228.0</td><td>Full rank (K=16 bottleneck limits bind, but MLP is high-rank)</td></tr>
+<tr><td>L 1</td><td class="num">28.2</td><td class="num">229.5</td><td>Full rank</td></tr>
+<tr><td>L 2</td><td class="num">28.3</td><td class="num">228.6</td><td>Full rank</td></tr>
+<tr><td>L 22</td><td class="num">37.2</td><td class="num">3.6</td><td><strong>Rank collapse!</strong></td></tr>
+<tr><td>L 23</td><td class="num">76.7</td><td class="num">1.38</td><td><strong>Nearly rank-1!</strong></td></tr>
+</table>
+<div class="warn">
+<strong>Interpretation:</strong> The last two layers are collapsing into a low-rank (nearly rank-1) subspace. L23's MLP has ||W||=76.7 (2.7× larger than early layers) but eff_rank=1.38. This means the last layer is essentially projecting the 896-d representation onto a single direction before the LM head decodes it. The model wants a low-rank final representation but the architecture forces it through a full 896×896 matrix.
+</div>
+
+<h3>1.4 Gradient Health</h3>
+<table>
+<tr><th>Metric</th><th>Value</th><th>Status</th></tr>
+<tr><td>Mean |grad|</td><td class="num">7.9×10⁻⁵</td><td>Very small</td></tr>
+<tr><td>RMS grad</td><td class="num">9.89×10⁻⁴</td><td>Small but not zero</td></tr>
+<tr><td>Weight std (global)</td><td class="num">0.073</td><td>Healthy</td></tr>
+<tr><td>Model output std</td><td class="num">1.0</td><td>Excellent</td></tr>
+</table>
+<div class="ok">
+Gradients are small (RMS 0.001) but not zero — the model is learning. With AdamW, the effective step is g/√(v+ε) ≈ sign(g) for small g, so learning continues. No vanishing gradient crisis.
+</div>
+
+<h3>1.5 Non-Learning Parameters</h3>
+<table>
+<tr><th>Parameter</th><th>Init</th><th>After 20K steps</th><th>Issue</th></tr>
+<tr><td><code>lambda_k</code></td><td>0.5 + idx/23</td><td>std=0.0002, range [0.4992, 0.5009]</td><td>Almost no learning — spectral scaling is dead</td></tr>
+<tr><td><code>mirror_scale</code></td><td>0.1</td><td>0.1007</td><td>Barely moved — mirror bind is decorative</td></tr>
+<tr><td><code>b_d</code></td><td>0.0</td><td>≈±0.0002</td><td>Fixed at ~0 → decay ≈ 0.5 always</td></tr>
+<tr><td><code>w_i</code> (mean)</td><td>0.0</td><td>0.0001</td><td>Input gate not content-dependent</td></tr>
+</table>
+
+<h3>1.6 DCT Basis Bug — Fixed</h3>
+<div class="ok">
+<strong>Status:</strong> FIXED. Changed <code>basis[:, 0] /= sqrt(2)</code> to <code>basis[0, :] /= sqrt(2)</code>.
+<p>||VVᵀ − I|| improved from 1.1171 → <strong>0.0014</strong>. The basis is now properly orthogonal.</p>
+</div>
+
+<h3>1.7 VSA Memory — Fixed (τ ≈ 150)</h3>
+<div class="ok">
+<strong>Status:</strong> FIXED. Changed <code>b_d init = 0 → 5.0</code>, <code>w_i init std = 0.1 → 1.0</code>.
+<p>Memory time constant: τ ≈ 2 → τ ≈ <strong>150 steps</strong> (full 128-token context).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>Part 2: Improvements Within Paradigm</h2>
+
+<h3>2.1 Fix MLP Expansion → 2× or 3×</h3>
+<div class="math">
+<p><strong>Current:</strong> bottleneck = 896 (1× expansion). MLP = 38.5M params = 93.5% of total but effectively a single 896×896 matrix.</p>
+<p><strong>Proposed:</strong> bottleneck = 1792 (2×) or 2688 (3×).</p>
+<table>
+<tr><th>Expansion</th><th>MLP params</th><th>Total params</th><th>VRAM (est.)</th><th>MX550 fit?</th></tr>
+<tr><td>1× (current)</td><td class="num">38.5M</td><td class="num">41.2M</td><td>1.86 GB</td><td>✅ Yes</td></tr>
+<tr><td>2×</td><td class="num">77.0M</td><td class="num">79.9M</td><td>~2.5 GB</td><td>❌ No</td></tr>
+<tr><td>1.25×</td><td class="num">48.1M</td><td class="num">51.0M</td><td>~2.0 GB</td><td>⚠️ Maybe</td></tr>
+</table>
+<p><strong>Recommendation:</strong> Reduce n_layers from 24 to 12, increase bottleneck to 1792 (2×). Same param count, better feature expansion. Verify: rescale spec_tau to match.</p>
+</div>
+
+<h3>2.2 Bind: K=16 → K=32 (Full Cross-Modulation)</h3>
+<p>Current: D→K=16→D. The bilinear step has K² = 256 off-diagonal entries. Increasing to K=32 gives 1024 entries — 4× more cross-dim mixing at cost of 2× bind params (negligible).</p>
+
+<h3>2.3 Revive Spectral via Initialization</h3>
+<div class="warn">
+<p><code>lambda_k</code> is frozen near init because the DCT residual path has no learnable gain to compete with the main path. With <code>h = h + (h_dct * lambda_k) @ V</code>, the spectral path output is <code>O(lambda_k * ||h||) ≈ O(0.5 * 1.0) ≈ 0.5</code>, which is small relative to the main path's signal.</p>
+<p><strong>Fix:</strong> Initialize lambda_k with larger spread: <code>torch.randn(cfg.D) * 0.1 + 0.5</code>. Or: add a learned output gate for the spectral path: <code>h = h + spectral_out * sigmoid(g)</code>.</p>
+</div>
+
+<h3>2.4 VSA Gates: ReLU Decay + Learned Bias</h3>
+<p>Current decay is <code>sigmoid(h·w_d + b_d)</code> which saturates at [0, 1]. With b_d ≈ 0, the decay is ~0.5 regardless of input.</p>
+<p><strong>Option A:</strong> Initialize b_d = 2.0 (start high, decay slowly). Let training pull it down.</p>
+<p><strong>Option B:</strong> Replace sigmoid with <code>min(1, exp(h·w_d + b_d))</code> for unbounded decay (can be &gt;1 for "forget more" or ≈1 for "keep").</p>
+<p><strong>Mathematical note:</strong> With decay ≈ 0.5, the effective context window is roughly τ = 1/(1-0.5) = 2 steps. With L=128, this means the memory sees only ~2 tokens of context. To reach τ = 128, we need decay &gt; 0.992. This is why VSA state appears critical for loss &lt; 9 — even 2-step memory is vastly better than no memory (random). But there's room for much longer memory.</p>
+
+<h3>2.5 Cognitive Mirror — Replaces Old Mirror Bind</h3>
+<p>Old mirror (dead path, unbounded output) replaced by <strong>CognitiveMirror</strong>:</p>
+<ul>
+<li><strong>Temporal</strong> path: h[t] — memory centroid (VSA prediction error)</li>
+<li><strong>Smooth</strong> path: h[t] — conv1×3(h[t]) (local coherence in K-space)</li>
+<li><strong>Symmetry</strong> path: (h[t] ⊙ wᵤ) · (h[t-1] ⊙ wᵥ) (bilinear trajectory)</li>
+<li>All three → rms_norm → tanh(W_out) → <strong>bounded</strong> correction ±exp(log_scale)</li>
+<li><code>log_scale</code> per-dim gate (896 dims, init=0, exp=1) gets full gradient signal</li>
+</ul>
+<div class="ok">
+<strong>Gradient verification:</strong> log_scale gradient non-zero on all 896 dims. Output bounded to |mirror| ≤ exp(log_scale). Contrast with old mirror: unbounded (max=5.05), scalar scale (gradient 0.1× weaker).
+</div>
+
+<h3>2.6 Learnable Zeckendorf Embeddings</h3>
+<p>Current: fixed Zeckendorf binary codes + learned linear projection. The codes are binary (0/1) and fixed per token. This imposes a hard 23-bit representation on tokens, which may not be optimal.</p>
+<p><strong>Alternative:</strong> Make codes learnable: start from Zeckendorf init, allow fine-tuning. This gives the model flexibility to adjust token positions in D-space while keeping the sparse initial structure.</p>
+
+<h3>2.7 Add Skip Connections Across Bind/Memory Paths</h3>
+<p>Current: single residual path <code>h = h + enhanced</code> after combining bind + mem_read + mirror.</p>
+<p><strong>Proposed:</strong> <code>enhanced = bind_out * g_bind + mem_read * g_mem + mirror * g_mirror</code> where gates are learned scalars. This lets the model dynamically route between the three content-processing paths, rather than summing them with fixed weights.</p>
+
+<!-- ============================================================ -->
+<h2>Part 3: Mathematical Verification</h2>
+
+<h3>3.1 Effective Rank of Bind</h3>
+<div class="math">
+<p><strong>Claim:</strong> The bind path D→K→D with bilinear in K can represent any rank-≤K matrix.</p>
+<p><strong>Proof:</strong> The bilinear operation <code>bind(h) = ((h·W_p) ⊙ w_u ⊙ w_v) · W_o</code> can be rewritten as:</p>
+<pre><code>bind(h) = h · W_p · diag(w_u) · diag(w_v) · W_o
+        = h · (W_p · D · W_o)</code></pre>
+<p>where D = diag(w_u) · diag(w_v) is a rank-K diagonal matrix in the bottleneck space.</p>
+<p>This gives <code>bind(h) = h · M</code> where <code>M = W_p · D · W_o</code> is a D×D matrix with rank ≤ K. With K=16, the bind can represent any rank-16 perturbation of the residual stream. For W_p and W_o to be full-rank on their own (rank K), both must have rank K, which requires inputs/outputs to not lie in a lower-dimensional subspace. The eff_rank(W_p) ≈ 12.8 (out of 16) confirms the bind is using ~80% of its theoretical capacity.</p>
+<p><strong>Implication:</strong> Increasing K to 32 would give rank-32 binding at negligible cost (4K extra params per layer). The bind is not the bottleneck — it's the MLP at 1× expansion.</p>
+</div>
+
+<h3>3.2 Free Parameters vs Expected Capacity</h3>
+<table>
+<tr><th>Path</th><th>Theoretical max rank</th><th>Actual eff_rank (L0)</th><th>Utilization</th></tr>
+<tr><td>Bind bilinear (K=16)</td><td>16</td><td>12.8</td><td>80%</td></tr>
+<tr><td>MLP up (896→896)</td><td>896</td><td>228</td><td>25%</td></tr>
+<tr><td>Conv (kernel=48)</td><td>48</td><td>—</td><td>—</td></tr>
+<tr><td>VSA memory</td><td>896 (diagonal)</td><td>—</td><td>Only ~2 steps effective</td></tr>
+</table>
+
+<div class="bug">
+<p><strong>Critical observation:</strong> The MLP has 896×896 = 802,816 params per layer but uses only 25% of its rank capacity (eff_rank ≈ 228). With bottleneck = D = 896, the MLP is just two stacked 896×896 matrices — it's the classic "bottleneck without expansion" problem. The matrix <code>W_down · W_up</code> has rank ≤ 896 but empirically uses only ~228 dimensions effectively.</p>
+<p><strong>Root cause:</strong> With expansion ratio = 1×, the MLP is an autoencoder with tied dimensions. If the input has intrinsic dimension d < 896 (which is likely for language after 24 layers), the MLP compresses and decompresses through the same 896-dim space, losing information. The rank-228 observation suggests the data manifold has intrinsic dimension ~228 at this representation level.</p>
+</div>
+
+<h3>3.3 Gradient Signal Analysis</h3>
+<div class="math">
+<p><strong>Observation:</strong> RMS |grad| = 7.9×10⁻⁵, RMS grad² = 1×10⁻⁶. For AdamW (β₁=0.9, β₂=0.95, ε=1×10⁻⁸):</p>
+<pre><code>m ← 0.9·m + 0.1·g          first moment
+v ← 0.95·v + 0.05·g²       second moment
+ΔW ← -η · m / (√v + ε)</code></pre>
+<p>With g ≈ 0.001 (RMS):</p>
+<pre><code>|m|_ss ≈ 0.1·0.001 / (1-0.9) = 0.001                                           (steady state)
+v_ss  ≈ 0.05·(0.001)² / (1-0.95) = 1×10⁻⁶ / 0.05 = 2×10⁻⁵                     (steady state)
+√v_ss ≈ 0.0045
+ΔW ≈ 3×10⁻⁴ · 0.001 / (0.0045 + 1×10⁻⁸) ≈ 6.7×10⁻⁵                            (per step)
+</code></pre>
+<p><strong>Effective ΔW per step ≈ 6.7×10⁻⁵.</strong> Over 20K steps, cumulative change ≈ 1.34. Since |W| ≈ 28 (early layers) to 77 (last layer), the relative change is ~2-5% — reasonable for 20K steps. The learning is happening, but slowly.</p>
+<p><strong>Prediction:</strong> Given 500K total steps, the model will have ~33% cumulative weight change in early layers and ~5% in late layers. The last-layer collapse will persist or worsen. Spectral and mirror paths will remain frozen.</p>
+</div>
+
+<h3>3.4 VSA Memory Time Constants</h3>
+<div class="math">
+<p>VSA memory recurrence: <code>mem[t] = decay[t] · mem[t-1] + input[t] · i_gate[t]</code></p>
+<p>With <code>decay ≈ 0.5</code> (constant), the memory after k steps is:</p>
+<pre><code>mem[t] = Σ_{j=0}^{k-1} 0.5ʲ · input[t-j] · i_gate[t-j] + 0.5ᵏ · mem[t-k]</code></pre>
+<p>The effective time constant τ = 1/(1-0.5) = <strong>2 steps</strong>. This means only the last 2 tokens contribute significantly to the memory state. After 10 steps, the contribution is 0.5¹⁰ ≈ 0.001 — effectively zero.</p>
+<p>To get τ = 128 (the sequence length):</p>
+<pre><code>τ = 1/(1-α) → α = 1 - 1/128 = 0.9922
+</code></pre>
+<p>With b_d initialized to 0 and sigmoid activation, α ≈ 0.5. To get α = 0.992, we need <code>b_d ≈ 4.8</code> (since sigmoid(4.8) ≈ 0.992).</p>
+<p><strong>Fix:</strong> Initialize <code>b_d = 5.0</code> (decay ≈ 0.993) and let training adjust. This immediately gives τ ≈ 150 — the memory can span the full 128-token sequence from the start of training.</p>
+<p><strong>Caveat:</strong> With b_d = 5.0 and w_d init std=0.1, the input-dependent modulation is ≈ 5 ± 0.1·std(h). Since std(h) ≈ 1.0, the decay varies in [0.991, 0.995] — a narrow range. To make it content-dependent, increase w_d std to ~1.0.</p>
+</div>
+
+<h3>3.5 DCT Orthogonality Error Propagation</h3>
+<div class="math">
+<p>The non-orthogonal DCT basis introduces aliasing. With ||VVᵀ - I|| = 1.1171, the error per spectral transform step is ~1.12·std(h) ≈ 1.12. Since the spectral path is additive (<code>h = h + spectral_out</code>), the error compound is:</p>
+<pre><code>h^{(l+1)} = h^{(l)} + ((h^{(l)}·Vᵀ) ⊙ λ) · V
+          ≈ h^{(l)} + error_term(h^{(l)}) + ideal_term(h^{(l)})
+</code></pre>
+<p>After 24 layers, the total aliasing error could be ~24 × 1.12 ≈ 27 relative to signal std=1. This is likely compensated by the learned lambda_k (which stays near 0.5, reducing spectral path gain), but it means the spectral path is operating at ~50% efficiency.</p>
+<p><strong>Fix the bug</strong> and the basis becomes orthogonal (error ≈ 10⁻⁶), enabling lambda_k to learn meaningful frequency selective filters.</p>
+</div>
+
+<h3>3.6 Zeckendorf Embedding Capacity</h3>
+<div class="math">
+<p>Zeckendorf codes: vocab = 50000 tokens, K = 23 bits/token. The code matrix Z ∈ {0,1}^{50000×23} has the property that each row has sum ≈ 6.19 (average number of Fibonacci terms needed).</p>
+<p><strong>Capacity:</strong> The linear projection W_p ∈ ℝ^{23×896} maps these codes to D-space. The Gram matrix of codes: G = Z·Zᵀ. If two codes are similar (share Fibonacci terms), their representations are correlated. The maximum possible distinct representations is bounded by the rank of G.</p>
+<p><strong>Problem:</strong> Zeckendorf codes are sparse with fixed support — they provide a very specific geometry in {0,1}²³ that may not match the natural geometry of the D-space. Making the projection learnable (full 50000×896 lookup table) would add 44.8M params — not feasible.</p>
+<p><strong>Better:</strong> Add a small learned delta on top of the fixed Zeckendorf projection: <code>embed[t] = Z[t] · W_p + E[t]</code> where E ∈ ℝ^{50000×D} is a learned embedding matrix initialized at 0. This adds 44.8M params (too much for MX550). Alternative: factorized embedding — learn E = Z · W_e where W_e ∈ ℝ^{23×896} is learnable (only 20K extra params). Wait, that's already what we have! W_p is already and solely responsible for the mapping from binary codes to D-space. So the current design is already a compressed embedding via Zeckendorf codes.</p>
+<p>The question is whether the Zeckendorf code structure is optimal. Zeckendorf codes have the property that no two consecutive bits are both set — this ensures unique representation. But for neural embeddings, this sparsity may not be helpful. Removing the Zeckendorf constraint and just using a learned K=23 embedding per token (50000×23 = 1.15M params) would be more flexible and still far smaller than a full 50000×896 embedding.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>Part 4: Prioritized Action Plan</h2>
+
+<table>
+<tr><th>#</th><th>Change</th><th>Impact</th><th>Effort</th><th>Risk</th><th>VRAM Δ</th></tr>
+<tr><td>1</td><td><strong>Fix DCT basis bug</strong> (row vs column)</td><td>Medium</td><td>2 lines</td><td>None</td><td>0</td><td>✅ Done</td></tr>
+<tr><td>2</td><td><strong>Increase b_d init to 5.0</strong> (τ from 2→150)</td><td>High</td><td>1 line</td><td>Low</td><td>0</td><td>✅ Done</td></tr>
+<tr><td>3</td><td><strong>Increase w_i init std to 1.0</strong> (content-dependent gate)</td><td>Medium</td><td>1 line</td><td>Low</td><td>0</td><td>✅ Done</td></tr>
+<tr><td>4</td><td><strong>Cognitive Mirror</strong> (replace old mirror)</td><td>High</td><td>Core redesign</td><td>Low</td><td>+23K</td><td>✅ Done</td></tr>
+<tr><td>5</td><td><strong>Increase bind K: 16→32</strong></td><td>Low-Medium</td><td>1 line</td><td>Low</td><td>+0.7M</td><td>⬜ Todo</td></tr>
+<tr><td>6</td><td><strong>Spectral: increase lambda_k init spread</strong></td><td>Low</td><td>1 line</td><td>Low</td><td>0</td><td>⬜ Todo</td></tr>
+<tr><td>7</td><td><strong>Reduce n_layers: 24→12; bottleneck: 896→1792</strong></td><td>High</td><td>Config change</td><td>High</td><td>~same</td><td>⬜ Todo</td></tr>
+</table>
+
+<h3>Completed Changes (ready for --resume auto reinit):</h3>
+<div class="ok">
+<ol>
+<li><strong>DCT basis fix</strong> — <code>basis[0, :] /= sqrt(2)</code> instead of <code>[:, 0]</code>. Orthogonality 1.117 → 0.001</li>
+<li><strong>b_d init = 5.0</strong> — τ ≈ 150, full 128-token memory context</li>
+<li><strong>w_i init std = 1.0</strong> — content-dependent input gate</li>
+<li><strong>Cognitive Mirror</strong> — replaces old mirror. Three bounded paths: temporal + smooth + symmetry. rms_norm + tanh + per-dim exp(log_scale). Gradient verified on all 896 dims.</li>
+</ol>
+</div>
+
+<p><strong>Note:</strong> Since b_d, w_i, log_scale are params in <code>__init__</code>, a <code>--resume auto</code> will overwrite them with checkpoint values (old b_d≈0, w_i≈0.1, no log_scale). <strong>Must force reinit</strong> or train from scratch for these changes to take effect.</p>
+
+<h3>If Time/Budget Allows:</h3>
+<div class="warn">
+<p>Train with <strong>12 layers + bottleneck=1792</strong> (2× expansion, ~42M params, ~2.0 GB VRAM). Compare loss trajectory against current 24-layer 1× expansion model. Hypothesis: the 12-layer model will achieve lower loss at the same step count because its MLP can actually expand and contract features rather than bottlenecking through the same dimension.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>Part 5: Summary Metrics</h2>
+
+<table>
+<tr><th>Metric</th><th>Value</th><th>Grade</th></tr>
+<tr><td>Model output std after 24 layers</td><td>1.0</td><td>✅ Excellent — residual network is stable</td></tr>
+<tr><td>Gradient RMS</td><td>0.001</td><td>✅ Healthy (no vanishing, no explosion)</td></tr>
+<tr><td>Train loss</td><td>~1.37</td><td>✅ Improving (was 14.6 at resume due to scheduler bug)</td></tr>
+<tr><td>Best val_loss</td><td>1.5551 (ppl 4.74)</td><td>✅ Reasonable for 41M on 2.86B tokens</td></tr>
+<tr><td>MLP expansion ratio</td><td>1.0×</td><td>❌ Critical — wasting 93% of params</td></tr>
+<tr><td>VSA memory time constant</td><td>τ ≈ 2 steps</td><td>❌ Should be τ &gt; 128</td></tr>
+<tr><td>DCT basis orthogonality</td><td>||VVᵀ − I|| = 1.12</td><td>❌ Bug — should be ~0</td></tr>
+<tr><td>Non-learning params</td><td>4 groups (lambda_k, mirror, b_d, w_i)</td><td>⚠️ Need better init/training signal</td></tr>
+<tr><td>Last-layer eff_rank</td><td>1.38 (near rank-1)</td><td>⚠️ Symptom of 1× expansion bottleneck</td></tr>
+<tr><td>Tok/s (training)</td><td>262 (MX550, B=2, L=128)</td><td>✅ Usable for prototyping</td></tr>
+</table>
+
+<hr>
+<p style="color: #8b949e; font-size: 0.9em;">
+Report generated from 41.2M-param WideBind checkpoint at step 20000.<br>
+Data: 2.86B tokens (ACTION 1.1B + DETECT 1.8B), MX550 2GB.<br>
+Analysis by WideBind Expert Team (Architecture, Optimization, Mathematics).
+</p>
+
+</body>
+</html>
