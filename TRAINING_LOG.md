@@ -71,6 +71,7 @@
   - var(log_scale) grows → decay factor drops
   - |mirror| shrinks at convergence → mag_factor drops
   - Combined: LR_adapt = base_lr × (1 - var/0.1) × min(1, mag/0.3)
+  - Fallback: forced cosine decay over 50K steps if mirror frozen
 - Expected: adaptive LR breaks plateau by reducing LR when mirror stabilizes
 
 ### Comparison with Run 0 (flat MLP 896→896→896)

@@ -434,7 +434,8 @@ class MirrorLRScheduler:
     LR_mult = max(0.05, (1 - var/target) * min(1, mag/threshold))
     """
     def __init__(self, model, optimizer, base_lr, warmup=1000,
-                 target_var=0.1, mag_threshold=0.3, lr_min_ratio=0.05):
+                 target_var=0.1, mag_threshold=0.3, lr_min_ratio=0.05,
+                 max_decay_steps=50000):
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
@@ -442,6 +443,7 @@ class MirrorLRScheduler:
         self.target_var = target_var
         self.mag_threshold = mag_threshold
         self.lr_min_ratio = lr_min_ratio
+        self.max_decay_steps = max_decay_steps
         self._step = 0
         self._last_log = 0
 
@@ -466,9 +468,17 @@ class MirrorLRScheduler:
             mag_factor = min(1.0, max(self.lr_min_ratio, mag / max(self.mag_threshold, 1e-10)))
             mult = max(self.lr_min_ratio, decay * mag_factor)
 
+            # Fallback: force cosine decay if mirror hasn't diverged
+            post_warmup = self._step - self.warmup
+            progress = post_warmup / max(self.max_decay_steps, 1)
+            forced = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+            mult = min(mult, forced)
+
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
-                print(f'  lr_adapt: var(ls)={var:.6f} |mirror|={mag:.4f} mult={mult:.4f} lr={self.base_lr*mult:.2e}')
+                print(f'  lr_adapt: var(ls)={var:.6f} |mirror|={mag:.4f} '
+                      f'mirror_mult={decay*mag_factor:.4f} forced={forced:.4f} '
+                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
 
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.base_lr * mult
