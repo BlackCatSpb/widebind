@@ -17,6 +17,8 @@ start /b /wait "" python train.py ^
     --n-layers 24 ^
     --bottleneck 896 ^
     --bind-K 16 ^
+    --mlp-groups 8 ^
+    --mlp-expand 8 ^
     --lr 3e-4 ^
     --max-steps 500000 ^
     --warmup 1000 ^

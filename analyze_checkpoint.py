@@ -57,13 +57,32 @@ def generate_report(ckpt_path):
     # Layer eff_rank
     layer_stats = []
     for i, layer in enumerate(model.layers):
-        up_s = torch.linalg.svdvals(layer.mlp_up.weight.float())
-        eff_r = (up_s**2).sum() / up_s.max()**2
+        if hasattr(layer.mlp, 'W_up'):
+            # GroupedMLP: per-group eff_rank, then average
+            G = layer.mlp.G
+            eff_ranks = []
+            norms = []
+            for g in range(G):
+                w = layer.mlp.W_up[g].float()
+                s = torch.linalg.svdvals(w)
+                eff_r = (s**2).sum() / s.max()**2
+                eff_ranks.append(eff_r.item())
+                norms.append(w.norm().item())
+            eff_rank_mlp = sum(eff_ranks) / G
+            mlp_norm = sum(norms) / G
+            mlp_std = layer.mlp.W_up.std().item()
+        else:
+            w = layer.mlp_up.weight.float()
+            s = torch.linalg.svdvals(w)
+            eff_rank_mlp = (s**2).sum() / s.max()**2
+            mlp_norm = w.norm().item()
+            mlp_std = w.std().item()
+
         layer_stats.append({
             'idx': i,
-            'eff_rank_mlp': eff_r.item(),
-            'mlp_norm': layer.mlp_up.weight.norm().item(),
-            'mlp_std': layer.mlp_up.weight.std().item(),
+            'eff_rank_mlp': eff_rank_mlp,
+            'mlp_norm': mlp_norm,
+            'mlp_std': mlp_std,
             'bind_norm': layer.W_proj.norm().item(),
             'bind_eff_rank': (lambda s=torch.linalg.svdvals(layer.W_proj.float()): (s**2).sum() / s.max()**2)().item(),
             'log_scale_mean': layer.mirror.log_scale.data.mean().item(),
@@ -118,6 +137,7 @@ code {{ background: #21262d; padding: 1px 5px; border-radius: 3px; color: #f0883
 <tr><td>Params</td><td class="num">{total:,} ({total/1e6:.2f}M)</td></tr>
 <tr><td>Trainable</td><td class="num">{trainable:,}</td></tr>
 <tr><td>D / K / bottleneck</td><td class="num">{cfg.D} / {cfg.bind_K} / {cfg.bottleneck}</td></tr>
+<tr><td>MLP groups / expand</td><td class="num">{getattr(cfg,'mlp_groups','?')} / {getattr(cfg,'mlp_expand','?')}×</td></tr>
 <tr><td>Layers</td><td class="num">{cfg.n_layers}</td></tr>
 <tr><td>Weight mean / std</td><td class="num">{all_w.mean():.4f} / {all_w.std():.4f}</td></tr>
 <tr><td>Weight min / max</td><td class="num">{all_w.min():.4f} / {all_w.max():.4f}</td></tr>

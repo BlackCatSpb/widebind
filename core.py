@@ -188,6 +188,44 @@ class CognitiveMirror(nn.Module):
         return mirror
 
 
+# ─── Grouped MLP ──────────────────────────────────────────────────────
+
+class GroupedMLP(nn.Module):
+    """
+    Grouped bottleneck MLP with per-group expansion.
+
+    Instead of D → D → D (rank-bounded by D), splits D into G groups
+    and gives each group internal expansion (d → expand*d → d).
+    Total rank still ≤ D, but each group learns richer features
+    within its d-dim subspace.
+
+    G=8, d=112, expand=4 → 4× per-group expansion at half the params
+    of a full 896→896→896 MLP.
+    """
+    def __init__(self, D, expand, groups):
+        super().__init__()
+        assert D % groups == 0
+        self.D = D
+        self.G = groups
+        self.d = D // groups
+        d = self.d
+        e = expand
+
+        up_std = (2.0 / (d + e * d)) ** 0.5
+        down_std = (2.0 / (e * d + d)) ** 0.5
+        self.W_up = nn.Parameter(torch.randn(groups, d, e * d) * up_std)
+        self.W_down = nn.Parameter(torch.randn(groups, e * d, d) * down_std)
+        self.norm_w = nn.Parameter(torch.ones(D))
+
+    def forward(self, h):
+        B, L, D = h.shape
+        h = F.rms_norm(h, (D,), self.norm_w)
+        h = h.reshape(B, L, self.G, self.d)
+        h = F.silu(torch.einsum('blgd,gdf->blgf', h, self.W_up))
+        h = torch.einsum('blgf,gfd->blgd', h, self.W_down)
+        return h.reshape(B, L, D)
+
+
 # ─── WideBind Block ────────────────────────────────────────────────────
 
 class WideBindBlock(nn.Module):
@@ -248,12 +286,8 @@ class WideBindBlock(nn.Module):
         lam = torch.full((cfg.D,), 0.5 + layer_idx / max(cfg.n_layers - 1, 1))
         self.lambda_k = nn.Parameter(lam)
         
-        # ─── MLP ───
-        self.mlp_up = nn.Linear(cfg.D, cfg.bottleneck, bias=False)
-        self.mlp_down = nn.Linear(cfg.bottleneck, cfg.D, bias=False)
-        nn.init.xavier_uniform_(self.mlp_up.weight)
-        nn.init.xavier_uniform_(self.mlp_down.weight)
-        self.register_buffer('mlp_norm_w', torch.ones(cfg.D))
+        # ─── MLP (grouped: per-group 4× expansion, half params) ───
+        self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
     
     def forward(self, h, state=None, global_state=None):
         mem_state = mu_state = conv_state = None
@@ -305,10 +339,8 @@ class WideBindBlock(nn.Module):
         h_dct = h @ self.V_dct.T
         h = h + (h_dct * self.lambda_k) @ self.V_dct
         
-        # ─── MLP ───
-        h_mlp = F.rms_norm(h, (D,), self.mlp_norm_w)
-        h_mlp = F.silu(self.mlp_up(h_mlp))
-        h = h + self.mlp_down(h_mlp)
+        # ─── MLP (grouped 8×112, 4× per-group expansion) ───
+        h = h + self.mlp(h)
         
         return h, (mem_state_out, mu_state_out, conv_state_out)
 

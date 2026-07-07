@@ -100,7 +100,11 @@ def train(cfg=None, resume_path=None):
     if resume_path and os.path.exists(resume_path):
         print(f'Resuming from {resume_path}')
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt['model'])
+        missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+        if missing:
+            print(f'  Missing keys (new arch): {len(missing)}')
+        if unexpected:
+            print(f'  Unexpected keys (old arch): {len(unexpected)}')
         optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler'])
@@ -254,8 +258,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--seq-len', type=int, default=128)
     parser.add_argument('--n-layers', type=int, default=24)
-    parser.add_argument('--bottleneck', type=int, default=3584)
+    parser.add_argument('--bottleneck', type=int, default=896)
     parser.add_argument('--bind-K', type=int, default=16)
+    parser.add_argument('--mlp-groups', type=int, default=8)
+    parser.add_argument('--mlp-expand', type=int, default=8)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--max-steps', type=int, default=50000)
     parser.add_argument('--warmup', type=int, default=500)
@@ -273,6 +279,8 @@ if __name__ == '__main__':
         n_layers=args.n_layers,
         bottleneck=args.bottleneck,
         bind_K=args.bind_K,
+        mlp_groups=args.mlp_groups,
+        mlp_expand=args.mlp_expand,
         lr=args.lr,
         max_steps=args.max_steps,
         warmup_steps=args.warmup,

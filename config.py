@@ -17,6 +17,10 @@ class WideBindConfig:
     grad_clip: float = 1.0
     dtype: str = 'float32'
 
+    # MLP
+    mlp_groups: int = 8
+    mlp_expand: int = 8
+
     # Conv
     conv_kernel: int = 48
 
