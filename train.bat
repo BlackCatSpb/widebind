@@ -9,6 +9,9 @@ echo   Model: 41M params, 24 layers, B=2, L=128
 echo   VRAM: ~1.9 GB peak
 echo.
 
+echo   TRAINING ON CLEAN DATA (PAD REMOVED) - STARTING FRESH
+echo.
+
 start /b /wait "" python train.py ^
     --data-dir "C:\Users\black\OneDrive\Desktop\fcp" ^
     --save-dir checkpoints ^
@@ -25,8 +28,7 @@ start /b /wait "" python train.py ^
     --log-interval 100 ^
     --eval-interval 1000 ^
     --save-interval 5000 ^
-    --scheduler mirror ^
-    --resume auto
+    --scheduler mirror
 
 echo.
 echo [WideBind] Training finished.

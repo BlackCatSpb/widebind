@@ -1,56 +1,60 @@
 """
 WideBind text generation.
+Uses HuggingFace tokenizer from the training data directory.
 """
 
-import os, sys, math, torch, pickle, glob, json
+import os, sys, math, torch, json
 import torch.nn.functional as F
-import numpy as np
+from tokenizers import Tokenizer
 
 from config import WideBindConfig
 from core import WideBindStack
 
 
+def load_russian_tokenizer(path=None):
+    """Load BPE tokenizer from russian_tokenizer/tokenizer.json."""
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), '..', 'fcp')
+    tok_file = os.path.join(path, 'russian_tokenizer', 'tokenizer.json')
+    if not os.path.exists(tok_file):
+        tok_file = os.path.join(os.path.dirname(__file__), 'fcp', 'russian_tokenizer', 'tokenizer.json')
+    if os.path.exists(tok_file):
+        tok = Tokenizer.from_file(tok_file)
+        tok.enable_padding(pad_id=0, pad_token='<|pad|>')
+        tok.enable_truncation(max_length=512)
+        return tok
+    return None
+
+
 @torch.no_grad()
 def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50):
-    """Generate tokens from prompt."""
+    """Generate tokens from prompt string."""
     model.eval()
     device = next(model.parameters()).device
     L = model.cfg.seq_len
     
-    # Handle prompt as tokens or string
-    if isinstance(prompt, str):
-        # Try loading tokenizer
-        tokenizer_file = os.path.join(os.path.dirname(__file__), 'tokenizer', 'tokenizer.pkl')
-        if os.path.exists(tokenizer_file):
-            with open(tokenizer_file, 'rb') as f:
-                tokenizer = pickle.load(f)
-            prompt_tokens = tokenizer.encode(prompt)
-            detokenize = lambda ids: tokenizer.decode(ids)
-        else:
-            # Fallback: character-level
-            chars = sorted(list(set(prompt)))
-            stoi = {ch: i for i, ch in enumerate(chars)}
-            prompt_tokens = [stoi.get(c, 0) for c in prompt]
-            detokenize = lambda ids: ''.join(chr(i) if i < 128 else '?' for i in ids)
-    else:
-        prompt_tokens = prompt
-        detokenize = lambda ids: ' '.join(str(i) for i in ids)
+    # Load tokenizer
+    tok = load_russian_tokenizer()
+    if tok is None:
+        raise FileNotFoundError('russian_tokenizer/tokenizer.json not found')
     
-    # Pad / truncate to full blocks
+    # Encode prompt
+    encoded = tok.encode(prompt)
+    prompt_tokens = encoded.ids
+    detokenize = lambda ids: tok.decode(ids, skip_special_tokens=True)
+    
     tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
     
     # Generate
-    generated = tokens.tolist()
     state = None
     
     for _ in range(max_new_tokens):
-        # Take last L tokens
-        ctx = tokens[-L:].unsqueeze(0)  # (1, ctx_len)
+        ctx = tokens[-L:].unsqueeze(0)
         
         h = model.embed_tokens(ctx)
         out, state = model(h, state)
         
-        logits = model.lm_head(out[:, -1, :])  # (1, vocab)
+        logits = model.lm_head(out[:, -1, :])
         logits = logits / temperature
         
         if top_k > 0:
@@ -60,10 +64,9 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50):
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, 1)
         
-        generated.append(next_token.item())
-        tokens = torch.cat([tokens, next_token.squeeze(0)])
+        tokens = torch.cat([tokens, next_token.squeeze(0)], dim=0)
     
-    return detokenize(generated)
+    return detokenize(tokens.tolist())
 
 
 if __name__ == '__main__':
@@ -80,24 +83,29 @@ if __name__ == '__main__':
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load checkpoint
-    state = torch.load(args.checkpoint, map_location=device)
+    from torch.serialization import add_safe_globals
+    add_safe_globals([WideBindConfig])
+    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     cfg = state.get('cfg', WideBindConfig())
     model = WideBindStack(cfg).to(device)
     model.load_state_dict(state['model'])
     
     print(f'Loaded checkpoint: step={state.get("step", "?")}  params={model.param_count():,}')
     
-    # Prompt
+    # Prompts
     if args.prompt:
         text = generate(model, args.prompt, args.tokens, args.temperature, args.top_k)
         print(f'Prompt: {args.prompt}')
         print(f'Generated: {text}')
     else:
-        # Interactive mode
-        print('Enter prompts (empty line to quit):')
-        while True:
-            prompt = input('> ')
-            if not prompt:
-                break
-            text = generate(model, prompt, args.tokens, args.temperature, args.top_k)
+        prompts = [
+            'Привет, как дела?',
+            'Москва — столица',
+            'В начале было Слово',
+            'Искусственный интеллект',
+        ]
+        for p in prompts:
+            text = generate(model, p, 100, 0.8, 40)
+            print(f'> {p}')
             print(text)
+            print()
