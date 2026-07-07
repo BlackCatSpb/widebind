@@ -228,8 +228,10 @@ class WideBindBlock(nn.Module):
         self.w_d = nn.Parameter(torch.randn(cfg.D) * 0.1)    # content-dependent decay
         self.w_q = nn.Parameter(torch.randn(cfg.D))
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
-        self.b_i = nn.Parameter(torch.full((cfg.D,), 1.0))
+        self.b_i = nn.Parameter(torch.full((cfg.D,), -3.0))  # sigmoid init → i_gate ≈ 0.047
         self.b_d = nn.Parameter(torch.full((cfg.D,), 5.0))    # high init → τ ≈ 150
+
+        # First moment
         
         # First moment
         self.w_k_mu = nn.Parameter(torch.randn(cfg.D))
@@ -280,8 +282,8 @@ class WideBindBlock(nn.Module):
         bind_out = (u * v) @ self.W_out  # (B, L, D)
         
         # ─── VSA Memory ───
-        i_gate = torch.exp(h * self.w_i + self.b_i)     # (B, L, D)
-        decay = torch.sigmoid(h * self.w_d + self.b_d)  # (B, L, D)
+        i_gate = torch.sigmoid(h * self.w_i + self.b_i)     # (B, L, D) bounded [0, 1]
+        decay = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D)
         
         mem_all, mem_state_out = vsa_prefix_scan(decay, h * i_gate, mem_state)
         mem_read = mem_all * self.w_q                    # (B, L, D)

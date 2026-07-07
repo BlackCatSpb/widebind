@@ -22,7 +22,7 @@ start /b /wait "" python train.py ^
     --warmup 1000 ^
     --log-interval 100 ^
     --eval-interval 1000 ^
-    --save-interval 10000 ^
+    --save-interval 5000 ^
     --resume auto
 
 echo.

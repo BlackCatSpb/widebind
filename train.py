@@ -10,6 +10,7 @@ from torch.serialization import add_safe_globals
 
 from config import WideBindConfig
 from core import WideBindStack
+from analyze_checkpoint import generate_report
 
 add_safe_globals([WideBindConfig])
 
@@ -185,6 +186,7 @@ def train(cfg=None, resume_path=None):
                         'cfg': cfg,
                     }, save_path)
                     print(f'  Saved best model to {save_path}')
+                    generate_report(save_path)
             
             # Save
             if step > 0 and step % cfg.save_interval == 0:
@@ -198,6 +200,7 @@ def train(cfg=None, resume_path=None):
                     'cfg': cfg,
                 }, save_path)
                 print(f'  Saved checkpoint to {save_path}')
+                generate_report(save_path)
     except KeyboardInterrupt:
         print('\n[WideBind] Ctrl+C detected, saving checkpoint...')
         save_path = os.path.join(cfg.save_dir, f'interrupt_step_{step}.pt')
@@ -210,6 +213,7 @@ def train(cfg=None, resume_path=None):
             'cfg': cfg,
         }, save_path)
         print(f'[WideBind] Saved interrupt checkpoint to {save_path}')
+        generate_report(save_path)
         print('[WideBind] Exiting gracefully.')
         sys.exit(0)
     
