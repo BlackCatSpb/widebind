@@ -142,6 +142,9 @@ def analyze_single_checkpoint(ckpt_path):
         d['mlp_norm'] = sum(norms) / G
         d['mlp_min_rank'] = min(eff_ranks)
         d['mlp_max_rank'] = max(eff_ranks)
+        d['mlp_eff_ranks'] = eff_ranks  # per-group
+        d['mlp_group_norms'] = norms  # per-group
+        d['mlp_dead_groups'] = sum(1 for r in eff_ranks if r < 0.5 * (sum(eff_ranks) / G))
         d['mlp_up_mean'] = mlp.W_up.data.mean().item()
         d['mlp_up_std'] = mlp.W_up.data.std().item()
         d['mlp_down_mean'] = mlp.W_down.data.mean().item()
@@ -370,6 +373,37 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
         html += f'<td class="num">{ff.format(max_v)} (L{max_i})</td></tr>\n'
     
     html += '''</table>
+'''
+
+    # ─── GroupedMLP Detail ───
+    html += '''<h2>GroupedMLP Analysis (per-group eff_rank)</h2>
+<div style="overflow-x:auto;">
+<table>
+<tr>
+<th>L</th><th>mean</th><th>std</th><th>min</th><th>max</th>
+<th>dead (r<50%)</th>
+<th>groups with rank < 50</th>
+</tr>
+'''
+    for d in layers_data:
+        ers = d['mlp_eff_ranks']
+        mean_r = d['mlp_eff_rank']
+        std_r = (sum((v - mean_r) ** 2 for v in ers) / len(ers)) ** 0.5
+        low = [f'{i}({r:.0f})' for i, r in enumerate(ers) if r < 0.5 * mean_r]
+        low_str = ', '.join(low[:5])
+        if len(low) > 5:
+            low_str += f' ... (+{len(low)-5})'
+        html += f'<tr>'
+        html += f'<td>{d["idx"]}</td>'
+        html += f'<td class="num">{d["mlp_eff_rank"]:.1f}</td>'
+        html += f'<td class="num">{std_r:.1f}</td>'
+        html += f'<td class="num">{d["mlp_min_rank"]:.1f}</td>'
+        html += f'<td class="num">{d["mlp_max_rank"]:.1f}</td>'
+        html += f'<td class="num">{d["mlp_dead_groups"]}</td>'
+        html += f'<td style="font-size:0.8em;">{low_str if low_str else "—"}</td>'
+        html += f'</tr>\n'
+    html += '''</table>
+</div>
 '''
 
     # ─── Missing keys ───
