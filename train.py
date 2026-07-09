@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.serialization import add_safe_globals
 
-from config import WideBindConfig
+from wbconfig import WideBindConfig
 from core import WideBindStack, MirrorLRScheduler
 from analyze_checkpoint import generate_report
 

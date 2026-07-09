@@ -862,6 +862,65 @@ Low freq ───→ Mid ───→ High ───→ Detail ───→ Com
 
 ---
 
+## 10. AdaptiveController: Fully Self-Tuning Hyperparameters
+
+The AdaptiveController eliminates all manual hyperparameter tuning for VSA memory
+gates, making the architecture fully self-regulating based on cognitive mirror state.
+
+### Two Fundamental Signals
+
+```
+exploration = min(1, |mirror| / 0.3)
+    How much correction is the mirror applying.
+    High → model is actively adjusting, needs aggressive learning.
+    Low → model is stable, needs conservative parameters.
+
+differentiation = min(1, var(log_scale) / 0.1)
+    How specialized has the mirror become (per-dim scaling).
+    High → mirror has learned which dims to trust/suppress.
+    Low → mirror hasn't differentiated, still exploring.
+```
+
+### Adapted Parameters
+
+| Parameter | Range | Signal | Math |
+|-----------|-------|--------|------|
+| `b_d` (decay bias) | [3.0, 6.0] → τ ≈ [20, 400] | exploration | `6.0 - expl × 3.0` |
+| `b_i` (write bias) | [-5.0, -1.0] → i_gate ≈ [0.007, 0.269] | exploration | `-5.0 + expl × 4.0` |
+| `w_mem2v` scale | [0.5, 1.0] | differentiation | `1.0 - diff × 0.5` |
+| EMA α (global state) | [0.90, 0.99] | differentiation | `0.90 + diff × 0.09` |
+| Noise scale (gates) | [0.001, 0.05] | differentiation | `0.05 - diff × 0.049` |
+
+### Intuition
+
+- **High exploration** (mirror making large corrections): memory should be short
+  (low b_d/tau) and write-heavy (high b_i/i_gate) to capture the corrections.
+
+- **High differentiation** (mirror has specialized per dimension): memory should
+  yield to the mirror (low w_mem2v_scale) and update its self-model slowly
+  (high EMA alpha).
+
+### Gate Bias Parameterization
+
+Gate biases are excluded from the optimizer (bypassed in `param_groups`) and set
+directly via `bn.Parameter.fill_()` before each forward pass. This avoids gradient
+conflict between adaptive control and learned updates.
+
+### Integration Points
+
+```
+WideBindStack.forward():
+    1. Compute expl, diff from all layers' mirrors
+    2. Fill_ all layer.b_d, layer.b_i with adaptive values
+    3. Pass mem2v_scale to each WideBindBlock
+    4. Use adaptive ema_alpha for global state aggregation
+
+WideBindBlock.forward():
+    1. Accept mem2v_scale parameter
+    2. Apply: enhanced = bind_out + mem_read × w_mem2v × mem2v_scale + mirror
+```
+
+
 ## 9. Mathematical Appendix
 
 ### A. Prefix Scan Associativity Proof
