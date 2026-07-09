@@ -1,10 +1,13 @@
 """Quick generation test."""
-import sys, torch
+import sys, os, torch
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.stdout = open(1, 'w', encoding='utf-8', closefd=False)
 from torch.serialization import add_safe_globals
-from config import WideBindConfig
-from core import WideBindStack
-from generate import load_russian_tokenizer, generate
+from core import WideBindConfig, WideBindStack
+try:
+    from generate import load_russian_tokenizer, generate
+except ImportError:
+    from scripts.generate import load_russian_tokenizer, generate
 
 add_safe_globals([WideBindConfig])
 

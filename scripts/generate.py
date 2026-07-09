@@ -4,20 +4,20 @@ Uses HuggingFace tokenizer from the training data directory.
 """
 
 import os, sys, math, torch, json
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-from config import WideBindConfig
-from core import WideBindStack
+from core import WideBindConfig, WideBindStack
 
 
 def load_russian_tokenizer(path=None):
     """Load BPE tokenizer from russian_tokenizer/tokenizer.json."""
     if path is None:
-        path = os.path.join(os.path.dirname(__file__), '..', 'fcp')
+        path = os.path.join(os.path.dirname(__file__), '..', '..', 'fcp')
     tok_file = os.path.join(path, 'russian_tokenizer', 'tokenizer.json')
     if not os.path.exists(tok_file):
-        tok_file = os.path.join(os.path.dirname(__file__), 'fcp', 'russian_tokenizer', 'tokenizer.json')
+        tok_file = os.path.join(os.path.dirname(__file__), '..', 'fcp', 'russian_tokenizer', 'tokenizer.json')
     if os.path.exists(tok_file):
         tok = Tokenizer.from_file(tok_file)
         tok.enable_padding(pad_id=0, pad_token='<|pad|>')

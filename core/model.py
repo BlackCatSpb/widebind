@@ -6,7 +6,7 @@ import math, os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from wbconfig import WideBindConfig
+from .config import WideBindConfig
 
 
 # ─── Utilities ──────────────────────────────────────────────────────────

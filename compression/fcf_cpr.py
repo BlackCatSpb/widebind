@@ -4,7 +4,7 @@ Compresses WideBind .pt files: removes deterministic buffers,
 quantizes real weights with uniform 8-bit per tensor.
 """
 import math, os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 
 

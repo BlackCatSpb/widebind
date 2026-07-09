@@ -3,14 +3,17 @@ WideBind training: streaming from token_stream_{GENRE}.bin files.
 """
 
 import os, sys, math, time, json, glob, pickle
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import torch.nn.functional as F
 import numpy as np
 from torch.serialization import add_safe_globals
 
-from wbconfig import WideBindConfig
-from core import WideBindStack, MirrorLRScheduler
-from analyze_checkpoint import generate_report
+from core import WideBindConfig, WideBindStack, MirrorLRScheduler
+try:
+    from analyze_checkpoint import generate_report
+except ImportError:
+    from scripts.analyze_checkpoint import generate_report
 
 add_safe_globals([WideBindConfig])
 

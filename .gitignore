@@ -7,3 +7,5 @@ __pycache__/
 *.pth
 *.bin
 tokenizer/
+generation_output.txt
+*_report.html

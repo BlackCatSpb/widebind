@@ -4,17 +4,17 @@ Usage:
     from google.colab import drive
     drive.mount('/content/drive')
 
-    !python colab_train.py --drive-path /content/drive/MyDrive/widebind_data
+    !python scripts/colab_train.py --drive-path /content/drive/MyDrive/widebind_data
 """
 
 import os, sys, math, time, glob, argparse
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import torch.nn.functional as F
 import numpy as np
 from torch.serialization import add_safe_globals
 
-from wbconfig import WideBindConfig
-from core import WideBindStack, MirrorLRScheduler, AdaptiveController
+from core import WideBindConfig, WideBindStack, MirrorLRScheduler, AdaptiveController
 
 add_safe_globals([WideBindConfig])
 

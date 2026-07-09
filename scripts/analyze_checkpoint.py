@@ -1,15 +1,15 @@
 """
 Generate HTML analysis report from any WideBind checkpoint (.pt or _fcf.pt).
-Usage: python analyze_checkpoint.py <checkpoint.pt>
+Usage: python scripts/analyze_checkpoint.py <checkpoint.pt>
 """
 
 import os, sys, math, json, textwrap
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import torch.nn.functional as F
 from torch.serialization import add_safe_globals
-from wbconfig import WideBindConfig
-from core import WideBindStack, dct_basis, zeckendorf_codes
-from fcf_cpr import FCF_CPR
+from core import WideBindConfig, WideBindStack, dct_basis, zeckendorf_codes
+from compression import FCF_CPR
 
 add_safe_globals([WideBindConfig])
 
@@ -391,7 +391,7 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('Usage: python analyze_checkpoint.py <checkpoint.pt>')
+        print('Usage: python scripts/analyze_checkpoint.py <checkpoint.pt>')
         sys.exit(1)
     ckpt_path = sys.argv[1]
     if not os.path.isfile(ckpt_path):
