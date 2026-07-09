@@ -153,6 +153,7 @@ class CognitiveMirror(nn.Module):
         self.w_sym_v = nn.Parameter(torch.randn(K))
         
         self.log_scale = nn.Parameter(torch.zeros(D))
+        self.register_buffer('_last_magnitude', torch.zeros(1))
     
     def forward(self, h, mem_all, global_state=None):
         B, L, D = h.shape
@@ -185,7 +186,7 @@ class CognitiveMirror(nn.Module):
         mirror = torch.tanh(delta @ self.W_out)
         mirror = mirror * torch.exp(self.log_scale)
         
-        self._last_magnitude = mirror.abs().mean().item()
+        self._last_magnitude.fill_(mirror.abs().mean().item())
         
         return mirror
 
@@ -469,8 +470,7 @@ class AdaptiveController:
             m = layer.mirror
             ls = m.log_scale.data
             var_sum += ls.var().item()
-            if hasattr(m, '_last_magnitude'):
-                mag_sum += m._last_magnitude
+            mag_sum += m._last_magnitude.item()
         n = len(blocks)
         avg_var = var_sum / n
         avg_mag = mag_sum / n
@@ -565,8 +565,7 @@ class MirrorLRScheduler:
         for layer in self.model.layers:
             ls = layer.mirror.log_scale.data
             var_sum += ls.var().item()
-            if hasattr(layer.mirror, '_last_magnitude'):
-                mag_sum += layer.mirror._last_magnitude
+            mag_sum += layer.mirror._last_magnitude.item()
         n = len(self.model.layers)
         return var_sum / n, mag_sum / n
 
