@@ -1,128 +1,166 @@
 # WideBind
 
-Гибридная не-трансформерная языковая модель. Без softmax, без attention, без QKV.
+**Не-трансформерная языковая модель** на когнитивных зеркалах, VSA-памяти и bottleneck bind. Никакого softmax, attention или QKV.
 
-**41.25M параметров | 24 слоя | D=896 | K=16 bottleneck bind | Grouped MLP (8×112→896→112)**
-
----
-
-## Мотивация
-
-Трансформеры доминируют в NLP, но O(L²) attention и неограниченный KV-cache — архитектурные ограничения, а не фичи. WideBind исследует альтернативу:
-
-- **VSA-память** — состояние O(D) на слой (336 KB на все 24 слоя), O(L log L) параллельный prefix scan
-- **Bottleneck bind (D→K→D)** — билинейная проекция через K=16. Решает проблему диагонального якобиана чистых element-wise VSA (модели умирали после 4 слоёв)
-- **Grouped MLP** — D=896 разбивается на 8 независимых групп, каждая с 8× внутренним expansion (112→896→112). Параметров столько же, сколько в плоском 896→896→896, но каждая группа учится в своём подпространстве
-- **Cognitive Mirror** — bounded self-consistency: temporal/smooth/symmetry/global пути, tanh(W_out) × exp(log_scale)
-- **DCT Spectral** — learned per-dim частотная маска (lambda_k растёт 0.5→1.5 по слоям)
-
----
-
-## Архитектура (блок)
-
-```
-h → Pre-LN (RMS)
-  → Depthwise Conv1d (k=48, groups=D)
-  → Bottleneck Bind (D→K=16→bilinear→D)
-  → VSA Memory (prefix scan, τ≈150)
-  → Cognitive Mirror (3 local + 1 global path)
-  → h += bind + mem_read + mirror
-  → DCT Spectral (h_dct * lambda_k)
-  → Grouped MLP (8 групп × 112→896→112, SiLU)
-  → h_out
-```
-
-### VSA Memory
-
-```
-mem[t] = sigmoid(h·w_d + b_d) · mem[t-1] + sigmoid(h·w_i + b_i) · h[t]
-```
-τ ≈ 150 (b_d=5.0) — первый токен сохраняется на ~42% после 128 шагов. Ассоциативный параллельный prefix scan.
-
-### Grouped MLP
-
-| G | d | expand | Параметров | Эффект |
-|---|---|---|---|---|
-| 8 | 112 | 8× | 1,606,528 (93.6% слоя) | 8× expansion per group |
-
-Каждая группа: SiLU(W_down_g · SiLU(W_up_g · h_g)). Mixing между группами — через residual + conv + bind + mirror соседних блоков.
-
-### Cognitive Mirror
-
-Четыре пути в K=16 → rms_norm → tanh(W_out) → exp(log_scale):
-
-1. **Temporal:** h − mem_centroid (ошибка предсказания VSA-памяти)
-2. **Global:** h − cross-layer EMA (отклонение от self-model всех слоёв)
-3. **Smooth:** h − conv1×3(h) (локальная когерентность)
-4. **Symmetry:** (h·w_u) · (h[t-1]·w_v) (билинейная самосогласованность)
-
-tanh гарантирует bounded correction; exp(log_scale) — per-dim амплитуда.
-
-### Embedding / LM Head
-
-Zeckendorf коды Фибоначчи (K=23) + learned linear projection. 50K словарь.
+Архитектура вдохновлена тем, как мозг обрабатывает последовательности: **векторная суперпозиция** вместо attention, **биллинейный баттлнек** вместо multi-head projection, **когнитивное зеркало** для самокоррекции.
 
 ---
 
 ## Быстрый старт
 
-### Требования
-- Python 3.10+, PyTorch 2.0+
-- 2 GB VRAM (MX550) или больше
-- Токен стримы в `.bin` формате (uint16 numpy array)
+### Инференс (локально, MX550 2GB)
 
-### Тренировка
 ```bash
-python train.py --data-dir /path/to/token_streams --save-dir checkpoints
+python scripts/gen_demo.py
 ```
 
-Ключевые флаги: `--batch-size 2 --seq-len 128 --n-layers 24 --lr 3e-4 --warmup 1000`
+### Тренировка (Colab T4 16GB)
 
-Resume с последнего: `--resume auto`
+1. Загрузить `core/`, `compression/`, `scripts/`, `notebooks/` на Google Drive в папку `widebind_data/src/`
+2. Открыть `notebooks/colab.ipynb` → Run All
 
-### Отчёты по чекпоинтам
-При каждом сохранении генерируется HTML-отчёт:
-```
-checkpoints/step_5000_report.html
+### Анализ чекпоинта
+
+```bash
+python scripts/analyze_checkpoint.py checkpoints/step_N.pt
+# → step_N_report.html
 ```
 
 ---
 
-## Структура проекта
+## Чем WideBind не является
 
-| Файл | Назначение |
+| Это НЕ | Потому что |
 |---|---|
-| `core.py` | WideBindBlock, GroupedMLP, CognitiveMirror, VSA prefix scan, эмбеддинги |
-| `config.py` | WideBindConfig dataclass (все гиперпараметры) |
-| `train.py` | Streaming trainer — AdamW + cosine LR + checkpointing |
-| `analyze_checkpoint.py` | Генерация HTML-отчёта из `.pt` чекпоинта |
-| `TRAINING_LOG.md` | Живой лог тренировки, сравнения, изменения архитектуры |
+| Transformer | Нет attention, нет QKV, нет softmax |
+| Pure VSA / hyperdimensional computing | Есть bottleneck bind (D→K→D) — даёт скрещивание размерностей |
+| SSM / State Space Model | VSA memory — это не линейная рекуррентность, а prefix scan с сигмоидными гейтами |
+| RNN | Prefix scan параллелизуется за O(L log L), не O(L) последовательно |
+| MoE | Все 32 группы MLP всегда активны |
 
 ---
 
-## Статус обучения
+## Архитектура за 30 секунд
 
-Текущие результаты в [TRAINING_LOG.md](TRAINING_LOG.md). Последнее: step 1000, val_loss=1.99, ppl=7.32.
+```
+tokens → Zeckendorf code (K=23) → Linear(K→D=3584) → [Block × 24] → LM Head
+```
+
+**Один блок:**
+
+```
+h → RMSNorm → Conv1d depthwise → Bind (D→K=16→D) → VSA Memory → Cognitive Mirror → DCT Spectral → GroupedMLP → h'
+```
+
+Компоненты:
+
+- **Bind** — проекция в K=16, биллинейная склейка, проекция обратно. Единственный механизм скрещивания размерностей.
+- **VSA Memory** — prefix scan: `mem[t] = sigmoid(decay) · mem[t-1] + sigmoid(i_gate) · h[t]`. Векторная суперпозиция, не матрица ковариации.
+- **Cognitive Mirror** — 4 пути самоконтроля в K-space: temporal (отклонение от памяти), global (отклонение от предыдущих слоёв), smoothness (предсказуемость соседями), symmetry (биллинейная согласованность).
+- **DCT Spectral** — весовое масштабирование частот DCT-II. L0: все частоты ×0.5, L23: все частоты ×1.5.
+- **GroupedMLP** — D=3584 разбит на 32 группы по 112, каждая с 8× внутренним расширением. Имитация большого MLP без роста параметров.
+
+Параметры: **165M** (D=3584, 24 слоя).
 
 ---
 
-## Известные проблемы
+## Ключевые идеи (для специалиста)
 
-1. **Last-layer collapse** — L23 eff_rank ≈ 12/112 на группу (было 4/896 в плоском MLP — улучшение в 22×, но коллапс остаётся). Структурно: LM head (896→23→50000) агрессивно сжимает на последнем слое.
-2. **b_d / b_i frozen at init** — decay (5.0) и write gate bias (-3.0) не двигаются. init — локальный минимум градиента.
-3. **Mirror frozen** — log_scale ≈ 0 (exp=1) первые 1000 шагов. Пути зеркала активны, но амплитуда не учится.
-4. **Плоский MLP с bottleneck=D мёртв** — rank ≤ D. GroupedMLP решает это внутренним 8× expansion в каждой группе.
+### Почему не attention?
+
+Attention — O(L²). Prefix scan — O(L log L). VSA memory — O(D) состояния на слой, независимо от длины последовательности.
+
+### Почему K=16 работает?
+
+Bind — это `h·W_proj → u·v → W_out`. Матрица преобразования M = W_proj · diag(u) · diag(v) · W_out имеет **ранг K**, но размер D×D. Градиент течёт через все D×K + K×D путей — никакого диагонального затухания, как в pure VSA.
+
+При K=16 и D=3584: grad/param > 0.4 на ините. При K=1: grad/param ≈ 0. При K=896 (полная проекция): grad/param ≈ 0.9, но 1.6M параметров на слой вместо 28K.
+
+### Cognitive Mirror — что это?
+
+Четыре сигнала рассогласования в K-space:
+
+1. **Temporal:** `h[t] - mean(mem)` — текущий вход не похож на накопленную память
+2. **Global:** `h[t] - global_state` — текущий вход не похож на агрегат предыдущих слоёв
+3. **Smoothness:** `h[t] - conv1x3(h[t])` — не-гладкий переход
+4. **Symmetry:** `(h[t]·u) · (h[t-1]·v)` — биллинейное рассогласование соседних шагов
+
+Сумма → rms_norm → tanh(W_out) → **exp(log_scale)**. tanh гарантирует коррекцию в [-1, 1]; log_scale — пер-дим амплитуда.
+
+### AdaptiveController — автоподстройка
+
+Никаких ручных гиперпараметров для гейтов памяти. Два сигнала:
+
+- **exploration** = `mean(|mirror|) / 0.3` — зеркало активно → короткая память, агрессивная запись
+- **differentiation** = `var(log_scale) / 0.1` — зеркало специализировалось → меньше памяти, стабильнее EMA
+
+Всё считается в `.forward()` одной строкой: `layer.b_i.fill_(b_i_val)`.
+
+### FCF-CPR сжатие
+
+Uniform 8-bit per tensor с per-tensor min/max. Удаляет детерминированные буферы (V_dct, Zeckendorf codes). 3.22 GB → 1.48 GB (с оптимизатором), 165 MB (model-only). MSE 1.7e-5.
 
 ---
 
-## Гипотеза специализации слоёв (по lambda_k)
+## Проект
 
-| Слой | lambda_k | Предполагаемая роль |
+```
+WideBind/
+├── core/                    # Модель
+│   ├── config.py            # WideBindConfig — все гиперпараметры
+│   └── model.py             # WideBindStack, блоки, зеркало, MLP, адаптивный контроллер
+├── compression/             # FCF-CPR сжатие чекпоинтов
+│   └── fcf_cpr.py           # save_compressed / load_compressed
+├── scripts/                 # Всё, что можно запустить
+│   ├── train.py             # Локальная тренировка (CPU/MX550)
+│   ├── colab_train.py       # Тренировка на Colab (T4, fp16, auto-batch)
+│   ├── analyze_checkpoint.py # HTML-отчёт по чекпоинту
+│   ├── generate.py          # Генерация текста (с токенизатором)
+│   ├── gen_demo.py          # Демо генерации из сжатого чекпоинта
+│   └── run_generate.py      # Быстрый тест генерации
+├── tests/
+│   └── test_infer.py        # Бенчмарк инференса (VRAM, tok/s)
+├── notebooks/
+│   └── colab.ipynb          # Colab для D=3584 на T4
+├── docs/
+│   ├── ARCHITECTURE.md      # Полное описание архитектуры
+│   └── TRAINING_LOG.md      # Логи тренировок
+├── config.py / wbconfig.py  # Шимы для старых чекпоинтов
+├── checkpoints/             # Веса (gitignored)
+└── requirements.txt
+```
+
+---
+
+## Статус
+
+- **Архитектура:** финальная (CognitiveMirror + GroupedMLP + AdaptiveController)
+- **Сжатие:** FCF-CPR (8-bit uniform, 11.5× без потерь качества)
+- **Тренировка:** D=896 (41M) — **val_loss 2.27, ppl 9.67** | D=3584 (165M) — **step 15000**, train_loss 2.7-3.0
+- **Инференс:** fp16, 0.98 GB VRAM, 15 tok/s (MX550)
+- **Токенизатор:** BPE, vocab=50000, русский
+
+---
+
+## Производительность
+
+| Конфиг | Параметры | VRAM (fp16) | tok/s (MX550) | tok/s (T4) |
+|--------|-----------|-------------|---------------|------------|
+| D=896, 24L | 41M | 0.5 GB | 25 | 420 |
+| D=3584, 24L | 165M | 0.98 GB | 15 | 214 |
+
+---
+
+## Структура параметров на слой (D=3584, G=32, expand=8×)
+
+| Компонент | Параметров | Доля |
 |---|---|---|
-| L0-L4 | 0.50-0.67 | Низкие частоты — интеграция контекста, тема |
-| L5-L12 | 0.72-0.98 | Средние частоты — синтаксис, локальные зависимости |
-| L13-L18 | 1.02-1.28 | Высокие частоты — лексика, точный выбор слов |
-| L19-L22 | 1.33-1.46 | Детализация — прагматика, уточнение |
-| L23 | 1.50 | Сжатие в LM head |
-
-lambda_k растёт монотонно с глубиной, что согласуется с иерархической обработкой языка.
+| GroupedMLP | 6,422,528 | 93.5% |
+| Bottleneck Bind | 172,048 | 2.5% |
+| Cognitive Mirror | 172,049 | 2.5% |
+| VSA Memory (гейты + момент) | 50,176 | 0.7% |
+| Depthwise Conv1d (k=48) | 172,032 | 2.5% |
+| Spectral lambda_k | 3,584 | 0.05% |
+| **Итого на слой** | **6,992,417** | 100% |
+| Embedding + LM Head | 165,616 | 0.1% |
+| **Total** | **165,313,024** | 165M |
