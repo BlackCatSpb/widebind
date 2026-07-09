@@ -269,8 +269,11 @@ class WideBindBlock(nn.Module):
         self.w_d = nn.Parameter(torch.randn(cfg.D) * 0.1)    # content-dependent decay
         self.w_q = nn.Parameter(torch.randn(cfg.D))
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
-        self.b_i = nn.Parameter(torch.full((cfg.D,), -3.0))  # sigmoid init → i_gate ≈ 0.047
-        self.b_d = nn.Parameter(torch.full((cfg.D,), 5.0))    # high init → τ ≈ 150
+        # Linear decay across layers: shallow → short memory, deep → long
+        layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
+        b_d_init = 2.0 + 3.0 * layer_frac  # L0: τ≈7, L23: τ≈400
+        self.b_i = nn.Parameter(torch.full((cfg.D,), -3.0))
+        self.b_d = nn.Parameter(torch.full((cfg.D,), b_d_init))
 
         # First moment
         
@@ -320,7 +323,7 @@ class WideBindBlock(nn.Module):
         bind_out = (u * v) @ self.W_out  # (B, L, D)
         
         # ─── VSA Memory (adaptive gates) ───
-        i_gate = torch.sigmoid(h * self.w_i + self.b_i)     # (B, L, D) bounded [0, 1]
+        i_gate = F.softplus(h * self.w_i + self.b_i)        # (B, L, D) bounded [0, ∞)
         decay = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D)
         
         mem_all, mem_state_out = vsa_prefix_scan(decay, h * i_gate, mem_state)
@@ -375,11 +378,13 @@ class WideBindStack(nn.Module):
         # ─── Adaptive gate biases from mirror stats ───
         with torch.no_grad():
             expl, _ = AdaptiveController.stats(self.layers)
-            b_d_val = 6.0 - expl * 3.0
-            b_i_val = -5.0 + expl * 4.0
             mem2v_scale = AdaptiveController.w_mem2v_scale(self.layers)
             ema_alpha = AdaptiveController.ema_alpha(self.layers)
-            for layer in self.layers:
+            n = len(self.layers)
+            for i, layer in enumerate(self.layers):
+                layer_frac = i / max(n - 1, 1)
+                b_i_val = -5.0 + expl * 4.0
+                b_d_val = (2.0 + 3.0 * layer_frac) + expl * (6.0 - (2.0 + 3.0 * layer_frac))
                 layer.b_i.fill_(b_i_val)
                 layer.b_d.fill_(b_d_val)
         
@@ -413,27 +418,44 @@ class WideBindStack(nn.Module):
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
     
-    def param_groups(self, lr=None, weight_decay=None):
+    def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=5.0):
         """Optimizer parameter groups with weight decay.
-        Gate biases (b_d, b_i) are excluded — they are set adaptively by AdaptiveController."""
+        Gate biases (b_d, b_i) are excluded — set adaptively by AdaptiveController.
+        Gate weight params get increased lr for faster adaptation."""
         cfg = self.cfg
         lr = lr or cfg.lr
         wd = weight_decay or cfg.weight_decay
         
         decay = []
         no_decay = []
+        gate_decay = []
+        gate_no_decay = []
         for name, p in self.named_parameters():
             if '.b_d' in name or '.b_i' in name:
                 continue  # adaptive controller handles these
-            if p.ndim < 2:
-                no_decay.append(p)
+            is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_mem2v',
+                                               '.w_k_mu', '.w_q_mu', '.w_mu_mem',
+                                               '.w_u', '.w_v'])
+            if is_gate:
+                if p.ndim < 2:
+                    gate_no_decay.append(p)
+                else:
+                    gate_decay.append(p)
             else:
-                decay.append(p)
+                if p.ndim < 2:
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
         
-        return [
+        groups = [
             {'params': decay, 'lr': lr, 'weight_decay': wd},
             {'params': no_decay, 'lr': lr, 'weight_decay': 0},
         ]
+        if gate_decay:
+            groups.append({'params': gate_decay, 'lr': lr * gate_lr_mult, 'weight_decay': wd})
+        if gate_no_decay:
+            groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0})
+        return groups
 
 
 # ─── Adaptive Controller ──────────────────────────────────────────────
@@ -456,7 +478,8 @@ class AdaptiveController:
 
     Mathematically derived ranges:
     ──────────────────────────────
-    b_d  ∈ [3.0, 6.0]  →  τ ≈ [20, 400]  (decay timescale)
+    b_d  ∈ [2.0 + 3.0*layer_frac, 6.0] per layer
+         L0: τ≈[7, 400], L23: τ≈[150, 400]
     b_i  ∈ [-5.0, -1.0] → i_gate ≈ [0.007, 0.269] (write rate)
     w_mem2v_scale ∈ [0.5, 1.0]  (memory contribution)
     ema_alpha ∈ [0.90, 0.99]  (cross-layer memory aggregation)
@@ -480,11 +503,10 @@ class AdaptiveController:
 
     @staticmethod
     def b_d(blocks):
-        """Decay bias. High exploration → shorter memory (model needs fresh signal).
+        """Decay bias (average across layers). High exploration → shorter memory.
 
         τ = -1/ln(sigmoid(b_d))
-        b_d=3.0 → τ≈20  (short memory, high exploration)
-        b_d=6.0 → τ≈400 (long memory, low exploration)
+        Per-layer init: L0=2.0(τ≈7), L23=5.0(τ≈150), adjusted by exploration up to 6.0(τ≈400).
         """
         expl, _ = AdaptiveController.stats(blocks)
         return 6.0 - expl * 3.0
