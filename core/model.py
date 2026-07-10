@@ -119,77 +119,128 @@ class LmHead(nn.Module):
         return self.proj(h) @ self.codes.T
 
 
-# ─── Cognitive Mirror ─────────────────────────────────────────────────
+# ─── Grouped Cognitive Mirror (32 эксперта) ────────────────────────────
 
-class CognitiveMirror(nn.Module):
+class GroupedCognitiveMirror(nn.Module):
     """
-    Unified self-consistency mirror with three bounded correction paths.
+    Ансамбль из 32 экспертов-зеркал, каждый в своём d=112 подпространстве.
     
-    Local (per-layer) paths:
-      1. Temporal:   h[t] - memory centroid    (VSA prediction error)
-      2. Smoothness: h[t] - conv1x3(h[t])      (local coherence)
-      3. Symmetry:   h[t] . h[t-1]              (bilinear trajectory)
+    Каждый эксперт:
+      - Имеет свой K-space (k=4) внутри своего d=112
+      - Вычисляет 3 сигнала коррекции: temp, smooth, sym
+      - Имеет свой tanh_bias + skip_connection + log_scale
+      - Имеет meta-gate: учится доверять/игнорировать эксперта
     
-    Global (cross-layer) path:
-      - h[t] - global_state                     (deviation from global self-model)
+    Внешний сигнал подкрепления:
+      - prev_grad_norm: норма градиента по подпространству (c предыдущего backward)
+      - Устанавливается извне через cache_grad_norms(grad_h) после backward
     
-    All paths in K-space -> rms_norm -> tanh(W_out) -> exp(log_scale).
-    tanh guarantees bounded correction; exp(log_scale) gives per-dim amplitude.
+    Skip connection (alpha=0.1):
+      - mirror = tanh(linear + bias) + alpha * linear
+      - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
-    def __init__(self, D, K):
+    def __init__(self, D, G=32, k=4, skip_alpha=0.1):
         super().__init__()
-        proj_std = 1.0 / (D * K) ** 0.25
+        assert D % G == 0
+        self.D = D
+        self.G = G
+        self.k = k
+        self.d = D // G
+        self.skip_alpha = skip_alpha
         
-        self.W_proj = nn.Parameter(torch.randn(D, K) * proj_std)
-        self.W_out = nn.Parameter(torch.randn(K, D) * proj_std)
+        proj_std = 1.0 / (self.d * k) ** 0.25
         
-        self.w_temp = nn.Parameter(torch.randn(K))
-        self.w_global = nn.Parameter(torch.randn(K))
+        self.W_proj = nn.Parameter(torch.randn(G, self.d, k) * proj_std)
+        self.W_out = nn.Parameter(torch.randn(G, k, self.d) * proj_std)
         
-        self.conv_smooth = nn.Conv1d(K, K, 3, padding=2, groups=K, bias=False)
+        self.w_temp = nn.Parameter(torch.randn(G, k))
+        self.w_global = nn.Parameter(torch.randn(G, k))
+        
+        # Depthwise conv per group in K-space
+        self.conv_smooth = nn.Conv1d(G * k, G * k, 3, padding=2,
+                                      groups=G * k, bias=False)
         nn.init.dirac_(self.conv_smooth.weight)
         
-        self.w_sym_u = nn.Parameter(torch.randn(K))
-        self.w_sym_v = nn.Parameter(torch.randn(K))
+        self.w_sym_u = nn.Parameter(torch.randn(G, k))
+        self.w_sym_v = nn.Parameter(torch.randn(G, k))
         
-        self.tanh_bias = nn.Parameter(torch.zeros(K))  # breaks tanh zero-mean symmetry
-        self.log_scale = nn.Parameter(torch.zeros(D))
+        self.tanh_bias = nn.Parameter(torch.zeros(G, k))
+        self.log_scale = nn.Parameter(torch.zeros(G, self.d))
+        
+        # Per-expert meta-gate: pooled h_g -> gate logit
+        gate_std = 1.0 / (self.d + 1) ** 0.5
+        self.w_gate = nn.Parameter(torch.randn(G, self.d) * gate_std)
+        self.b_gate = nn.Parameter(torch.zeros(G))
+        
+        # External gradient cache (устанавливается после backward)
+        self.register_buffer('_prev_grad_norm', torch.zeros(G))
         self.register_buffer('_last_magnitude', torch.zeros(1))
     
     def forward(self, h, mem_all, global_state=None):
         B, L, D = h.shape
-        K = self.W_proj.shape[1]
+        G, d, k = self.G, self.d, self.k
         
-        hp = h @ self.W_proj  # (B, L, K)
+        # Split into subspaces
+        h_g = h.reshape(B, L, G, d)           # (B, L, G, d)
+        mem_g = mem_all.reshape(B, L, G, d)
+        mc_g = mem_g.mean(dim=1, keepdim=True)  # (B, 1, G, d)
         
-        # 1. Temporal: deviation from local memory centroid
-        mem_centroid = mem_all.mean(dim=1, keepdim=True)
-        mc_k = mem_centroid @ self.W_proj
-        temp_k = (hp - mc_k) * self.w_temp
+        # 1. Project each group to its K-space
+        hp = torch.einsum('blgd,gdk->blgk', h_g, self.W_proj)    # (B, L, G, k)
+        mc_k = torch.einsum('b l gd,gdk->b l gk', mc_g, self.W_proj)
         
-        # 1b. Global: deviation from cross-layer state
+        # Temporal: deviation from memory centroid
+        temp_k = (hp - mc_k) * self.w_temp  # (B, L, G, k)
+        
+        # Global: deviation from cross-layer state
         if global_state is not None:
-            gs_k = global_state @ self.W_proj
+            gs_k = torch.einsum('b l gd,gdk->b l gk',
+                                global_state.reshape(1, 1, G, d), self.W_proj)
             temp_k = temp_k + (hp - gs_k) * self.w_global
         
-        # 2. Smoothness: local coherence via conv1x3
-        hp_perm = hp.transpose(1, 2)
-        hp_smooth = self.conv_smooth(hp_perm)[:, :, :L].transpose(1, 2)
+        # 2. Smoothness: local coherence in K-space
+        hp_perm = hp.permute(0, 2, 3, 1).reshape(B, G * k, L)  # (B, G*k, L)
+        hp_smooth = self.conv_smooth(hp_perm)[:, :, :L]
+        hp_smooth = hp_smooth.reshape(B, G, k, L).permute(0, 3, 1, 2)  # (B, L, G, k)
         smooth_k = hp - hp_smooth
         
-        # 3. Symmetry: h[t] . h[t-1] bilinear (zero at t=0, no predecessor)
+        # 3. Symmetry: bilinear temporal interaction
         hp_prev = torch.cat([torch.zeros_like(hp[:, 0:1]), hp[:, :-1]], dim=1)
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
         delta = temp_k + smooth_k + sym_k
-        delta = F.rms_norm(delta, (K,))
+        delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
+        delta = delta + self.tanh_bias  # break zero-mean symmetry in K-space
         
-        mirror = torch.tanh(delta @ self.W_out + self.tanh_bias)
-        mirror = mirror * torch.exp(self.log_scale)
+        # Linear projection + skip connection
+        linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
+        mirror = torch.tanh(linear) + self.skip_alpha * linear
+        mirror = mirror * torch.exp(self.log_scale)  # per-dim scale
+        
+        # Per-expert meta-gate
+        # Gate from pooled h_g + external gradient signal
+        h_pool = h_g.mean(dim=(0, 1))  # (G, d) — pooled over B,L per expert
+        gate_logits = torch.einsum('gd,gd->g', h_pool, self.w_gate) + self.b_gate
+        gate_logits = gate_logits + self.w_grad_signal(self._prev_grad_norm)
+        expert_gate = torch.sigmoid(gate_logits)  # (G,)
+        
+        mirror = mirror * expert_gate.reshape(1, 1, G, 1)  # (B, L, G, d)
+        mirror = mirror.reshape(B, L, D)
         
         self._last_magnitude.fill_(mirror.abs().mean().item())
         
         return mirror
+    
+    @staticmethod
+    def w_grad_signal(grad_norm):
+        """Map cached gradient norm to gate modulation."""
+        return 0.1 * torch.tanh(grad_norm - 0.01)
+    
+    def cache_grad_norms(self, grad_h):
+        """Call after backward: store per-subspace gradient norm."""
+        with torch.no_grad():
+            g_norms = grad_h.reshape(-1, self.G, self.d).norm(dim=-1).mean(dim=0)
+            self._prev_grad_norm.copy_(g_norms)
 
 
 # ─── Grouped MLP ──────────────────────────────────────────────────────
@@ -262,8 +313,8 @@ class WideBindBlock(nn.Module):
         self.w_v = nn.Parameter(torch.randn(cfg.bind_K))
         self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
         
-        # Cognitive Mirror (self-consistency correction)
-        self.mirror = CognitiveMirror(cfg.D, cfg.bind_K)
+        # Cognitive Mirror (32 эксперта, grouped K-space)
+        self.mirror = GroupedCognitiveMirror(cfg.D)
         
         # ─── VSA Memory (gates) ───
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
@@ -439,7 +490,8 @@ class WideBindStack(nn.Module):
                                                '.w_u', '.w_v',
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
-                                               '.mirror.w_temp', '.mirror.w_global'])
+                                               '.mirror.w_temp', '.mirror.w_global',
+                                               '.mirror.w_gate', '.mirror.b_gate'])
             if is_gate:
                 if p.ndim < 2:
                     gate_no_decay.append(p)
