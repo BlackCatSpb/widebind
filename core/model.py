@@ -383,7 +383,7 @@ class WideBindStack(nn.Module):
             n = len(self.layers)
             for i, layer in enumerate(self.layers):
                 layer_frac = i / max(n - 1, 1)
-                b_i_val = -5.0 + expl * 4.0
+                b_i_val = -3.0 + expl * 3.0
                 b_d_val = (2.0 + 3.0 * layer_frac) + expl * (6.0 - (2.0 + 3.0 * layer_frac))
                 layer.b_i.fill_(b_i_val)
                 layer.b_d.fill_(b_d_val)
@@ -480,7 +480,7 @@ class AdaptiveController:
     ──────────────────────────────
     b_d  ∈ [2.0 + 3.0*layer_frac, 6.0] per layer
          L0: τ≈[7, 400], L23: τ≈[150, 400]
-    b_i  ∈ [-5.0, -1.0] → i_gate ≈ [0.007, 0.269] (write rate)
+    b_i  ∈ [-3.0, 0.0] → i_gate ≈ [0.049, 0.693] (write rate, softplus)
     w_mem2v_scale ∈ [0.5, 1.0]  (memory contribution)
     ema_alpha ∈ [0.90, 0.99]  (cross-layer memory aggregation)
     noise_scale ∈ [0.001, 0.05]  (parameter noise for exploration)
@@ -515,12 +515,12 @@ class AdaptiveController:
     def b_i(blocks):
         """Write gate bias. High exploration → more writing (capture corrections).
 
-        i_gate = sigmoid(b_i)
-        b_i=-5.0 → i_gate≈0.007 (low write, model stable)
-        b_i=-1.0 → i_gate≈0.269 (high write, exploring)
+        i_gate = softplus(b_i) — note: softplus, not sigmoid.
+        b_i=-3.0 → i_gate≈0.049 (low write, model stable)
+        b_i= 0.0 → i_gate≈0.693 (high write, exploring)
         """
         expl, _ = AdaptiveController.stats(blocks)
-        return -5.0 + expl * 4.0
+        return -3.0 + expl * 3.0
 
     @staticmethod
     def w_mem2v_scale(blocks):
