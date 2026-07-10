@@ -13,7 +13,7 @@
 - **VSA-память** — состояние O(D) на слой (336 KB на все 24 слоя), O(L log L) параллельный prefix scan
 - **Bottleneck bind (D→K→D)** — билинейная проекция через K=16. Решает проблему диагонального якобиана чистых element-wise VSA (модели умирали после 4 слоёв)
 - **Grouped MLP** — D=896 разбивается на 8 независимых групп, каждая с 8× внутренним expansion (112→896→112). Параметров столько же, сколько в плоском 896→896→896, но каждая группа учится в своём подпространстве
-- **Cognitive Mirror** — bounded self-consistency: temporal/smooth/symmetry/global пути, tanh(W_out) + α·identity, exp(log_scale). **Grouped** — 32 эксперта, каждый в K=4 подпространстве.
+- **Cognitive Mirror** — bounded self-consistency: temp/pred/smooth/sym пути, frequency-adaptive K (lo/hi), predictive self-model (W_pred), gradient-adaptive gate (delta_var EMA). **Grouped** — 32 эксперта, каждый в K=8 подпространстве.
 - **DCT Spectral** — learned per-dim частотная маска (lambda_k растёт 0.5→1.5 по слоям)
 - **Partitioned Embedding** — sparse block codes (K=32, S=6), 32 сегмента × 112 dims, 1:1 с mirror группами
 
