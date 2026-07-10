@@ -2,7 +2,7 @@
 
 Гибридная не-трансформерная языковая модель. Без softmax, без attention, без QKV.
 
-**41.25M параметров | 24 слоя | D=896 | K=16 bottleneck bind | Grouped MLP (8×112→896→112)**
+**163M параметров | 24 слоя | D=3584 | K=16 bottleneck bind | Grouped MLP (32×112→896→112) | GroupedCognitiveMirror (32 эксперта) | Partitioned Embed/Head (K=32, S=6)**
 
 ---
 
@@ -13,8 +13,9 @@
 - **VSA-память** — состояние O(D) на слой (336 KB на все 24 слоя), O(L log L) параллельный prefix scan
 - **Bottleneck bind (D→K→D)** — билинейная проекция через K=16. Решает проблему диагонального якобиана чистых element-wise VSA (модели умирали после 4 слоёв)
 - **Grouped MLP** — D=896 разбивается на 8 независимых групп, каждая с 8× внутренним expansion (112→896→112). Параметров столько же, сколько в плоском 896→896→896, но каждая группа учится в своём подпространстве
-- **Cognitive Mirror** — bounded self-consistency: temporal/smooth/symmetry/global пути, tanh(W_out) × exp(log_scale)
+- **Cognitive Mirror** — bounded self-consistency: temporal/smooth/symmetry/global пути, tanh(W_out) + α·identity, exp(log_scale). **Grouped** — 32 эксперта, каждый в K=4 подпространстве.
 - **DCT Spectral** — learned per-dim частотная маска (lambda_k растёт 0.5→1.5 по слоям)
+- **Partitioned Embedding** — sparse block codes (K=32, S=6), 32 сегмента × 112 dims, 1:1 с mirror группами
 
 ---
 
@@ -58,9 +59,9 @@ mem[t] = sigmoid(h·w_d + b_d) · mem[t-1] + sigmoid(h·w_i + b_i) · h[t]
 
 tanh гарантирует bounded correction; exp(log_scale) — per-dim амплитуда.
 
-### Embedding / LM Head
+### Partitioned Embedding / LM Head
 
-Zeckendorf коды Фибоначчи (K=23) + learned linear projection. 50K словарь.
+Sparse block codes (K=32, S=6) — комбинаторная система счисления, ровно 6 из 32 бит на токен. D=3584 разбит на 32 сегмента × 112. Каждый бит — свой basis vector w_k ∈ ℝ¹¹². Gradient grouping: ∂L/∂w_k = 0 при z_k=0. 3584 параметра против 179.2M learned embedding.
 
 ---
 

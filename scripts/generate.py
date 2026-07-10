@@ -52,7 +52,7 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50):
         ctx = tokens[-L:].unsqueeze(0)
         
         h = model.embed_tokens(ctx)
-        out, state = model(h, state)
+        out, state, _ = model(h, state)
         
         logits = model.lm_head(out[:, -1, :])
         logits = logits / temperature
@@ -88,7 +88,7 @@ if __name__ == '__main__':
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     cfg = state.get('cfg', WideBindConfig())
     model = WideBindStack(cfg).to(device)
-    model.load_state_dict(state['model'])
+    model.load_state_dict(state['model'], strict=False)
     
     print(f'Loaded checkpoint: step={state.get("step", "?")}  params={model.param_count():,}')
     

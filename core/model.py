@@ -21,7 +21,9 @@ def dct_basis(n):
 
 
 def zeckendorf_codes(vocab=50000):
-    """Fibonacci Zeckendorf binary codes for vocab tokens."""
+    """Fibonacci Zeckendorf binary codes for vocab tokens.
+    Возвращает (V, K≈23) — длина кода зависит от vocab.
+    """
     fib = [1, 2]
     while fib[-1] <= vocab:
         fib.append(fib[-1] + fib[-2])
@@ -34,6 +36,36 @@ def zeckendorf_codes(vocab=50000):
             if n >= fib[j]:
                 codes[i, j] = 1.0
                 n -= fib[j]
+    return codes
+
+
+def sparse_block_codes(vocab=50000, K=32, S=6):
+    """Sparse block codes: ровно S единиц из K на каждый токен.
+    
+    Использует комбинаторную систему счисления (combinadic) с
+    фиксированной случайной перестановкой, чтобы все K бит были
+    равномерно представлены среди vocab токенов.
+    
+    Гарантии:
+      - C(K, S) ≥ vocab     (C(32,6)=906192 ≥ 50000 ✓)
+      - Ровно S=6 активных бит на каждый токен
+      - Каждый бит активен у ≈ vocab·S/K токенов (≈ 9375)
+      - Детерминированность (seed=42)
+    """
+    from math import comb
+    total = comb(K, S)
+    # Фиксированная случайная перестановка всех C(K, S) индексов
+    perm = torch.randperm(total, generator=torch.Generator().manual_seed(42))
+    codes = torch.zeros(vocab, K)
+    for v in range(vocab):
+        idx = int(perm[v].item())
+        n = idx
+        for i in range(S, 0, -1):
+            c = i - 1
+            while comb(c + 1, i) <= n:
+                c += 1
+            codes[v, c] = 1.0
+            n -= comb(c, i)
     return codes
 
 
@@ -92,7 +124,10 @@ def vsa_prefix_scan(a, b, state=None):
 # ─── Embedding ──────────────────────────────────────────────────────────
 
 class ZeckendorfEmbedding(nn.Module):
-    """Token -> D-space via Zeckendorf codes + learned projection."""
+    """Token -> D-space via Zeckendorf codes + learned projection.
+    
+    Legacy: проекция K→D через Linear. Ранг матрицы эмбеддингов ≤ K=23.
+    """
     def __init__(self, cfg):
         super().__init__()
         codes = zeckendorf_codes(cfg.vocab)
@@ -105,8 +140,51 @@ class ZeckendorfEmbedding(nn.Module):
         return self.proj(self.codes[tokens])
 
 
+class PartitionedEmbedding(nn.Module):
+    """Token -> D-space via partitioned sparse codes.
+    
+    D делится на K сегментов, K = D // seg_size (точное деление).
+    Каждый бит кода получает свой сегмент: h = Σ z_k · w_k.
+    
+    K=32, S=6: C(32,6)=906192 ≥ V=50000. Ровно 6 активных бит на токен.
+    Per-token: 6 × d = 6×112 = 672 dims (18.8%), детерминированно.
+    
+    Математические свойства:
+      - rank(E) = 3584 (полный ранг)
+      - Segment ↔ mirror group: 1:1 alignment (32×112)
+      - Равномерная частота бит: ~19% каждый
+      - K=32 → bind compression 32→16: ровно 2 сегмента на bind-канал
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
+        self.K = codes.shape[1]
+        self.register_buffer('codes', codes)
+        
+        D = cfg.D
+        assert D % self.K == 0, f'D={D} must be divisible by K={self.K}'
+        d = D // self.K
+        self.dims = [d] * self.K
+        offsets = list(range(0, D + 1, d))
+        self.register_buffer('_offsets', torch.tensor(offsets))
+        
+        self.basis = nn.Parameter(torch.randn(self.K, d))
+        nn.init.normal_(self.basis, std=0.02)
+    
+    def forward(self, tokens):
+        codes = self.codes[tokens]
+        B, L = tokens.shape
+        D = self._offsets[-1].item()
+        h = torch.zeros(B, L, D, device=tokens.device, dtype=self.basis.dtype)
+        for k in range(self.K):
+            o = int(self._offsets[k].item())
+            d = self.dims[k]
+            h[:, :, o:o+d] = codes[:, :, k:k+1] * self.basis[k, :d]
+        return h
+
+
 class LmHead(nn.Module):
-    """D-space -> vocab logits via Zeckendorf code projection."""
+    """D-space -> vocab logits via Zeckendorf code projection (legacy)."""
     def __init__(self, cfg):
         super().__init__()
         codes = zeckendorf_codes(cfg.vocab)
@@ -117,6 +195,43 @@ class LmHead(nn.Module):
     
     def forward(self, h):
         return self.proj(h) @ self.codes.T
+
+
+class PartitionedHead(nn.Module):
+    """D-space -> vocab logits via segment-addressed readout.
+    
+    h ∈ ℝᴰ → split по тем же K сегментам, что и в PartitionedEmbedding.
+    Каждый сегмент h_k сравнивается со своим readout r_k:
+        logit_v = Σ_k z_{vk} · ⟨h_k, r_k⟩
+    
+    K=32: каждый сегмент выровнен с mirror group (1:1).
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
+        self.K = codes.shape[1]
+        self.register_buffer('codes', codes)
+        
+        D = cfg.D
+        assert D % self.K == 0
+        d = D // self.K
+        self.dims = [d] * self.K
+        offsets = list(range(0, D + 1, d))
+        self.register_buffer('_offsets', torch.tensor(offsets))
+        
+        self.readout = nn.Parameter(torch.randn(self.K, d))
+        nn.init.normal_(self.readout, std=0.02)
+    
+    def forward(self, h):
+        scores = []
+        for k in range(self.K):
+            o = int(self._offsets[k].item())
+            d = self.dims[k]
+            h_k = h[:, :, o:o+d]
+            r_k = self.readout[k, :d]
+            scores.append((h_k * r_k).sum(dim=-1))
+        scores = torch.stack(scores, dim=-1)
+        return scores @ self.codes.T
 
 
 # ─── Grouped Cognitive Mirror (32 эксперта) ────────────────────────────
@@ -173,8 +288,10 @@ class GroupedCognitiveMirror(nn.Module):
         self.b_gate = nn.Parameter(torch.zeros(G))
         
         # External gradient cache (устанавливается после backward)
-        self.register_buffer('_prev_grad_norm', torch.zeros(G))
-        self.register_buffer('_last_magnitude', torch.zeros(1))
+        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
+        self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
+        self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
     
     def forward(self, h, mem_all, global_state=None):
         B, L, D = h.shape
@@ -228,6 +345,8 @@ class GroupedCognitiveMirror(nn.Module):
         mirror = mirror.reshape(B, L, D)
         
         self._last_magnitude.fill_(mirror.abs().mean().item())
+        self._last_gates.copy_(expert_gate.detach())
+        self._last_h_pool.copy_(h_pool.detach())
         
         return mirror
     
@@ -412,8 +531,8 @@ class WideBindStack(nn.Module):
     def __init__(self, cfg: WideBindConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed = ZeckendorfEmbedding(cfg)
-        self.lm_head = LmHead(cfg)
+        self.embed = PartitionedEmbedding(cfg)
+        self.lm_head = PartitionedHead(cfg)
         
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
@@ -421,8 +540,11 @@ class WideBindStack(nn.Module):
         
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
     
-    def forward(self, h, state=None):
-        """h: (B, L, D) — pre-embedded tokens"""
+    def forward(self, h, state=None, global_state=None):
+        """h: (B, L, D) — pre-embedded tokens
+           state: per-layer memory states from previous forward (or None)
+           global_state: cross-layer EMA self-model (or None, created fresh)
+        """
         if state is None:
             state = [None] * len(self.layers)
         B, L, D = h.shape
@@ -441,7 +563,8 @@ class WideBindStack(nn.Module):
                 layer.b_d.fill_(b_d_val)
         
         # Global self-model: running EMA of layer memory centroids
-        global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
+        if global_state is None:
+            global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
         
         new_state = []
         for layer, s in zip(self.layers, state):
@@ -455,7 +578,7 @@ class WideBindStack(nn.Module):
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
         
-        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state
+        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state
     
     def embed_tokens(self, tokens):
         """Token indices -> D-space vectors."""
@@ -706,7 +829,7 @@ if __name__ == '__main__':
     
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)
     h = model.embed_tokens(x)
-    out, state = model(h)
+    out, state, _ = model(h)
     loss = model.compute_loss(out[:, :-1], x[:, 1:])
     loss.backward()
     

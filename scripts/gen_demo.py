@@ -49,13 +49,13 @@ gen_len = 256
 with torch.no_grad():
     h = model.embed_tokens(prompt)
     state = None
-    out, state = model(h, state)
+    out, state, _ = model(h, state)
 
     tokens = prompt_ids[:]
     x = out[:, -1:, :]
     t0 = time.time()
     for i in range(gen_len):
-        out, state = model(x, state)
+        out, state, _ = model(x, state)
         logits = model.lm_head(out).float()
         next_id = logits[:, -1].argmax(dim=-1).item()
         tokens.append(next_id)

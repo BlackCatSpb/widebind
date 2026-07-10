@@ -17,6 +17,10 @@ class WideBindConfig:
     grad_clip: float = 1.0
     dtype: str = 'float32'
 
+    # Embed
+    code_dim: int = 32           # K: число сегментов для PartitionedEmbedding
+    code_sparsity: int = 6       # S: единиц на токен (C(32,6)=906K≥50000)
+
     # MLP
     mlp_groups: int = 8
     mlp_expand: int = 8

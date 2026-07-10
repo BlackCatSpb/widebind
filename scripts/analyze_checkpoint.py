@@ -61,7 +61,7 @@ def analyze_single_checkpoint(ckpt_path):
     device = next(model.parameters()).device
     x = torch.randint(0, min(cfg.vocab, 1000), (1, 16)).to(device)
     h = model.embed_tokens(x)
-    out, state = model(h)
+    out, state, _ = model(h)
     
     # ─── Per-layer analysis ───
     layers_data = []

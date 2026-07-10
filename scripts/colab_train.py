@@ -42,7 +42,7 @@ def find_best_batch_size(model, seq_len, device, start=8):
     x = torch.randint(0, 50000, (start, seq_len), device=device)
     try:
         h = model.embed_tokens(x)
-        out, _ = model(h, None)
+        out, _, _ = model(h, None)
         out[:, :1].sum().backward()
         best = start
     except RuntimeError:
@@ -57,7 +57,7 @@ def find_best_batch_size(model, seq_len, device, start=8):
         try:
             x = torch.randint(0, 50000, (mid, seq_len), device=device)
             h = model.embed_tokens(x)
-            out, _ = model(h, None)
+            out, _, _ = model(h, None)
             out[:, :1].sum().backward()
             best = mid
             lo = mid + 1
@@ -178,7 +178,7 @@ def train(cfg, drive_path=None):
 
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 h = model.embed_tokens(x)
-                out, state = model(h, state)
+                out, state, _ = model(h, state)
                 loss = model.compute_loss(out, y)
 
             if scaler:
@@ -268,7 +268,7 @@ def evaluate(model, streams, cfg, device):
             x, y = x.to(device), y.to(device)
             with torch.cuda.amp.autocast(enabled=device=='cuda'):
                 h = model.embed_tokens(x)
-                out, _ = model(h, None)
+                out, _, _ = model(h, None)
                 loss = model.compute_loss(out, y)
             total_loss += loss.item()
             total_steps += 1

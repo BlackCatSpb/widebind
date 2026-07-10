@@ -42,7 +42,7 @@ def test_inference(ckpt_path, prompt_len=16, gen_len=128, device='cuda'):
     state = None
     t0 = time.time()
     with torch.no_grad():
-        out, state = model(h, state)
+        out, state, _ = model(h, state)
     t_prefill = time.time() - t0
     logits = model.compute_loss(out, prompt)  # just to compute
     
@@ -54,7 +54,7 @@ def test_inference(ckpt_path, prompt_len=16, gen_len=128, device='cuda'):
     t0 = time.time()
     with torch.no_grad():
         for i in range(gen_len):
-            out, state = model(x, state)
+            out, state, _ = model(x, state)
             logits = model.lm_head(out)  # (1, 1, vocab)
             next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
             tokens.append(next_token.item())

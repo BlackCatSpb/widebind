@@ -169,7 +169,7 @@ def train(cfg=None, resume_path=None):
             
             # Forward
             h = model.embed_tokens(x)
-            out, state = model(h, state)
+            out, state, _ = model(h, state)
             loss = model.compute_loss(out, y)
             
             # Backward
@@ -263,7 +263,7 @@ def evaluate(model, streams, cfg, device):
             break
         x, y = x.to(device), y.to(device)
         h = model.embed_tokens(x)
-        out, state = model(h, state)
+        out, state, _ = model(h, state)
         loss = model.compute_loss(out, y)
         total_loss += loss.item()
         total_steps += 1

@@ -14,7 +14,7 @@ add_safe_globals([WideBindConfig])
 ckpt = torch.load('checkpoints/step_5000.pt', map_location='cpu', weights_only=True)
 cfg = ckpt.get('cfg', WideBindConfig())
 model = WideBindStack(cfg)
-model.load_state_dict(ckpt['model'])
+model.load_state_dict(ckpt['model'], strict=False)
 print(f'Loaded step={ckpt.get("step","?")} params={model.param_count():,}')
 
 prompts = [
