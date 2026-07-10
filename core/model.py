@@ -69,22 +69,6 @@ def sparse_block_codes(vocab=50000, K=32, S=6):
     return codes
 
 
-def compute_timescales(cfg):
-    """Timescale biases for multi-timescale decay."""
-    tau_min, tau_max = cfg.cov_tau_lo, cfg.cov_tau_hi
-    n = cfg.n_layers
-    tau = torch.exp(torch.linspace(math.log(tau_min), math.log(tau_max), n))
-    return tau
-
-
-def compute_spectrum(cfg):
-    """Spectral weight vector for DCT mixing."""
-    n = cfg.n_layers
-    lo, hi = cfg.spec_lo, cfg.spec_hi
-    lam = torch.linspace(lo, hi, n)
-    return lam, lam
-
-
 # ─── VSA Prefix Scan ───────────────────────────────────────────────────
 
 def vsa_prefix_scan(a, b, state=None):
@@ -271,7 +255,7 @@ class GroupedCognitiveMirror(nn.Module):
       - mirror = tanh(linear + bias) + alpha * linear
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
-    def __init__(self, D, G=32, k=4, skip_alpha=0.1):
+    def __init__(self, D, G=32, k=8, skip_alpha=0.1):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -313,8 +297,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.b_gate = nn.Parameter(torch.zeros(G))
         
         # External gradient cache (устанавливается после backward)
-        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
-        self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
+        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=True)
+        self.register_buffer('_delta_var', torch.zeros(G), persistent=True)  # running EMA of delta var
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
@@ -491,8 +475,6 @@ class WideBindBlock(nn.Module):
         self.b_i = nn.Parameter(torch.full((cfg.D,), -2.5))   # i_gate ~0.08 init (was -3.0, ~0.05)
         self.b_d = nn.Parameter(torch.full((cfg.D,), b_d_init))
 
-        # First moment
-        
         # First moment
         self.w_k_mu = nn.Parameter(torch.randn(cfg.D))
         self.w_q_mu = nn.Parameter(torch.randn(cfg.D))

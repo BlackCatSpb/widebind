@@ -11,7 +11,6 @@ from core.model import (
     WideBindStack, WideBindBlock, GroupedCognitiveMirror, GroupedMLP,
     PartitionedEmbedding, PartitionedHead, LmHead,
     sparse_block_codes, dct_basis, vsa_prefix_scan,
-    compute_timescales, compute_spectrum,
 )
 from core.live_inference import LiveInference, MirrorMonitor
 
