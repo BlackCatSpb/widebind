@@ -241,10 +241,27 @@ class GroupedCognitiveMirror(nn.Module):
     Ансамбль из 32 экспертов-зеркал, каждый в своём d=112 подпространстве.
     
     Каждый эксперт:
-      - Имеет свой K-space (k=4) внутри своего d=112
-      - Вычисляет 3 сигнала коррекции: temp, smooth, sym
+      - Имеет свой K-space (k=8) внутри своего d=112
+      - Вычисляет 4 сигнала коррекции: temp, pred, smooth, sym
+      - lo half k: temp + pred (медленные/долгоживущие ошибки)
+      - hi half k: smooth + sym (быстрые/локальные ошибки)
       - Имеет свой tanh_bias + skip_connection + log_scale
       - Имеет meta-gate: учится доверять/игнорировать эксперта
+    
+    Predictive mirror:
+      - W_pred: линейный предсказатель K-space (t-1 → t)
+      - pred_error = hp_t - pred(hp_{t-1}) — ошибка предсказания
+      - Обучает зеркало динамике VSA-состояния
+    
+    Frequency-Adaptive K:
+      - Первые k/2 направлений K-space: temp + pred (медленные)
+      - Последние k/2 направлений: smooth + sym (быстрые)
+      - Естественная специализация, 0 дополнительных параметров
+    
+    Gradient-Adaptive Gate:
+      - delta_var: running EMA variance дельты K-space
+      - Эксперт с высокой variance активен, с низкой — прижат
+      - Дополняет внешний grad_norm сигнал внутренней метрикой
     
     Внешний сигнал подкрепления:
       - prev_grad_norm: норма градиента по подпространству (c предыдущего backward)
@@ -279,6 +296,11 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_sym_u = nn.Parameter(torch.randn(G, k))
         self.w_sym_v = nn.Parameter(torch.randn(G, k))
         
+        # Predictive mirror: K-space prediction from previous step
+        pred_std = 1.0 / k ** 0.5
+        self.W_pred = nn.Parameter(torch.randn(G, k, k) * pred_std)
+        self.w_pred_scale = nn.Parameter(torch.ones(G, k) * 0.1)
+        
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * 0.05)  # N(0,0.05): break chicken-and-egg plateau
         
@@ -289,6 +311,7 @@ class GroupedCognitiveMirror(nn.Module):
         
         # External gradient cache (устанавливается после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
@@ -302,10 +325,14 @@ class GroupedCognitiveMirror(nn.Module):
         mem_g = mem_all.reshape(B, L, G, d)
         mc_g = mem_g.mean(dim=1, keepdim=True)  # (B, 1, G, d)
         
-        # 1. Project each group to its K-space
+        # Project each group to its K-space
         hp = torch.einsum('blgd,gdk->blgk', h_g, self.W_proj)    # (B, L, G, k)
         mc_k = torch.einsum('b l gd,gdk->b l gk', mc_g, self.W_proj)
         
+        # hp_prev shared by sym_k and pred_error
+        hp_prev = torch.cat([torch.zeros_like(hp[:, 0:1]), hp[:, :-1]], dim=1)
+        
+        # ─── Slow signals (lo half of K-space) ───
         # Temporal: deviation from memory centroid
         temp_k = (hp - mc_k) * self.w_temp  # (B, L, G, k)
         
@@ -315,17 +342,26 @@ class GroupedCognitiveMirror(nn.Module):
                                 global_state.reshape(1, 1, G, d), self.W_proj)
             temp_k = temp_k + (hp - gs_k) * self.w_global
         
-        # 2. Smoothness: local coherence in K-space
+        # Predictive: error in K-space self-prediction (t-1 -> t)
+        pred_k = torch.einsum('blgk,gkk->blgk', hp_prev, self.W_pred)
+        pred_error = (hp - pred_k) * self.w_pred_scale  # (B, L, G, k)
+        
+        # ─── Fast signals (hi half of K-space) ───
+        # Smoothness: local coherence in K-space
         hp_perm = hp.permute(0, 2, 3, 1).reshape(B, G * k, L)  # (B, G*k, L)
         hp_smooth = self.conv_smooth(hp_perm)[:, :, :L]
         hp_smooth = hp_smooth.reshape(B, G, k, L).permute(0, 3, 1, 2)  # (B, L, G, k)
         smooth_k = hp - hp_smooth
         
-        # 3. Symmetry: bilinear temporal interaction
-        hp_prev = torch.cat([torch.zeros_like(hp[:, 0:1]), hp[:, :-1]], dim=1)
+        # Symmetry: bilinear temporal interaction
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
-        delta = temp_k + smooth_k + sym_k
+        # ─── Frequency-Adaptive merge (lo/hi split) ───
+        k_lo = k // 2
+        delta_lo = temp_k[..., :k_lo] + pred_error[..., :k_lo]
+        delta_hi = smooth_k[..., k_lo:] + sym_k[..., k_lo:]
+        delta = torch.cat([delta_lo, delta_hi], dim=-1)
+        
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
         delta = delta + self.tanh_bias  # break zero-mean symmetry in K-space
         
@@ -334,11 +370,17 @@ class GroupedCognitiveMirror(nn.Module):
         mirror = torch.tanh(linear) + self.skip_alpha * linear
         mirror = mirror * torch.exp(self.log_scale)  # per-dim scale
         
-        # Per-expert meta-gate
-        # Gate from pooled h_g + external gradient signal
+        # ─── Gradient-Adaptive Gate ───
         h_pool = h_g.mean(dim=(0, 1))  # (G, d) — pooled over B,L per expert
         gate_logits = torch.einsum('gd,gd->g', h_pool, self.w_gate) + self.b_gate
         gate_logits = gate_logits + self.w_grad_signal(self._prev_grad_norm)
+        
+        # Internal delta variance: expert with high variance is actively correcting
+        with torch.no_grad():
+            dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)  # (G,)
+            self._delta_var.mul_(0.9).add_(dvar * 0.1)
+        gate_logits = gate_logits + 0.1 * torch.tanh(self._delta_var - 0.01)
+        
         expert_gate = torch.sigmoid(gate_logits)  # (G,)
         
         mirror = mirror * expert_gate.reshape(1, 1, G, 1)  # (B, L, G, d)
