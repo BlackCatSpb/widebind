@@ -291,7 +291,10 @@ class GroupedCognitiveMirror(nn.Module):
         # Depthwise conv per group in K-space
         self.conv_smooth = nn.Conv1d(G * k, G * k, 3, padding=2,
                                       groups=G * k, bias=False)
-        nn.init.dirac_(self.conv_smooth.weight)
+        with torch.no_grad():
+            # dirac_ bug: doesn't fill all channels for grouped convs
+            self.conv_smooth.weight.zero_()
+            self.conv_smooth.weight[:, :, 1] = 1.0  # all channels get center dirac
         
         self.w_sym_u = nn.Parameter(torch.randn(G, k))
         self.w_sym_v = nn.Parameter(torch.randn(G, k))

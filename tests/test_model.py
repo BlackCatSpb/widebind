@@ -238,6 +238,32 @@ def test_mirror_global_state():
     assert out_with.shape == out_without.shape
 
 
+def test_mirror_conv_smooth_all_channels_active():
+    """Verify depthwise conv init fills ALL channels (not just first)."""
+    for _ in range(10):
+        k = 8 if torch.rand(1).item() > 0.5 else 4
+        mirror = GroupedCognitiveMirror(D=896, G=32, k=k)
+        w = mirror.conv_smooth.weight.data
+        assert w.shape == (32 * k, 1, 3)
+        assert w[:, 0, 1].eq(1.0).all(), f'Not all channels have center=1 (k={k})'
+        assert w[:, 0, [0, 2]].abs().sum().item() == 0, 'Non-center elements non-zero'
+
+
+def test_mirror_conv_smooth_produces_temporal_diff():
+    """smooth_k = hp[t] - hp[t-1] with dirac init."""
+    G, k = 32, 8
+    mirror = GroupedCognitiveMirror(D=3584, G=G, k=k)
+    B, L = 2, 64
+    h = torch.randn(B, L, 3584).reshape(B, L, G, 112)
+    hp = torch.einsum('blgd,gdk->blgk', h, mirror.W_proj.data)
+    hp_perm = hp.permute(0, 2, 3, 1).reshape(B, G * k, L)
+    hp_smooth = mirror.conv_smooth(hp_perm)[:, :, :L]
+    hp_smooth_r = hp_smooth.reshape(B, G, k, L).permute(0, 3, 1, 2)
+    diff = (hp_smooth_r[:, 1:] - hp[:, :-1]).abs().mean()
+    assert diff < 1e-5, f'hp_smooth[t] != hp[t-1]: {diff:.6f}'
+    assert hp_smooth_r[:, 0:1].abs().max() < 1e-5, 'hp_smooth[0] should be zero (padding)'
+
+
 # ─── GroupedMLP ─────────────────────────────────────────────────────
 
 def test_mlp_shape():
