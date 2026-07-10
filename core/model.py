@@ -152,7 +152,7 @@ class CognitiveMirror(nn.Module):
         self.w_sym_u = nn.Parameter(torch.randn(K))
         self.w_sym_v = nn.Parameter(torch.randn(K))
         
-        self.log_scale = nn.Parameter(torch.zeros(D))
+        self.log_scale = nn.Parameter(torch.randn(D) * 0.01)  # per-dim noise seeds differentiation
         self.register_buffer('_last_magnitude', torch.zeros(1))
     
     def forward(self, h, mem_all, global_state=None):
