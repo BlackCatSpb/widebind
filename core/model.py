@@ -152,7 +152,8 @@ class CognitiveMirror(nn.Module):
         self.w_sym_u = nn.Parameter(torch.randn(K))
         self.w_sym_v = nn.Parameter(torch.randn(K))
         
-        self.log_scale = nn.Parameter(torch.randn(D) * 0.01)  # per-dim noise seeds differentiation
+        self.tanh_bias = nn.Parameter(torch.zeros(K))  # breaks tanh zero-mean symmetry
+        self.log_scale = nn.Parameter(torch.zeros(D))
         self.register_buffer('_last_magnitude', torch.zeros(1))
     
     def forward(self, h, mem_all, global_state=None):
@@ -183,7 +184,7 @@ class CognitiveMirror(nn.Module):
         delta = temp_k + smooth_k + sym_k
         delta = F.rms_norm(delta, (K,))
         
-        mirror = torch.tanh(delta @ self.W_out)
+        mirror = torch.tanh(delta @ self.W_out + self.tanh_bias)
         mirror = mirror * torch.exp(self.log_scale)
         
         self._last_magnitude.fill_(mirror.abs().mean().item())
@@ -435,7 +436,10 @@ class WideBindStack(nn.Module):
                 continue  # adaptive controller handles these
             is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_mem2v',
                                                '.w_k_mu', '.w_q_mu', '.w_mu_mem',
-                                               '.w_u', '.w_v'])
+                                               '.w_u', '.w_v',
+                                               '.tanh_bias', '.log_scale',
+                                               '.mirror.W_proj', '.mirror.W_out',
+                                               '.mirror.w_temp', '.mirror.w_global'])
             if is_gate:
                 if p.ndim < 2:
                     gate_no_decay.append(p)
