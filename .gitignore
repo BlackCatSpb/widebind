@@ -9,3 +9,5 @@ __pycache__/
 tokenizer/
 generation_output.txt
 *_report.html
+
+session_backup.json
