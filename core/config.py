@@ -19,7 +19,10 @@ class WideBindConfig:
 
     # Embed
     code_dim: int = 32           # K: число сегментов для PartitionedEmbedding
-    code_sparsity: int = 6       # S: единиц на токен (C(32,6)=906K≥50000)
+    code_sparsity: int = 6       # S: единиц на токен (C(32,6)=906K>=50000)
+
+    # Mirror
+    mirror_k: int = 8            # K-space dim per expert (was 4, now 8: 2x capacity)
 
     # MLP
     mlp_groups: int = 8

@@ -280,7 +280,7 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_sym_v = nn.Parameter(torch.randn(G, k))
         
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
-        self.log_scale = nn.Parameter(torch.zeros(G, self.d))
+        self.log_scale = nn.Parameter(torch.randn(G, self.d) * 0.05)  # N(0,0.05): break chicken-and-egg plateau
         
         # Per-expert meta-gate: pooled h_g -> gate logit
         gate_std = 1.0 / (self.d + 1) ** 0.5
@@ -433,7 +433,7 @@ class WideBindBlock(nn.Module):
         self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
         
         # Cognitive Mirror (32 эксперта, grouped K-space)
-        self.mirror = GroupedCognitiveMirror(cfg.D)
+        self.mirror = GroupedCognitiveMirror(cfg.D, G=32, k=cfg.mirror_k, skip_alpha=0.1)
         
         # ─── VSA Memory (gates) ───
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
@@ -443,7 +443,7 @@ class WideBindBlock(nn.Module):
         # Linear decay across layers: shallow → short memory, deep → long
         layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
         b_d_init = 2.0 + 3.0 * layer_frac  # L0: τ≈7, L23: τ≈400
-        self.b_i = nn.Parameter(torch.full((cfg.D,), -3.0))
+        self.b_i = nn.Parameter(torch.full((cfg.D,), -2.5))   # i_gate ~0.08 init (was -3.0, ~0.05)
         self.b_d = nn.Parameter(torch.full((cfg.D,), b_d_init))
 
         # First moment
@@ -676,8 +676,8 @@ class AdaptiveController:
         n = len(blocks)
         avg_var = var_sum / n
         avg_mag = mag_sum / n
-        exploration = min(1.0, avg_mag / 0.3)
-        differentiation = min(1.0, avg_var / 0.1)
+        exploration = min(1.0, avg_mag / 0.25)          # threshold 0.25 (was 0.3)
+        differentiation = min(1.0, avg_var / 0.08)       # threshold 0.08 (was 0.1)
         return exploration, differentiation
 
     @staticmethod
