@@ -92,12 +92,17 @@ def vsa_prefix_scan(a, b, state=None):
         b = torch.cat([b_state, b], dim=1)
     
     n = a.shape[1]
-    a_curr, b_curr = a.clone(), b.clone()
+    a_curr, b_curr = a, b
     step = 1
     while step < n:
-        a_prev, b_prev = a_curr.clone(), b_curr.clone()
-        a_curr[:, step:] = a_prev[:, step:] * a_prev[:, :-step]
-        b_curr[:, step:] = b_prev[:, :-step] * a_prev[:, step:] + b_prev[:, step:]
+        a_left = a_curr[:, :step]
+        a_step = a_curr[:, step:]
+        a_prev = a_curr[:, :-step]
+        b_left = b_curr[:, :step]
+        b_step = b_curr[:, step:]
+        b_prev = b_curr[:, :-step]
+        a_curr = torch.cat([a_left, a_step * a_prev], dim=1)
+        b_curr = torch.cat([b_left, b_prev * a_step + b_step], dim=1)
         step *= 2
     
     if state is not None:
