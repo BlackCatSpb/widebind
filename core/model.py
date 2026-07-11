@@ -164,12 +164,12 @@ class PartitionedEmbedding(nn.Module):
         codes = self.codes[tokens]
         B, L = tokens.shape
         D = self._offsets[-1].item()
-        h = torch.zeros(B, L, D, device=tokens.device, dtype=self.basis.dtype)
+        parts = []
         for k in range(self.K):
             o = int(self._offsets[k].item())
             d = self.dims[k]
-            h[:, :, o:o+d] = codes[:, :, k:k+1] * self.basis[k, :d]
-        return h
+            parts.append(codes[:, :, k:k+1] * self.basis[k, :d])
+        return torch.cat(parts, dim=-1)
 
 
 class LmHead(nn.Module):
@@ -610,7 +610,7 @@ class WideBindStack(nn.Module):
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
         
-        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state
+        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state.detach()
     
     def embed_tokens(self, tokens):
         """Token indices -> D-space vectors."""
