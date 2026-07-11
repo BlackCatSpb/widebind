@@ -302,8 +302,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.b_gate = nn.Parameter(torch.zeros(G))
         
         # External gradient cache (устанавливается после backward)
-        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=True)
-        self.register_buffer('_delta_var', torch.zeros(G), persistent=True)  # running EMA of delta var
+        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
