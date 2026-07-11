@@ -4,9 +4,8 @@ from dataclasses import dataclass, field
 
 @dataclass
 class WideBindConfig:
-    D: int = 896
+    D: int = 3584
     n_layers: int = 24
-    bottleneck: int = 3584       # MLP hidden dim
     bind_K: int = 16             # bottleneck for bind projection
     vocab: int = 50000
     seq_len: int = 128
@@ -22,10 +21,10 @@ class WideBindConfig:
     code_sparsity: int = 6       # S: единиц на токен (C(32,6)=906K>=50000)
 
     # Mirror
-    mirror_k: int = 8            # K-space dim per expert (was 4, now 8: 2x capacity)
+    mirror_k: int = 8            # K-space dim per expert
 
     # MLP
-    mlp_groups: int = 8
+    mlp_groups: int = 32         # D/mlp_groups=112 — aligned with embed seg и mirror G
     mlp_expand: int = 8
 
     # Scheduler
