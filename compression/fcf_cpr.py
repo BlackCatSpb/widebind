@@ -113,10 +113,21 @@ class FCF_CPR:
             if is_removable(k):
                 continue  # skip entirely
             
-            if v.numel() > 1 and v.std().item() < 1e-8:
+            if is_scalar_gate(k):
+                result[k] = v[0:1].clone()
+                meta[k] = ('scalar', v.shape, v.dtype)
+                continue
+            
+            if v.numel() > 1 and v.dtype.is_floating_point and v.std().item() < 1e-8:
                 # Constant tensor: store as scalar
                 val = v[0:1].clone()
                 result[k] = val
+                meta[k] = ('scalar', v.shape, v.dtype)
+                continue
+            
+            if not v.dtype.is_floating_point:
+                # Non-float tensor: store as-is
+                result[k] = v.clone()
                 meta[k] = ('scalar', v.shape, v.dtype)
                 continue
             
