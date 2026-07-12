@@ -81,7 +81,7 @@ token IDs: (B, L) — целые числа от 0 до 49999
           ├── Bottleneck Bind (D → K=32 → diag(u)·diag(v) → D)
           ├── VSA Memory (prefix scan + read + first moment)
           ├── h += enhanced (bind_out + mem_read × scale + mirror)
-          ├── Grouped Cognitive Mirror (32 экспертов × d=112, K=8, 4 сигнала: temp+pred+smooth+sym, freq-adaptive lo/hi, predictive self-model, gradient-adaptive gate, learned per-expert skip_α)
+          ├── Grouped Cognitive Mirror (32 экспертов × d=112, K=8, 4 сигнала: temp+pred+smooth+sym, freq-adaptive lo/hi, predictive self-model, gradient-adaptive gate, learned per-expert skip_α, mod_scale/bias, adaptive EMA α, 5% noise_scale на i_gate)
           ├── DCT Spectral (h_dct × lambda_k в базисе DCT-II)
           ├── Grouped MLP (32 группы × 112→896→112, SiLU)
           └── h_out: (B, L, D)
@@ -378,7 +378,7 @@ mem_read = mem_read + mu_read * w_mu_mem             # (B, L, D)
 
 **Калибровка i_gate.**
 
-`b_i = -3.0` → i_gate ≈ sigmoid(-3.0) = 0.047. На ините только 4.7% h[t] записывается в память за шаг. При τ≈150 общая память после 128 шагов:
+`b_i = -3.0` → i_gate ≈ sigmoid(-3.0) = 0.047. На ините только 4.7% h[t] записывается в память за шаг. **Noise_scale** (5% на ините, decay с differentiation) добавляет мультипликативный шум на i_gate при тренировке: `i_gate *= (1 + ε·noise_scale)`, ε ~ N(0,1). Это исследовательский шум — при diff=0 шум 5%, при diff=1 шум 0.1%. При τ≈150 общая память после 128 шагов:
 
 ```
 mem[128] ≈ Σ(decay^t · i_gate · h[128-t]) ≈ i_gate · h · τ ≈ 0.047 · 7.0 ≈ 0.33·h
@@ -470,8 +470,10 @@ expert_gate = sigmoid(gate_logit)                  # (G,) — один gate на
 gate_beta = sigmoid(gate_pred_scale)               # β ≈ 0.27 init (init=-1.0), растёт с W_pred
 gate_signal = hp + gate_beta * pred_error           # (B, L, G, k) — K-state эксперта
 gate_logit = einsum('blgk,gk->blg', gate_signal, w_gate) + b_gate
-gate_logit += 0.1 * tanh(grad_norm - 0.01)          # внешний: градиент
-gate_logit += 0.1 * tanh(delta_var - 0.01)          # внутренний: variance дельты
+# Per-expert learned modulation (вместо хардкода 0.1·tanh(x-0.01))
+grad_mod = log_grad_mod_scale * tanh(grad_norm + grad_mod_bias)   # (G,)
+dvar_mod = log_dvar_mod_scale * tanh(delta_var + dvar_mod_bias)    # (G,)
+gate_logit = gate_logit + grad_mod + dvar_mod
 expert_gate = sigmoid(gate_logit)                   # (B, L, G) — per-token!
 mirror = mirror * expert_gate.unsqueeze(-1)         # (B, L, G, d)
 ```
@@ -483,7 +485,7 @@ mirror = mirror * expert_gate.unsqueeze(-1)         # (B, L, G, d)
 - Per-token gate: 256 градиентов/шаг против 1 → **эффективная выборка 32 градиента/параметр/шаг** (против 0.009)
 - gate_pred_scale (init=-1.0, β≈0.27): адаптивное coupling с W_pred. На старте gate частично открыт; по мере обучения W_pred, β растёт и pred_error улучшает gate
 
-**delta_var** — running EMA: `var ← 0.9·var + 0.1·δ²`. Эксперт с высокой variance активно корректирует — gate открыт. С variance ≈ 0 — либо выключен, либо коллапсировал — gate прижат. Это внутренняя обратная связь, независимая от внешнего градиента.
+**delta_var** — adaptive EMA: `α = 0.8 + diff·0.19` (было 0.9). При low diff: α≈0.8 (быстрое обновление), при high diff: α≈0.99 (медленное). Эксперт с высокой variance активно корректирует — gate открыт. С variance ≈ 0 — либо выключен, либо коллапсировал — gate прижат.
 
 **Skip connection (per-expert learned α_g = exp(log_skip_alpha[g]), init 0.1):**
 ```python
@@ -511,6 +513,21 @@ mirror = tanh(linear) + skip_alpha[g] * linear
 self.tanh_bias = nn.Parameter(torch.zeros(G, k))  # (32, 8)
 ```
 Даже при нулевом входе (delta=0), tanh_bias даёт разный выход каждому эксперту. Это разрывает симетрию: без него все 32 эксперта на ините идентичны — градиент не знает, какого эксперта менять.
+
+**Per-expert learned parameters (5 новых параметров на эксперт):**
+
+```python
+# Каждый эксперт учит свои:
+log_skip_alpha = nn.Parameter(tensor(0.0))        # α = exp(log_skip_alpha), init 0.1
+log_dvar_mod_scale = nn.Parameter(tensor(-2.0))   # gate mod от delta_var, init ~0.14
+dvar_mod_bias = nn.Parameter(tensor(-0.01))        # bias для delta_var mod
+log_grad_mod_scale = nn.Parameter(tensor(-2.0))    # gate mod от grad_norm, init ~0.14
+grad_mod_bias = nn.Parameter(tensor(-0.01))         # bias для grad_norm mod
+```
+
+Раньше gate modulation была хардкодом `0.1·tanh(x-0.01)` — одинаковым для всех экспертов. Теперь каждый эксперт учит свою чувствительность к variance и gradient-norm. Разные эксперты могут по-разному реагировать на одни и те же сигналы (например, эксперт №3 может быть чувствителен к variance, а эксперт №17 — к градиенту).
+
+log_skip_alpha: в экспоненциальной параметризации, чтобы α>0 всегда. init=0.1 — слабый skip. По мере обучения некоторые эксперты могут увеличить α до 0.5+ (больше linear-компоненты), другие остаться на 0.1.
 
 **Связь с AdaptiveController.** `|mirror|` усредняется по всем 32 экспертам перед передачей в контроллер. `var(log_scale)` — тоже по всем экспертам. Контроллер видит агрегированный сигнал и подстраивает гейты памяти глобально, а эксперты дифференцируются локально.
 
@@ -661,8 +678,8 @@ differentiation = min(1, var(log_scale) / 0.1)
 
 | Параметр | Диапазон | От чего зависит | Формула | Config поля |
 |---|---|---|---|---|
-| b_d (bias decay) | [2.0, 5.0] → τ ≈ [8, 150] | exploration + layer | `(2.0+3.0·layer_frac) + expl·(5.0 - ...)` | (хардкод, иерархия τ) |
-| b_i (bias write gate) | [-3.0, -1.5] → i_gate ≈ [0.047, 0.27] | exploration | `-3.0 + expl·1.5` | (хардкод, сужение) |
+| b_d (bias decay) | [2.0, 5.0] → τ ≈ [8, 150] | exploration + layer | `(2.0+3.0·layer_frac) + expl·(5.0 - ...)` | fill_, иерархия τ, cap=5.0 |
+| b_i (bias write gate) | [-3.0, -1.5] → i_gate ≈ [0.047, 0.27] | exploration | `-3.0 + expl·1.5` | fill_, сужение, i_gate≤0.27 |
 | w_mem2v_scale | [min, max] → [0.5, 1.0] | differentiation | `max - diff·(max-min)` | `w_mem2v_scale_min/max` |
 | EMA α (global state) | [min, max] → [0.90, 0.99] | differentiation | `min + diff·(max-min)` | `ema_alpha_min/max` |
 | Noise scale (гейты) | [min, max] → [0.001, 0.05] | differentiation | `max - diff·(max-min)` | `noise_scale_min/max` |
@@ -671,7 +688,7 @@ differentiation = min(1, var(log_scale) / 0.1)
 
 b_i сужен: `-3.0 + expl·1.5` (было `-3.0 + expl·3.0`). При expl=0: i_gate=0.047, при expl=1: i_gate=0.27. Старая формула давала i_gate=0.5 при expl=1 → перегрузка VSA-памяти (||mem||² ~ 26, целевой ~5-6). Новая — i_gate ≤ 0.27, память в норме.
 
-**Gate LR:** gate_lr_mult=5.0, gate_pred_scale_mult=10.0. gate_pred_scale получает ×10 для быстрого роста β (с -1.0 до 0 за ~12K шагов вместо 125K).
+**Gate LR:** gate_lr_mult=5.0 (W_pred + w_pred_scale), gate_pred_scale_mult=10.0 (gate_pred_scale). W_pred и w_pred_scale — в единой gate-группе с LR×5: W_pred учит coupling быстрее, w_pred_scale (init=0.5, стало 0.5 вместо 0.1) даёт pred_error ~14% от hp — сигнал сильнее в 4.7×. gate_pred_scale получает ×10 для роста β: +0.014/100 шагов (17× быстрее), β≈0.5 за ~5-6K вместо 125K.
 
 **Интуиция:**
 
@@ -704,7 +721,7 @@ enhanced = bind_out + mem_read * w_mem2v * mem2v_scale + mirror
 
 Обратите внимание: `.fill_()` устанавливает bias напрямую, минуя градиент. b_i и b_d исключены из optimiser parameter groups (`param_groups()` не включает их). Это предотвращает конфликт между адаптивным контролем и градиентными обновлениями.
 
-`gate_pred_scale` вынесен в отдельную param group с LR×10 (gate_pred_scale_mult=10.0). Причина: градиент к gate_pred_scale мал (~10⁻³), стандартный LR 3e-4 даёт прирост всего 8e-6/шаг. С ×10 достигаем β=0.5 за ~12K шагов вместо 125K.
+`gate_pred_scale` в отдельной param group с LR×10 (gate_pred_scale_mult=10.0). W_pred и w_pred_scale — в gate-группе с LR×5 (gate_lr_mult=5.0). Причина: градиент к gate_pred_scale мал (~10⁻³), стандартный LR даёт всего 8e-6/шаг; W_pred нужно учить быстрее для coupling. w_pred_scale_init=0.5 (было 0.1) — pred_error ~14% от hp в gate_signal. **Итог: gate_pred_scale ускорился в 17×** (+0.014/100 шагов), β≈0.5 за ~5-6K вместо 125K.
 
 ### 3.11 MirrorLRScheduler
 
@@ -719,20 +736,22 @@ enhanced = bind_out + mem_read * w_mem2v * mem2v_scale + mirror
 **Формула:**
 
 ```python
-if var < 0.001:
+if var < var_min_for_lr_decay:               # config: 0.001
     mirror_mult = 1.0                        # зеркало не проснулось — не режем LR
 else:
-    decay = 1.0 - min(1.0, var / 0.1)        # var растёт → decay падает
-    mag_factor = min(1.0, mag / 0.3)          # коррекция растёт → mag_factor растёт
-    mirror_mult = max(0.05, decay * mag_factor)
+    decay = 1.0 - min(1.0, var / target_var) # config: 0.1
+    mag_factor = min(1.0, max(lr_min_ratio, mag / mag_threshold))  # config: 0.05, 0.3
+    mirror_mult = max(lr_min_ratio, decay * mag_factor)
 
-# Fallback: forced cosine decay (floored at 0.05)
-progress = step / max_steps
-forced = max(0.05, 0.5 * (1 + cos(π * min(1, progress))))
+# Fallback: forced cosine decay (floored at lr_min_ratio)
+progress = step / max_decay_steps            # config: 50000
+forced = max(lr_min_ratio, 0.5 * (1 + cos(π * min(1, progress))))
 mult = min(mirror_mult, forced)              # берём минимум из двух
 ```
 
-**Почему fallback?** Если зеркало заморожено (var < 0.001 всю тренировку), mirror_mult всегда 1.0, и LR не упадёт — модель никогда не сойдётся. Cosine fallback гарантирует, что LR всё равно уменьшится до 5% от base_lr к концу тренировки.
+**Почему fallback?** Если зеркало заморожено (var < var_min_for_lr_decay всю тренировку), mirror_mult всегда 1.0, и LR не упадёт — модель никогда не сойдётся. Cosine fallback гарантирует, что LR всё равно уменьшится до lr_min_ratio от base_lr к концу тренировки.
+
+**Конфигурация:** Все параметры — из WideBindConfig: `target_var`, `mag_threshold`, `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay`. Создаётся через `MirrorLRScheduler(model, optimizer, cfg=cfg)` — сам читает cfg.
 
 ---
 
@@ -1016,9 +1035,9 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 | 2000 | 6.53 | 6.55 | 697 | 0.00250 | 0.20 | 0.66 | -1.00 | Warmup конец, MirrorLR включён |
 | 3000 | 6.23 | 6.55 | 696 | 0.00249 | 0.21 | 0.67 | -0.98 | Gate начал движение (L31=-0.976) |
 | **5000 (прогноз)** | ~5.9 | ~6.4 | ~600 | ~0.0025 | ~0.25 | ~0.70 | **-0.95** | gate_pred продолжит рост |
-| **10000 (прогноз)** | ~5.5 | ~6.2 | ~500 | ~0.003 | ~0.35 | ~0.75 | **-0.90** | β≈0.30 — эффект на routing |
+| **10000 (прогноз)** | ~5.5 | ~6.2 | ~500 | ~0.003 | ~0.35 | ~0.75 | **-0.86** | β≈0.30 — эффект на routing |
 
-*Сессия 2026-07, L=32, K-space gate init=-1.0 (против -5.0 в старой сессии). gate_pred_scale движется +0.024 за 3000 шагов на стандартном LR. После установки gate_pred_scale_mult=10.0 (LR×10) прогноз: β≈0.5 за ~12K шагов.*
+*Сессия 2026-07, L=32, K-space gate init=-1.0 (против -5.0 в старой сессии). **Ускорение gate_pred_scale в 17×** после фиксов: W_pred в gate group (LR×5) + w_pred_scale_init=0.5 + gate_pred_scale_mult=10.0. Вместо +0.024 за 3000 шагов → **+0.014 за 100 шагов** (мини-тест, MX550). Прогноз: β≈0.5 за ~5-6K вместо 125K.*
 
 **Ключевые исправления сессии (11 commits):**
 
@@ -1062,17 +1081,19 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 - **Архитектура:** ✅ **K-space gate** + **bind_K=32** + **n_layers=32**. Полная синхронизация: L=K=G=32, D/L=d=112. 46 тестов проходят.
 - **Сжатие:** ✅ FCF-CPR (8-bit uniform, 18.7×, MSE 2.0e-5). **Важно:** `decompress_sd` использует `sparse_block_codes`, не `zeckendorf_codes`.
 - **Тренировка:** 🟡 Colab T4, B=2, L=128. Шаг 3000 (1 сессия). loss 10.8→6.23, val 6.55.
-- **gate_pred_scale:** ✅ init=-1.0 (исправлено с -5.0). Переместился в config (`gate_pred_scale_init`). LR×10 (`gate_pred_scale_mult=10.0` в config).
-- **W_pred:** ✅ Норма ~16, gate coupling через gate_pred_scale работает.
+- **gate_pred_scale:** ✅ init=-1.0 (исправлено с -5.0). Переместился в config (`gate_pred_scale_init`). **Ускорение 17×**: +0.014/100 шагов (мини-тест MX550, vs +0.024/3000 ранее) — благодаря W_pred в gate group (LR×5) + w_pred_scale_init=0.5 + gate_pred_scale_mult=10.0. Прогноз: β≈0.5 за ~5-6K.
+- **W_pred:** ✅ В gate param group (LR×5), норма ~16. w_pred_scale_init=0.5 (было 0.1) — pred_error ~14% от hp в gate_signal.
 - **AdaptiveController:** ✅ Все thresholds/ranges в config: `exploration_threshold`, `differentiation_threshold`, `w_mem2v_scale_min/max`, `ema_alpha_min/max`, `noise_scale_min/max`. b_i/d через fill_(), пер-слойный b_d (τ=8→150, кап 5.0), i_gate ≤ 0.27.
 - **Gate modulation:** ✅ **Per-expert learned** `log_dvar_mod_scale`, `dvar_mod_bias`, `log_grad_mod_scale`, `grad_mod_bias` — вместо хардкода `0.1·tanh(x-0.01)`. EMA alpha для δ_var: `0.8 + diff·0.19` (адаптивная).
 - **Skip connection:** ✅ **Per-expert learned** `log_skip_alpha` — вместо `α=0.1`.
 - **Init stds:** ✅ Все в config: `w_pred_scale_init`, `log_scale_init_std`, `w_d_init_std`, `conv_init_std`.
-- **MirrorLRScheduler:** ✅ Все параметры в config: `target_var`, `mag_threshold`, `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay`.
-- **param_groups:** ✅ `gate_lr_mult=5.0`, `gate_pred_scale_mult=10.0` — из config по умолчанию.
-- **var(log_scale):** 🟡 Плато 0.0025. Прорыв ожидается при gate_pred≈0 (~12K шагов).
+- **noise_scale:** ✅ **Активен** (был dead code). 5% multiplicative noise на i_gate во время train, детерминированный при eval. Decay с differentiation: `max - diff·(max-min)`.
+- **w_q init:** ✅ `randn(D)` → `1/sqrt(D)` ≈ 0.017 (warm read с шага 1).
+- **MirrorLRScheduler:** ✅ Все параметры в config: `target_var`, `mag_threshold`, `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay`. Принимает `cfg=` напрямую.
+- **param_groups:** ✅ `gate_lr_mult=5.0` (W_pred + w_pred_scale), `gate_pred_scale_mult=10.0` — из config.
+- **var(log_scale):** 🟡 Плато 0.0025. Прорыв ожидается при gate_pred≈0 (~5-6K шагов, с ускорением 17×).
 - **Инференс локально (MX550):** ✅ ~0.55 GB fp16, ~11 tok/s.
-- **Коллаб:** ✅ Notebook обновлён: patch FCF-CPR, gate_pred_scale reinit, resume по best.pt/step_*.pt
+- **Коллаб:** ✅ Notebook обновлён: patch FCF-CPR, gate_pred_scale + w_pred_scale reinit, resume по best.pt/step_*.pt, статус-лог с β0/βL/α_skip, MirrorLRScheduler(cfg=)
 - **Self-dialogue:** ✅ LiveInference — модель «живёт» между запросами
 - **Мониторинг:** ✅ MirrorMonitor
 
