@@ -90,8 +90,12 @@ def train(cfg=None, resume_path=None):
     
     # Scheduler: mirror-adaptive or cosine
     if cfg.scheduler == 'mirror':
-        scheduler = MirrorLRScheduler(model, optimizer, cfg.lr, warmup=cfg.warmup_steps)
-        print(f'Scheduler: MirrorLRScheduler (target_var=0.1, mag_threshold=0.3)')
+        scheduler = MirrorLRScheduler(model, optimizer, cfg.lr,
+            warmup=cfg.warmup_steps, target_var=cfg.target_var,
+            mag_threshold=cfg.mag_threshold, lr_min_ratio=cfg.lr_min_ratio,
+            max_decay_steps=cfg.max_decay_steps,
+            var_min_for_lr_decay=cfg.var_min_for_lr_decay)
+        print(f'Scheduler: MirrorLRScheduler (target_var={cfg.target_var}, mag_threshold={cfg.mag_threshold})')
     else:
         scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
         print(f'Scheduler: cosine decay')

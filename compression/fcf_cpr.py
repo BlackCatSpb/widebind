@@ -59,7 +59,9 @@ def analyze_sd(sd):
             groups['removable'].append((k, v))
         elif is_scalar_gate(k):
             groups['scalar_gates'].append((k, v))
-        elif v.numel() == 1 or (v.std().item() < 1e-8 and v.numel() > 1):
+        elif v.numel() == 1 or (v.dtype.is_floating_point and v.std().item() < 1e-8 and v.numel() > 1):
+            groups['constant'].append((k, v))
+        elif not v.dtype.is_floating_point:
             groups['constant'].append((k, v))
         else:
             groups['weights'].append((k, v))
@@ -134,7 +136,10 @@ class FCF_CPR:
             # Uniform 8-bit quantization per tensor
             indices, t_min, scale = quantize_tensor(v, n_bits=8)
             if indices is None:
-                result[k] = torch.tensor([t_min], dtype=torch.float32)
+                val = torch.tensor([t_min], dtype=torch.float32)
+                if v.ndim == 0:
+                    val = val.squeeze(0)  # preserve 0-dim scalar
+                result[k] = val
                 meta[k] = ('scalar', v.shape, v.dtype)
             else:
                 result[k] = indices
@@ -144,13 +149,13 @@ class FCF_CPR:
     
     def decompress_sd(self, compressed, meta, cfg):
         """Restore full state dict from compressed format."""
-        from core import dct_basis, zeckendorf_codes
+        from core import dct_basis, sparse_block_codes
         
         sd = {}
         
         # Recompute deterministic buffers
         V_dct = dct_basis(cfg.D)
-        codes = zeckendorf_codes(cfg.vocab)
+        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
         n_layers = cfg.n_layers
         
         for k, v in compressed.items():
@@ -160,9 +165,9 @@ class FCF_CPR:
             elif info[0] == 'scalar':
                 orig_shape, orig_dtype = info[1], info[2]
                 if len(orig_shape) > 0 and orig_shape[0] > 1:
-                    sd[k] = v.expand(orig_shape).clone().to(orig_dtype)
+                    sd[k] = v.detach().expand(orig_shape).clone().to(orig_dtype)
                 else:
-                    sd[k] = v.clone().to(orig_dtype)
+                    sd[k] = v.detach().clone().to(orig_dtype)
             elif info[0] == 'uniform8':
                 shape, dtype, t_min, scale = info[1], info[2], info[3], info[4]
                 sd[k] = dequantize_tensor(v, t_min, scale, dtype)

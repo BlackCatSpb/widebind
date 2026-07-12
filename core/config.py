@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 @dataclass
 class WideBindConfig:
     D: int = 3584
-    n_layers: int = 24
-    bind_K: int = 16             # bottleneck for bind projection
+    n_layers: int = 32
+    bind_K: int = 32             # bottleneck for bind projection (align with 32 segments)
     vocab: int = 50000
     seq_len: int = 128
     batch_size: int = 2
@@ -22,6 +22,9 @@ class WideBindConfig:
 
     # Mirror
     mirror_k: int = 8            # K-space dim per expert
+    w_pred_scale_init: float = 0.1
+    log_scale_init_std: float = 0.05
+    gate_pred_scale_init: float = -1.0   # β=σ(init) ≈ 0.27, растёт с тренировкой
 
     # MLP
     mlp_groups: int = 32         # D/mlp_groups=112 — aligned with embed seg и mirror G
@@ -29,6 +32,29 @@ class WideBindConfig:
 
     # Scheduler
     scheduler: str = 'mirror'
+    target_var: float = 0.1
+    mag_threshold: float = 0.3
+    lr_min_ratio: float = 0.05
+    max_decay_steps: int = 50000
+    var_min_for_lr_decay: float = 0.001
+
+    # AdaptiveController
+    exploration_threshold: float = 0.25   # normalization: |mirror| / thresh → [0,1]
+    differentiation_threshold: float = 0.08  # normalization: var(ls) / thresh → [0,1]
+    w_mem2v_scale_min: float = 0.5       # memory contribution when diff=1
+    w_mem2v_scale_max: float = 1.0       # memory contribution when diff=0
+    ema_alpha_min: float = 0.90          # global EMA rate when diff=0
+    ema_alpha_max: float = 0.99          # global EMA rate when diff=1
+    noise_scale_min: float = 0.001       # parameter noise when diff=1
+    noise_scale_max: float = 0.05        # parameter noise when diff=0
+
+    # Optimizer
+    gate_lr_mult: float = 5.0     # LR boost for gate weight params
+    gate_pred_scale_mult: float = 10.0  # LR boost for gate_pred_scale
+
+    # Init stds
+    w_d_init_std: float = 0.1
+    conv_init_std: float = 0.01
 
     # Conv
     conv_kernel: int = 48

@@ -260,14 +260,14 @@ class GroupedCognitiveMirror(nn.Module):
       - mirror = tanh(linear + bias) + alpha * linear
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
-    def __init__(self, D, G=32, k=8, skip_alpha=0.1):
+    def __init__(self, D, G=32, k=8, w_pred_scale_init=0.1, log_scale_init_std=0.05,
+                 gate_pred_scale_init=-1.0, skip_alpha=None):
         super().__init__()
         assert D % G == 0
         self.D = D
         self.G = G
         self.k = k
         self.d = D // G
-        self.skip_alpha = skip_alpha
         
         proj_std = 1.0 / (self.d * k) ** 0.25
         
@@ -291,15 +291,17 @@ class GroupedCognitiveMirror(nn.Module):
         # Predictive mirror: K-space prediction from previous step
         pred_std = 1.0 / k ** 0.5
         self.W_pred = nn.Parameter(torch.randn(G, k, k) * pred_std)
-        self.w_pred_scale = nn.Parameter(torch.ones(G, k) * 0.1)
-        
+        self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
-        self.log_scale = nn.Parameter(torch.randn(G, self.d) * 0.05)  # N(0,0.05): break chicken-and-egg plateau
+        self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
         
-        # Per-expert meta-gate: pooled h_g -> gate logit
-        gate_std = 1.0 / (self.d + 1) ** 0.5
-        self.w_gate = nn.Parameter(torch.randn(G, self.d) * gate_std)
+        # ─── K-space gate (per-token, per-expert from hp) ───
+        # w_gate: (G, k) — maps K-state (k=8) to gate logit per expert
+        gate_std = 1.0 / (self.k + 1) ** 0.5
+        self.w_gate = nn.Parameter(torch.randn(G, self.k) * gate_std)
         self.b_gate = nn.Parameter(torch.zeros(G))
+        # Gate coupling with W_pred: β = σ(gate_pred_scale), grows with W_pred
+        self.gate_pred_scale = nn.Parameter(torch.tensor(gate_pred_scale_init))
         
         # External gradient cache (устанавливается после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -307,8 +309,15 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
+        
+        # ─── Per-expert learned modulation ───
+        self.log_dvar_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
+        self.dvar_mod_bias = nn.Parameter(torch.full((G,), -0.01))
+        self.log_grad_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
+        self.grad_mod_bias = nn.Parameter(torch.full((G,), -0.01))
+        self.log_skip_alpha = nn.Parameter(torch.full((G,), math.log(0.1)))
     
-    def forward(self, h, mem_all, global_state=None):
+    def forward(self, h, mem_all, global_state=None, diff=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -359,35 +368,41 @@ class GroupedCognitiveMirror(nn.Module):
         
         # Linear projection + skip connection
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
-        mirror = torch.tanh(linear) + self.skip_alpha * linear
+        skip_alpha = torch.exp(self.log_skip_alpha).view(1, 1, G, 1)
+        mirror = torch.tanh(linear) + skip_alpha * linear
         mirror = mirror * torch.exp(self.log_scale)  # per-dim scale
         
-        # ─── Gradient-Adaptive Gate ───
-        h_pool = h_g.mean(dim=(0, 1))  # (G, d) — pooled over B,L per expert
-        gate_logits = torch.einsum('gd,gd->g', h_pool, self.w_gate) + self.b_gate
-        gate_logits = gate_logits + self.w_grad_signal(self._prev_grad_norm)
+        # ─── K-Space Gate (per-token, per-expert) ───
+        # Gate signal: hp + β·pred_error where β = σ(gate_pred_scale)
+        # hp: (B, L, G, k) — expert's own K-state (directly reflects output quality)
+        # pred_error: (B, L, G, k) — prediction quality (W_pred dynamics)
+        gate_beta = torch.sigmoid(self.gate_pred_scale)
+        gate_signal = hp + gate_beta * pred_error  # (B, L, G, k)
+        gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
+        grad_mod = torch.exp(self.log_grad_mod_scale) * torch.tanh(self._prev_grad_norm + self.grad_mod_bias)
+        gate_logits = gate_logits + grad_mod.unsqueeze(0).unsqueeze(0)
         
         # Internal delta variance: expert with high variance is actively correcting
         with torch.no_grad():
             dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)  # (G,)
-            self._delta_var.mul_(0.9).add_(dvar * 0.1)
-        gate_logits = gate_logits + 0.1 * torch.tanh(self._delta_var - 0.01)
+            if diff is not None:
+                ema_alpha = 0.8 + diff * 0.19  # diff∈[0,1] → alpha∈[0.8, 0.99]
+            else:
+                ema_alpha = 0.9
+            self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
+        dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
+        gate_logits = gate_logits + dvar_mod.unsqueeze(0).unsqueeze(0)
         
-        expert_gate = torch.sigmoid(gate_logits)  # (G,)
+        expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         
-        mirror = mirror * expert_gate.reshape(1, 1, G, 1)  # (B, L, G, d)
+        mirror = mirror * expert_gate.unsqueeze(-1)  # (B, L, G, d) * (B, L, G, 1)
         mirror = mirror.reshape(B, L, D)
         
         self._last_magnitude.fill_(mirror.abs().mean().item())
-        self._last_gates.copy_(expert_gate.detach())
-        self._last_h_pool.copy_(h_pool.detach())
+        self._last_gates.copy_(expert_gate.detach().mean(dim=(0, 1)))
+        self._last_h_pool.copy_(h_g.detach().mean(dim=(0, 1)))  # (G, d) for live_inference
         
         return mirror
-    
-    @staticmethod
-    def w_grad_signal(grad_norm):
-        """Map cached gradient norm to gate modulation."""
-        return 0.1 * torch.tanh(grad_norm - 0.01)
     
     def cache_grad_norms(self, grad_h):
         """Call after backward: store per-subspace gradient norm."""
@@ -467,11 +482,13 @@ class WideBindBlock(nn.Module):
         self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
         
         # Cognitive Mirror (32 эксперта, grouped K-space)
-        self.mirror = GroupedCognitiveMirror(cfg.D, G=32, k=cfg.mirror_k, skip_alpha=0.1)
+        self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=cfg.mirror_k,
+            w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
+            gate_pred_scale_init=cfg.gate_pred_scale_init)
         
         # ─── VSA Memory (gates) ───
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
-        self.w_d = nn.Parameter(torch.randn(cfg.D) * 0.1)    # content-dependent decay
+        self.w_d = nn.Parameter(torch.randn(cfg.D) * cfg.w_d_init_std)    # content-dependent decay
         self.w_q = nn.Parameter(torch.randn(cfg.D))
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         # Linear decay across layers: shallow → short memory, deep → long
@@ -488,7 +505,7 @@ class WideBindBlock(nn.Module):
         # ─── Conv ───
         self.conv = nn.Conv1d(cfg.D, cfg.D, kernel_size=cfg.conv_kernel,
                               padding=cfg.conv_kernel - 1, groups=cfg.D, bias=False)
-        nn.init.normal_(self.conv.weight, std=0.01)
+        nn.init.normal_(self.conv.weight, std=cfg.conv_init_std)
         
         # ─── Spectral ───
         self.register_buffer('V_dct', dct_basis(cfg.D))
@@ -499,7 +516,7 @@ class WideBindBlock(nn.Module):
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
     
     def forward(self, h, state=None, global_state=None,
-                mem2v_scale=1.0):
+                mem2v_scale=1.0, diff=None):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -539,7 +556,7 @@ class WideBindBlock(nn.Module):
         mem_read = mem_read + mu_read * self.w_mu_mem
         
         # ─── Mirror (self-consistency: local + global) ───
-        mirror = self.mirror(h, mem_all, global_state=global_state)
+        mirror = self.mirror(h, mem_all, global_state=global_state, diff=diff)
         
         # ─── Output (adaptive memory scale) ───
         enhanced = bind_out + mem_read * self.w_mem2v * mem2v_scale + mirror
@@ -583,14 +600,18 @@ class WideBindStack(nn.Module):
         
         # ─── Adaptive gate biases from mirror stats ───
         with torch.no_grad():
-            expl, _ = AdaptiveController.stats(self.layers)
-            mem2v_scale = AdaptiveController.w_mem2v_scale(self.layers)
-            ema_alpha = AdaptiveController.ema_alpha(self.layers)
+            expl, diff = AdaptiveController.stats(self.layers,
+                expl_thresh=self.cfg.exploration_threshold,
+                diff_thresh=self.cfg.differentiation_threshold)
+            mem2v_scale = AdaptiveController.w_mem2v_scale(self.layers,
+                min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max)
+            ema_alpha = AdaptiveController.ema_alpha(self.layers,
+                min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
             n = len(self.layers)
             for i, layer in enumerate(self.layers):
                 layer_frac = i / max(n - 1, 1)
-                b_i_val = -3.0 + expl * 3.0
-                b_d_val = (2.0 + 3.0 * layer_frac) + expl * (6.0 - (2.0 + 3.0 * layer_frac))
+                b_i_val = -3.0 + expl * 1.5
+                b_d_val = (2.0 + 3.0 * layer_frac) + expl * (5.0 - (2.0 + 3.0 * layer_frac))
                 layer.b_i.fill_(b_i_val)
                 layer.b_d.fill_(b_d_val)
         
@@ -600,7 +621,7 @@ class WideBindStack(nn.Module):
         
         new_state = []
         for layer, s in zip(self.layers, state):
-            h, s_out = layer(h, s, global_state=global_state, mem2v_scale=mem2v_scale)
+            h, s_out = layer(h, s, global_state=global_state, mem2v_scale=mem2v_scale, diff=diff)
             if s_out is not None:
                 mem_out = s_out[0]  # (B, D) — layer's final memory state
                 # Update global state: adaptive EMA aggregation
@@ -625,28 +646,38 @@ class WideBindStack(nn.Module):
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
     
-    def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=5.0):
+    def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None, gate_pred_scale_mult=None):
         """Optimizer parameter groups with weight decay.
         Gate biases (b_d, b_i) are excluded — set adaptively by AdaptiveController.
-        Gate weight params get increased lr for faster adaptation."""
+        Gate weight params get increased lr for faster adaptation.
+        gate_pred_scale gets separate high lr for rapid β growth."""
         cfg = self.cfg
         lr = lr or cfg.lr
         wd = weight_decay or cfg.weight_decay
+        gate_lr_mult = cfg.gate_lr_mult if gate_lr_mult is None else gate_lr_mult
+        gate_pred_scale_mult = cfg.gate_pred_scale_mult if gate_pred_scale_mult is None else gate_pred_scale_mult
         
         decay = []
         no_decay = []
         gate_decay = []
         gate_no_decay = []
+        gate_pred_scale_params = []
         for name, p in self.named_parameters():
             if '.b_d' in name or '.b_i' in name:
                 continue  # adaptive controller handles these
+            if 'gate_pred_scale' in name:
+                gate_pred_scale_params.append(p)
+                continue
             is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_mem2v',
                                                '.w_k_mu', '.w_q_mu', '.w_mu_mem',
                                                '.w_u', '.w_v',
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
-                                               '.mirror.w_gate', '.mirror.b_gate'])
+                                               '.mirror.w_gate', '.mirror.b_gate',
+                                               '.log_dvar_mod_scale', '.dvar_mod_bias',
+                                               '.log_grad_mod_scale', '.grad_mod_bias',
+                                               '.log_skip_alpha'])
             if is_gate:
                 if p.ndim < 2:
                     gate_no_decay.append(p)
@@ -666,6 +697,9 @@ class WideBindStack(nn.Module):
             groups.append({'params': gate_decay, 'lr': lr * gate_lr_mult, 'weight_decay': wd})
         if gate_no_decay:
             groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0})
+        if gate_pred_scale_params:
+            groups.append({'params': gate_pred_scale_params,
+                          'lr': lr * gate_pred_scale_mult, 'weight_decay': 0})
         return groups
 
 
@@ -689,15 +723,15 @@ class AdaptiveController:
 
     Mathematically derived ranges:
     ──────────────────────────────
-    b_d  ∈ [2.0 + 3.0*layer_frac, 6.0] per layer
-         L0: τ≈[7, 400], L23: τ≈[150, 400]
-    b_i  ∈ [-3.0, 0.0] → i_gate ≈ [0.049, 0.693] (write rate, softplus)
+    b_d  ∈ [2.0 + 3.0*layer_frac, 5.0] per layer
+         L0: τ≈[7, 150], L31: τ≈[150, 150]
+    b_i  ∈ [-3.0, -1.5] → i_gate ≈ [0.049, 0.27] (write rate, softplus)
     w_mem2v_scale ∈ [0.5, 1.0]  (memory contribution)
     ema_alpha ∈ [0.90, 0.99]  (cross-layer memory aggregation)
     noise_scale ∈ [0.001, 0.05]  (parameter noise for exploration)
     """
     @staticmethod
-    def stats(blocks):
+    def stats(blocks, expl_thresh=0.25, diff_thresh=0.08):
         """Return (exploration, differentiation) from all blocks' mirrors."""
         var_sum = mag_sum = 0.0
         for layer in blocks:
@@ -708,8 +742,8 @@ class AdaptiveController:
         n = len(blocks)
         avg_var = var_sum / n
         avg_mag = mag_sum / n
-        exploration = min(1.0, avg_mag / 0.25)          # threshold 0.25 (was 0.3)
-        differentiation = min(1.0, avg_var / 0.08)       # threshold 0.08 (was 0.1)
+        exploration = min(1.0, avg_mag / expl_thresh)
+        differentiation = min(1.0, avg_var / diff_thresh)
         return exploration, differentiation
 
     @staticmethod
@@ -717,10 +751,10 @@ class AdaptiveController:
         """Decay bias (average across layers). High exploration → shorter memory.
 
         τ = -1/ln(sigmoid(b_d))
-        Per-layer init: L0=2.0(τ≈7), L23=5.0(τ≈150), adjusted by exploration up to 6.0(τ≈400).
+        Per-layer init: L0=2.0(τ≈7), L31=5.0(τ≈150), capped at 5.0 by exploration.
         """
         expl, _ = AdaptiveController.stats(blocks)
-        return 6.0 - expl * 3.0
+        return 5.0 - expl * 2.0
 
     @staticmethod
     def b_i(blocks):
@@ -728,42 +762,42 @@ class AdaptiveController:
 
         i_gate = softplus(b_i) — note: softplus, not sigmoid.
         b_i=-3.0 → i_gate≈0.049 (low write, model stable)
-        b_i= 0.0 → i_gate≈0.693 (high write, exploring)
+        b_i=-1.5 → i_gate≈0.27 (high write, exploring, bounded)
         """
         expl, _ = AdaptiveController.stats(blocks)
-        return -3.0 + expl * 3.0
+        return -3.0 + expl * 1.5
 
     @staticmethod
-    def w_mem2v_scale(blocks):
+    def w_mem2v_scale(blocks, min_val=0.5, max_val=1.0):
         """Memory contribution scaling. High diff → trust mirror, reduce memory.
 
         Scale applied to w_mem2v in the enhanced output.
-        0.5 = memory cut in half (mirror dominates)
-        1.0 = full memory (mirror hasn't specialized)
+        min_val = memory cut in half (mirror dominates)
+        max_val = full memory (mirror hasn't specialized)
         """
         _, diff = AdaptiveController.stats(blocks)
-        return 1.0 - diff * 0.5
+        return max_val - diff * (max_val - min_val)
 
     @staticmethod
-    def ema_alpha(blocks):
+    def ema_alpha(blocks, min_val=0.90, max_val=0.99):
         """Cross-layer global EMA rate. High diff → stable self-model, slow EMA.
 
-        0.90 = fast update (model still learning)
-        0.99 = slow update (model converged)
+        min_val = fast update (model still learning)
+        max_val = slow update (model converged)
         """
         _, diff = AdaptiveController.stats(blocks)
-        return 0.90 + diff * 0.09
+        return min_val + diff * (max_val - min_val)
 
     @staticmethod
-    def noise_scale(blocks):
+    def noise_scale(blocks, min_val=0.001, max_val=0.05):
         """Parameter noise for exploration. Inversely proportional to diff.
 
         Applied as Gaussian noise to VSA gates during training.
-        0.05 = high noise (model exploring, low diff)
-        0.001 = low noise (model converged, high diff)
+        max_val = high noise (model exploring, low diff)
+        min_val = low noise (model converged, high diff)
         """
         _, diff = AdaptiveController.stats(blocks)
-        return 0.05 - diff * 0.049
+        return max_val - diff * (max_val - min_val)
 
 
 class MirrorLRScheduler:
@@ -780,7 +814,7 @@ class MirrorLRScheduler:
     """
     def __init__(self, model, optimizer, base_lr, warmup=1000,
                  target_var=0.1, mag_threshold=0.3, lr_min_ratio=0.05,
-                 max_decay_steps=50000):
+                 max_decay_steps=50000, var_min_for_lr_decay=0.001):
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
@@ -789,6 +823,7 @@ class MirrorLRScheduler:
         self.mag_threshold = mag_threshold
         self.lr_min_ratio = lr_min_ratio
         self.max_decay_steps = max_decay_steps
+        self.var_min_for_lr_decay = var_min_for_lr_decay
         self._step = 0
         self._last_log = 0
 
@@ -810,7 +845,7 @@ class MirrorLRScheduler:
             var, mag = self._mirror_stats()
 
             # Mirror hasn't differentiated yet — don't cut LR on noise
-            if var < 0.001:
+            if var < self.var_min_for_lr_decay:
                 mirror_mult = 1.0
             else:
                 decay = 1.0 - min(1.0, var / max(self.target_var, 1e-10))
@@ -850,13 +885,13 @@ if __name__ == '__main__':
     import torch
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    cfg = WideBindConfig(n_layers=24, D=896, bottleneck=896, bind_K=16, mlp_groups=8)
+    cfg = WideBindConfig(n_layers=24, D=896, bottleneck=896, bind_K=32, mlp_groups=8)
     model = WideBindStack(cfg).to(device)
     n = model.param_count()
     print(f'  D=896 G=8: params={n:,} ({n/1e6:.2f}M)')
     
     print()
-    cfg = WideBindConfig(n_layers=4, D=896, bottleneck=896, bind_K=16)
+    cfg = WideBindConfig(n_layers=4, D=896, bottleneck=896, bind_K=32)
     model = WideBindStack(cfg).to(device)
     
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)

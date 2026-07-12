@@ -188,7 +188,7 @@ def test_mirror_shape():
 
 def test_mirror_skip_connection_preserves_gradient():
     D, G, k = 352, 32, 4
-    mirror = GroupedCognitiveMirror(D, G=G, k=k, skip_alpha=0.1)
+    mirror = GroupedCognitiveMirror(D, G=G, k=k)
     B, L = 1, 4
     h = torch.randn(B, L, D)
     mem_all = torch.randn(B, L, D)
@@ -392,11 +392,78 @@ def test_adaptive_controller_ranges():
     b_i = AdaptiveController.b_i(model.layers)
     b_d = AdaptiveController.b_d(model.layers)
     assert -3 <= b_i <= 0, f'b_i out of range: {b_i}'
-    assert 2 <= b_d <= 6, f'b_d out of range: {b_d}'
+    assert 2 <= b_d <= 5, f'b_d out of range: {b_d}'
     scale = AdaptiveController.w_mem2v_scale(model.layers)
     assert 0.5 <= scale <= 1.0, f'mem2v_scale out of range: {scale}'
     alpha = AdaptiveController.ema_alpha(model.layers)
     assert 0.90 <= alpha <= 0.99, f'ema_alpha out of range: {alpha}'
+
+
+# ─── Config integration tests ──────────────────────────────────────────
+
+def test_config_adaptive_controller_thresholds():
+    """AdaptiveController stats respects custom config thresholds via forward pass."""
+    from core.config import WideBindConfig
+    from core.model import WideBindStack, AdaptiveController
+    cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
+                         exploration_threshold=0.5, differentiation_threshold=0.5)
+    model = WideBindStack(cfg)
+    h = torch.randn(1, 4, 896)
+    model(h)  # forward calls AdaptiveController.stats with cfg thresholds
+    # verify thresholds via direct call (kwargs override defaults)
+    expl, diff = AdaptiveController.stats(model.layers,
+        expl_thresh=cfg.exploration_threshold, diff_thresh=cfg.differentiation_threshold)
+    assert 0 <= expl <= 1
+    assert 0 <= diff <= 1
+
+
+def test_config_init_values():
+    """Custom init values propagate from config to model layers."""
+    from core.config import WideBindConfig
+    k = 4
+    cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8, mirror_k=k,
+                         w_pred_scale_init=0.5, log_scale_init_std=0.1,
+                         w_d_init_std=0.5, conv_init_std=0.05)
+    model = WideBindStack(cfg)
+    m0 = model.layers[0].mirror
+
+    # w_pred_scale shape and init
+    assert m0.w_pred_scale.shape == (8, k)
+    assert m0.w_pred_scale.data[0, 0].item() == 0.5
+
+    # w_d std respects config
+    w_d_std = model.layers[0].w_d.data.std().item()
+    assert abs(w_d_std - 0.5) < 0.1, f'w_d std={w_d_std:.3f} != 0.5'
+
+    # conv std respects config
+    conv_std = model.layers[0].conv.weight.data.std().item()
+    assert abs(conv_std - 0.05) < 0.02, f'conv std={conv_std:.4f} != 0.05'
+
+
+def test_config_param_groups_multipliers():
+    """param_groups uses config multipliers when called without overrides."""
+    from core.config import WideBindConfig
+    cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
+                         gate_lr_mult=3.0, gate_pred_scale_mult=7.0)
+    model = WideBindStack(cfg)
+    groups = model.param_groups(1e-4)
+
+    param_to_name = {}
+    for n, p in model.named_parameters():
+        param_to_name[id(p)] = n
+
+    found_gps = found_gate = False
+    for g in groups:
+        for p in g['params']:
+            name = param_to_name.get(id(p), '')
+            if 'gate_pred_scale' in name:
+                assert abs(g['lr'] - 7e-4) < 1e-7, f'gps lr={g["lr"]} != 7e-4'
+                found_gps = True
+            elif any(x in name for x in ['.w_gate', '.b_gate', '.log_skip']):
+                assert abs(g['lr'] - 3e-4) < 1e-7, f'gate lr={g["lr"]} != 3e-4'
+                found_gate = True
+    assert found_gps, 'gate_pred_scale group not found'
+    assert found_gate, 'gate param group not found'
 
 
 # ─── LiveInference ─────────────────────────────────────────────────
@@ -507,7 +574,7 @@ def test_mirror_monitor_rolling():
 
 def test_large_config_forward():
     cfg = WideBindConfig(n_layers=2, D=3584, mlp_groups=32, mlp_expand=8,
-                          bind_K=16, code_dim=32, code_sparsity=6)
+                          bind_K=32, code_dim=32, code_sparsity=6)
     model = WideBindStack(cfg)
     n = model.param_count()
     assert n > 0

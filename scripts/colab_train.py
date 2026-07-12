@@ -113,7 +113,11 @@ def train(cfg, drive_path=None):
 
     # ─── Scheduler ───
     if cfg.scheduler == 'mirror':
-        scheduler = MirrorLRScheduler(model, optimizer, cfg.lr, warmup=cfg.warmup_steps)
+        scheduler = MirrorLRScheduler(model, optimizer, cfg.lr,
+            warmup=cfg.warmup_steps, target_var=cfg.target_var,
+            mag_threshold=cfg.mag_threshold, lr_min_ratio=cfg.lr_min_ratio,
+            max_decay_steps=cfg.max_decay_steps,
+            var_min_for_lr_decay=cfg.var_min_for_lr_decay)
         print(f'Scheduler: MirrorLRScheduler')
     else:
         def get_lr_mult(step):
