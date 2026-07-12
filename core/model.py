@@ -489,7 +489,7 @@ class WideBindBlock(nn.Module):
         # ─── VSA Memory (gates) ───
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
         self.w_d = nn.Parameter(torch.randn(cfg.D) * cfg.w_d_init_std)    # content-dependent decay
-        self.w_q = nn.Parameter(torch.randn(cfg.D))
+        self.w_q = nn.Parameter(torch.full((cfg.D,), 1.0 / math.sqrt(cfg.D)))  # warm read: mem_read ≈ mem_all at init
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         # Linear decay across layers: shallow → short memory, deep → long
         layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
@@ -516,7 +516,7 @@ class WideBindBlock(nn.Module):
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
     
     def forward(self, h, state=None, global_state=None,
-                mem2v_scale=1.0, diff=None):
+                mem2v_scale=1.0, diff=None, noise_scale=0.0):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -545,6 +545,9 @@ class WideBindBlock(nn.Module):
         # ─── VSA Memory (adaptive gates) ───
         i_gate = F.softplus(h * self.w_i + self.b_i)        # (B, L, D) bounded [0, ∞)
         decay = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D)
+        if noise_scale > 0 and self.training:
+            noise = 1.0 + noise_scale * torch.randn_like(i_gate)
+            i_gate = i_gate * noise
         
         mem_all, mem_state_out = vsa_prefix_scan(decay, h * i_gate, mem_state)
         mem_read = mem_all * self.w_q                    # (B, L, D)
@@ -607,6 +610,8 @@ class WideBindStack(nn.Module):
                 min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max)
             ema_alpha = AdaptiveController.ema_alpha(self.layers,
                 min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
+            noise_scale = AdaptiveController.noise_scale(self.layers,
+                min_val=self.cfg.noise_scale_min, max_val=self.cfg.noise_scale_max)
             n = len(self.layers)
             for i, layer in enumerate(self.layers):
                 layer_frac = i / max(n - 1, 1)
@@ -621,7 +626,7 @@ class WideBindStack(nn.Module):
         
         new_state = []
         for layer, s in zip(self.layers, state):
-            h, s_out = layer(h, s, global_state=global_state, mem2v_scale=mem2v_scale, diff=diff)
+            h, s_out = layer(h, s, global_state=global_state, mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale)
             if s_out is not None:
                 mem_out = s_out[0]  # (B, D) — layer's final memory state
                 # Update global state: adaptive EMA aggregation
@@ -674,6 +679,7 @@ class WideBindStack(nn.Module):
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
+                                               '.mirror.W_pred', '.mirror.w_pred_scale',
                                                '.mirror.w_gate', '.mirror.b_gate',
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
