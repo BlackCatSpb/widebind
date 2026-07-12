@@ -1,0 +1,26 @@
+=== Что обновить на Google Drive ===
+
+Место на Drive: /content/drive/MyDrive/widebind_data/
+(или где у вас лежат исходники)
+
+1. core/config.py — 35 полей, все гиперпараметры
+2. core/model.py — per-expert params, noise_scale, gate_pred_scale acceleration
+3. compression/fcf_cpr.py — sparse_block_codes patch (уже должен быть, если не обновлялся)
+4. scripts/mini_test.py — smoke test для MX550/Colab
+5. notebooks/colab.ipynb — обновлён (см. ниже)
+
+=== Команда для копирования ===
+# В Colab, после cell[1] (drive.mount):
+!rm -rf /content/widebind_src
+!cp -r /content/drive/MyDrive/widebind_data/src /content/widebind_src
+
+# Или частями:
+!cp /content/drive/MyDrive/widebind_data/src/core/config.py /content/widebind_src/core/config.py
+!cp /content/drive/MyDrive/widebind_data/src/core/model.py /content/widebind_src/core/model.py
+!cp /content/drive/MyDrive/widebind_data/src/compression/fcf_cpr.py /content/widebind_src/compression/fcf_cpr.py
+
+=== Что изменилось в ноутбуке ===
+- Config: добавлены комментарии со всеми 35 полями (можно раскомментировать для тюнинга)
+- MirrorLRScheduler: принимает cfg напрямую (scheduler = MirrorLRScheduler(model, optimizer, cfg=cfg))
+- Status log: показывает β0, βL, α_skip (gate_pred_scale первой/последней layers, skip connection strength)
+- Reinit: w_pred_scale 0.1→0.5 для старых чекпоинтов (рядом с gate_pred_scale reinit)

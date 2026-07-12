@@ -818,9 +818,18 @@ class MirrorLRScheduler:
 
     LR_mult = max(0.05, (1 - var/target) * min(1, mag/threshold))
     """
-    def __init__(self, model, optimizer, base_lr, warmup=1000,
+    def __init__(self, model, optimizer, base_lr=None, warmup=1000,
                  target_var=0.1, mag_threshold=0.3, lr_min_ratio=0.05,
-                 max_decay_steps=50000, var_min_for_lr_decay=0.001):
+                 max_decay_steps=50000, var_min_for_lr_decay=0.001,
+                 cfg=None):
+        if cfg is not None:
+            base_lr = base_lr or cfg.lr
+            warmup = getattr(cfg, 'warmup_steps', warmup)
+            target_var = getattr(cfg, 'target_var', target_var)
+            mag_threshold = getattr(cfg, 'mag_threshold', mag_threshold)
+            lr_min_ratio = getattr(cfg, 'lr_min_ratio', lr_min_ratio)
+            max_decay_steps = getattr(cfg, 'max_decay_steps', max_decay_steps)
+            var_min_for_lr_decay = getattr(cfg, 'var_min_for_lr_decay', var_min_for_lr_decay)
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
