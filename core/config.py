@@ -47,6 +47,8 @@ class WideBindConfig:
     ema_alpha_max: float = 0.99          # global EMA rate when diff=1
     noise_scale_min: float = 0.001       # parameter noise when diff=1
     noise_scale_max: float = 0.05        # parameter noise when diff=0
+    delta_var_ema_min: float = 0.80      # δ_var EMA rate when diff=0 (fast, ~5-step TC)
+    delta_var_ema_max: float = 0.99      # δ_var EMA rate when diff=1 (slow, ~100-step TC)
 
     # Optimizer
     gate_lr_mult: float = 5.0     # LR boost for gate weight params

@@ -261,7 +261,8 @@ class GroupedCognitiveMirror(nn.Module):
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
     def __init__(self, D, G=32, k=8, w_pred_scale_init=0.1, log_scale_init_std=0.05,
-                 gate_pred_scale_init=-1.0, skip_alpha=None):
+                 gate_pred_scale_init=-1.0, skip_alpha=None,
+                 delta_var_ema_min=0.8, delta_var_ema_max=0.99):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -316,6 +317,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.log_grad_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
         self.grad_mod_bias = nn.Parameter(torch.full((G,), -0.01))
         self.log_skip_alpha = nn.Parameter(torch.full((G,), math.log(0.1)))
+        self._delta_var_ema_min = delta_var_ema_min
+        self._delta_var_ema_max = delta_var_ema_max
     
     def forward(self, h, mem_all, global_state=None, diff=None):
         B, L, D = h.shape
@@ -386,7 +389,7 @@ class GroupedCognitiveMirror(nn.Module):
         with torch.no_grad():
             dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)  # (G,)
             if diff is not None:
-                ema_alpha = 0.8 + diff * 0.19  # diff∈[0,1] → alpha∈[0.8, 0.99]
+                ema_alpha = self._delta_var_ema_min + diff * (self._delta_var_ema_max - self._delta_var_ema_min)
             else:
                 ema_alpha = 0.9
             self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
@@ -484,7 +487,8 @@ class WideBindBlock(nn.Module):
         # Cognitive Mirror (32 эксперта, grouped K-space)
         self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=cfg.mirror_k,
             w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
-            gate_pred_scale_init=cfg.gate_pred_scale_init)
+            gate_pred_scale_init=cfg.gate_pred_scale_init,
+            delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max)
         
         # ─── VSA Memory (gates) ───
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate

@@ -485,7 +485,7 @@ mirror = mirror * expert_gate.unsqueeze(-1)         # (B, L, G, d)
 - Per-token gate: 256 градиентов/шаг против 1 → **эффективная выборка 32 градиента/параметр/шаг** (против 0.009)
 - gate_pred_scale (init=-1.0, β≈0.27): адаптивное coupling с W_pred. На старте gate частично открыт; по мере обучения W_pred, β растёт и pred_error улучшает gate
 
-**delta_var** — adaptive EMA: `α = 0.8 + diff·0.19` (было 0.9). При low diff: α≈0.8 (быстрое обновление), при high diff: α≈0.99 (медленное). Эксперт с высокой variance активно корректирует — gate открыт. С variance ≈ 0 — либо выключен, либо коллапсировал — gate прижат.
+**delta_var** — adaptive EMA: `α = delta_var_ema_min + diff·(delta_var_ema_max - delta_var_ema_min)`. Default: min=0.80, max=0.99. При low diff: α≈0.8 (быстрое обновление), при high diff: α≈0.99 (медленное). Эксперт с высокой variance активно корректирует — gate открыт. С variance ≈ 0 — либо выключен, либо коллапсировал — gate прижат. Параметры из config: `delta_var_ema_min`, `delta_var_ema_max`.
 
 **Skip connection (per-expert learned α_g = exp(log_skip_alpha[g]), init 0.1):**
 ```python
@@ -682,6 +682,7 @@ differentiation = min(1, var(log_scale) / 0.1)
 | b_i (bias write gate) | [-3.0, -1.5] → i_gate ≈ [0.047, 0.27] | exploration | `-3.0 + expl·1.5` | fill_, сужение, i_gate≤0.27 |
 | w_mem2v_scale | [min, max] → [0.5, 1.0] | differentiation | `max - diff·(max-min)` | `w_mem2v_scale_min/max` |
 | EMA α (global state) | [min, max] → [0.90, 0.99] | differentiation | `min + diff·(max-min)` | `ema_alpha_min/max` |
+| EMA α (δ_var gate) | [min, max] → [0.80, 0.99] | differentiation | `min + diff·(max-min)` | `delta_var_ema_min/max` |
 | Noise scale (гейты) | [min, max] → [0.001, 0.05] | differentiation | `max - diff·(max-min)` | `noise_scale_min/max` |
 
 **Ключевое изменение:** b_d теперь **пер-слойный** — L0(τ≈8) → L31(τ≈150 на expl=0). Ранние слои быстро забывают (короткий контекст), глубокие — медленно (длинный контекст). Верхняя граница b_d=5.0 (τ≈150) — ограничивает перегрузку памяти при высоком exploration.
@@ -1083,8 +1084,8 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 - **Тренировка:** 🟡 Colab T4, B=2, L=128. Шаг 3000 (1 сессия). loss 10.8→6.23, val 6.55.
 - **gate_pred_scale:** ✅ init=-1.0 (исправлено с -5.0). Переместился в config (`gate_pred_scale_init`). **Ускорение 17×**: +0.014/100 шагов (мини-тест MX550, vs +0.024/3000 ранее) — благодаря W_pred в gate group (LR×5) + w_pred_scale_init=0.5 + gate_pred_scale_mult=10.0. Прогноз: β≈0.5 за ~5-6K.
 - **W_pred:** ✅ В gate param group (LR×5), норма ~16. w_pred_scale_init=0.5 (было 0.1) — pred_error ~14% от hp в gate_signal.
-- **AdaptiveController:** ✅ Все thresholds/ranges в config: `exploration_threshold`, `differentiation_threshold`, `w_mem2v_scale_min/max`, `ema_alpha_min/max`, `noise_scale_min/max`. b_i/d через fill_(), пер-слойный b_d (τ=8→150, кап 5.0), i_gate ≤ 0.27.
-- **Gate modulation:** ✅ **Per-expert learned** `log_dvar_mod_scale`, `dvar_mod_bias`, `log_grad_mod_scale`, `grad_mod_bias` — вместо хардкода `0.1·tanh(x-0.01)`. EMA alpha для δ_var: `0.8 + diff·0.19` (адаптивная).
+- **AdaptiveController:** ✅ Все thresholds/ranges в config: `exploration_threshold`, `differentiation_threshold`, `w_mem2v_scale_min/max`, `ema_alpha_min/max`, `delta_var_ema_min/max`, `noise_scale_min/max`. b_i/d через fill_(), пер-слойный b_d (τ=8→150, кап 5.0), i_gate ≤ 0.27.
+- **Gate modulation:** ✅ **Per-expert learned** `log_dvar_mod_scale`, `dvar_mod_bias`, `log_grad_mod_scale`, `grad_mod_bias` — вместо хардкода `0.1·tanh(x-0.01)`. EMA alpha для δ_var: `0.8 + diff·(0.99-0.80)` (адаптивная, из config `delta_var_ema_min/max`).
 - **Skip connection:** ✅ **Per-expert learned** `log_skip_alpha` — вместо `α=0.1`.
 - **Init stds:** ✅ Все в config: `w_pred_scale_init`, `log_scale_init_std`, `w_d_init_std`, `conv_init_std`.
 - **noise_scale:** ✅ **Активен** (был dead code). 5% multiplicative noise на i_gate во время train, детерминированный при eval. Decay с differentiation: `max - diff·(max-min)`.
