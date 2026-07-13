@@ -290,8 +290,9 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_sym_v = nn.Parameter(torch.randn(G, k))
         
         # Predictive mirror: K-space prediction from previous step
-        pred_std = 1.0 / k ** 0.5
-        self.W_pred = nn.Parameter(torch.randn(G, k, k) * pred_std)
+        # W_pred ≈ I: pred_k ≈ hp_prev, pred_error ≈ hp - hp_prev (temporal delta)
+        eye = torch.eye(k).unsqueeze(0).expand(G, -1, -1).clone()
+        self.W_pred = nn.Parameter(eye * 0.99 + torch.randn(G, k, k) * 0.01)
         self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)

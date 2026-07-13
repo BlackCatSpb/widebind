@@ -24,7 +24,7 @@ class WideBindConfig:
     mirror_k: int = 8            # K-space dim per expert
     w_pred_scale_init: float = 0.5
     log_scale_init_std: float = 0.05
-    gate_pred_scale_init: float = -1.0   # β=σ(init) ≈ 0.27, растёт с тренировкой
+    gate_pred_scale_init: float = 0.0    # β=σ(0)=0.5, старт с половинным coupling
 
     # MLP
     mlp_groups: int = 32         # D/mlp_groups=112 — aligned with embed seg и mirror G
