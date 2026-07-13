@@ -1030,20 +1030,23 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 ```
 
 | Шаг | Train Loss | Val Loss | Val PPL | var(ls) | |mirror| | mirror_mult | gate_pred | Примечание |
-|---|---|---|---|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 0 | 10.96 | — | — | 0.0025 | 0 | 1.0 | **0.00** | Инит (gate_pred_scale=0.0, β=0.5, W_pred≈I) |
 | 1000 | 6.83 | 6.55 | 699 | 0.0025 | 0.20 | 0.66 | 0.00 | β=0.5 — сильный сигнал для W_pred |
-| 2000 | 6.53 | 6.55 | 697 | 0.00250 | 0.20 | 0.66 | 0.00 | W_pred учится (identity init) |
-| 3000 | 6.23 | 6.55 | 696 | 0.00249 | 0.21 | 0.67 | 0.00 | W_pred std растёт, β стабилен |
-| **5000 (прогноз)** | ~5.9 | ~6.4 | ~600 | ~0.0025 | ~0.25 | ~0.70 | **>0.00** | W_pred накопил сигнал → β рост |
-| **10000 (прогноз)** | ~5.5 | ~6.2 | ~500 | ~0.003 | ~0.35 | ~0.75 | **>0.50** | β>0.5 — жёсткий gate, var(ls) рост |
+| 2000 | 6.53 | 6.55 | 697 | 0.00250 | 0.20 | 0.66 | 0.00 | best.pt. Все adaptive params frozen |
+| 3000 | 6.23 | 6.55 | 696 | 0.00249 | 0.21 | 0.67 | 0.00 | W_pred всё ещё ≈I, β frozen |
+| **5000 (прогноз)** | ~6.2 | ~6.4 | ~600 | ~0.0025 | ~0.20 | ~0.65 | **0.00** | Без фиксов β не двигается |
+| **после фиксов** | ~6.0 | ~6.2 | ~500 | ~0.003 | ~0.25 | ~0.70 | **>0.0** | b_d фикс + EMA + grad_mod |
 
-*Сессия 2026-07, L=32, K-space gate init=-1.0 (против -5.0 в старой сессии). **Ускорение gate_pred_scale в 17×** после фиксов: W_pred в gate group (LR×5) + w_pred_scale_init=0.5 + gate_pred_scale_mult=10.0. Вместо +0.024 за 3000 шагов → **+0.014 за 100 шагов** (мини-тест, MX550). Прогноз: β≈0.5 за ~5-6K вместо 125K.*
+*Сессия 2026-07, L=32, gate_pred_scale_init=0.0 (β=0.5). Ключевой вывод: β=0.5 слишком высок для свежего W_pred, gate режет 50% сигнала и не даёт W_pred выйти из identity. b_d формула была инвертирована (высокий exploration → LONG memory), исправлено в commit 3658fdc.*
 
-**Ключевые исправления сессии (11 commits):**
+**Ключевые исправления сессии (12 commits):**
 
 | Изменение | Файл | Эффект |
 |---|---|---|
+| **b_d formula INVERSION FIX** | model.py | high expl → SHORT memory (было LONG). τ=[13,148] vs [83,148] |
+| **grad_mod backward hook** | model.py | _prev_grad_norm заполняется автоматически, grad_mod работает |
+| **EMA exploration (τ=500)** | model.py | Контроллер не паникует от noise random init |
 | **K-space gate: w_gate (G,d)→(G,k), per-token gating, gate_pred_scale** | model.py | SNR gate ↑ 3555× |
 | conv_smooth dirac fix: все G*k каналов center=1.0 | model.py | Все 256 каналов conv_smooth активны |
 | vsa_prefix_scan: cat вместо in-place slice | model.py | autograd совместим с большими графами |
@@ -1080,20 +1083,22 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 
 - **Архитектура:** ✅ **K-space gate** + **bind_K=32** + **n_layers=32**. Полная синхронизация: L=K=G=32, D/L=d=112. 46 тестов проходят.
 - **Сжатие:** ✅ FCF-CPR (8-bit uniform, 18.7×, MSE 2.0e-5). **Важно:** `decompress_sd` использует `sparse_block_codes`, не `zeckendorf_codes`.
-- **Тренировка:** 🟡 Colab T4, B=4, seq_len=64. Fresh start, step 0 loss=10.96, step 100 loss=10.02. RAM-оптимизировано: `del`+`gc.collect()`, eval без `LiveInference`, batch test max 4.
+- **Тренировка:** 🟡 Colab T4, B=4, seq_len=64. step 2000: val_loss=6.575. **Вывод:** β=0.5 frozen, W_pred≈I, все adaptive params frozen. Требуется restart с исправлениями.
 - **gate_pred_scale:** ✅ init=0.0 (было -1.0). β=0.5 с первого шага. W_pred≈I identity init — pred_k≈hp_prev, pred_error≈hp-hp_prev (временной дельта).
 - **W_pred:** ✅ identity init (`eye×0.99 + noise×0.01`). В gate param group (LR×5). Не требует прогрева — градиент осмыслен с шага 1.
-- **AdaptiveController:** ✅ Все thresholds/ranges в config: `exploration_threshold`, `differentiation_threshold`, `w_mem2v_scale_min/max`, `ema_alpha_min/max`, `delta_var_ema_min/max`, `noise_scale_min/max`. b_i/d через fill_(), пер-слойный b_d (τ=8→150, кап 5.0), i_gate ≤ 0.27.
+- **AdaptiveController:** 🟡 b_d формула ИНВЕРТИРОВАНА — исправлено (commit 3658fdc). High exploration → SHORT memory. EMA exploration (τ=500). Все thresholds/ranges в config.
+- **grad_mod:** ✅ Заработал — backward hook на hp заполняет `_prev_grad_norm`.
+- **MirrorLRScheduler:** 🟡 `var_min_for_lr_decay=0.005` (было 0.001) — LR не режется на noise floor init.
 - **Gate modulation:** ✅ **Per-expert learned** `log_dvar_mod_scale`, `dvar_mod_bias`, `log_grad_mod_scale`, `grad_mod_bias` — вместо хардкода `0.1·tanh(x-0.01)`. EMA alpha для δ_var: `0.8 + diff·(0.99-0.80)` (адаптивная, из config `delta_var_ema_min/max`).
 - **Skip connection:** ✅ **Per-expert learned** `log_skip_alpha` — вместо `α=0.1`.
 - **Init stds:** ✅ Все в config: `w_pred_scale_init`, `log_scale_init_std`, `w_d_init_std`, `conv_init_std`.
 - **noise_scale:** ✅ **Активен** (был dead code). 5% multiplicative noise на i_gate во время train, детерминированный при eval. Decay с differentiation: `max - diff·(max-min)`.
 - **w_q init:** ✅ `randn(D)` → `1/sqrt(D)` ≈ 0.017 (warm read с шага 1).
-- **MirrorLRScheduler:** ✅ Все параметры в config: `target_var`, `mag_threshold`, `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay`. Принимает `cfg=` напрямую.
+- **MirrorLRScheduler:** Все параметры в config: `target_var`, `mag_threshold`, `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay`.
 - **param_groups:** ✅ `gate_lr_mult=5.0` (W_pred + w_pred_scale), `gate_pred_scale_mult=10.0` — из config.
 - **var(log_scale):** 🟡 Плато 0.0025. Прорыв ожидается при росте β→0.6-0.8 (зависит от W_pred, а не gate_pred_scale).
 - **Инференс локально (MX550):** ✅ ~0.55 GB fp16, ~11 tok/s.
-- **Коллаб:** ✅ Notebook обновлён: RAM-оптимизация (seq_len=64, B=4, del+gc), resume с force gps=0.0 и W_pred identity reinit, patch FCF-CPR, статус-лог с β0/βL/α_skip, MirrorLRScheduler(cfg=), batch test [4,2,1]
+- **Коллаб:** Обновлён (commit 3658fdc): скопировать `config.py`, `model.py`, `analyze_checkpoint.py` на Drive.
 - **Self-dialogue:** 🟡 LiveInference отключён (экономия RAM). Self-dialogue не тестируется до роста var(ls).
 - **Мониторинг:** ✅ MirrorMonitor
 
