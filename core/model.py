@@ -305,8 +305,9 @@ class GroupedCognitiveMirror(nn.Module):
         # Gate coupling with W_pred: β = σ(gate_pred_scale), grows with W_pred
         self.gate_pred_scale = nn.Parameter(torch.tensor(gate_pred_scale_init))
         
-        # External gradient cache (устанавливается после backward)
+        # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
         self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
@@ -332,6 +333,12 @@ class GroupedCognitiveMirror(nn.Module):
         
         # Project each group to its K-space
         hp = torch.einsum('blgd,gdk->blgk', h_g, self.W_proj)    # (B, L, G, k)
+        # Hook to capture gradient for grad_mod (only during training)
+        if hp.requires_grad:
+            hp.register_hook(lambda g: (
+                self._prev_grad_norm.copy_(g.detach().norm(dim=-1).mean(dim=(0, 1))),
+                None
+            )[1])
         mc_k = torch.einsum('b l gd,gdk->b l gk', mc_g, self.W_proj)
         
         # hp_prev shared by sym_k and pred_error
@@ -408,11 +415,15 @@ class GroupedCognitiveMirror(nn.Module):
         
         return mirror
     
-    def cache_grad_norms(self, grad_h):
-        """Call after backward: store per-subspace gradient norm."""
-        with torch.no_grad():
-            g_norms = grad_h.reshape(-1, self.G, self.d).norm(dim=-1).mean(dim=0)
-            self._prev_grad_norm.copy_(g_norms)
+    def cache_grad_norms(self, grad_h=None):
+        """Call after backward: store per-subspace gradient norm.
+        Uses hp hook by default; falls back to explicit grad_h if provided."""
+        if grad_h is not None:
+            with torch.no_grad():
+                g_norms = grad_h.reshape(-1, self.G, self.d).norm(dim=-1).mean(dim=0)
+                self._prev_grad_norm.copy_(g_norms)
+        else:
+            self._prev_grad_norm.copy_(self._hp_grad)
 
 
 # ─── Grouped MLP ──────────────────────────────────────────────────────
@@ -596,6 +607,8 @@ class WideBindStack(nn.Module):
         ])
         
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
+        # EMA for exploration (smoothed over ~500 steps)
+        self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
     def forward(self, h, state=None, global_state=None):
         """h: (B, L, D) — pre-embedded tokens
@@ -608,9 +621,13 @@ class WideBindStack(nn.Module):
         
         # ─── Adaptive gate biases from mirror stats ───
         with torch.no_grad():
-            expl, diff = AdaptiveController.stats(self.layers,
+            expl_raw, diff = AdaptiveController.stats(self.layers,
                 expl_thresh=self.cfg.exploration_threshold,
                 diff_thresh=self.cfg.differentiation_threshold)
+            # EMA-smooth exploration: τ ≈ 500 steps (α=0.998)
+            self._expl_ema.mul_(0.998).add_(expl_raw * (1.0 - 0.998))
+            expl = self._expl_ema.clamp(0.0, 1.0).item()
+            
             mem2v_scale = AdaptiveController.w_mem2v_scale(self.layers,
                 min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max)
             ema_alpha = AdaptiveController.ema_alpha(self.layers,
@@ -621,7 +638,14 @@ class WideBindStack(nn.Module):
             for i, layer in enumerate(self.layers):
                 layer_frac = i / max(n - 1, 1)
                 b_i_val = -3.0 + expl * 1.5
-                b_d_val = (2.0 + 3.0 * layer_frac) + expl * (5.0 - (2.0 + 3.0 * layer_frac))
+                # Fixed b_d: high expl → short memory (low b_d).
+                # τ hierarchy preserved: L0 shorter than L31 at any expl.
+                # base = 2.0 + 3.0*layer_frac ∈ [2.0, 5.0]
+                b_d_max = 5.0
+                b_d_min = 2.0 + 3.0 * layer_frac  # L0=2.0, L31=5.0
+                # expl=1 → b_d = b_d_min (shortest), expl=0 → b_d = b_d_max (longest)
+                b_d_val = b_d_max - expl * (b_d_max - b_d_min)
+                b_d_val = max(2.0, min(5.0, b_d_val))
                 layer.b_i.fill_(b_i_val)
                 layer.b_d.fill_(b_d_val)
         
@@ -734,9 +758,11 @@ class AdaptiveController:
 
     Mathematically derived ranges:
     ──────────────────────────────
-    b_d  ∈ [2.0 + 3.0*layer_frac, 5.0] per layer
+    b_d ∈ [b_d_min, 5.0] per layer, where b_d_min = 2.0 + 3.0*layer_frac
+         expl=1 → b_d = b_d_min (shortest memory)
+         expl=0 → b_d = 5.0 (longest memory)
          L0: τ≈[7, 150], L31: τ≈[150, 150]
-    b_i  ∈ [-3.0, -1.5] → i_gate ≈ [0.049, 0.27] (write rate, softplus)
+    b_i  ∈ [-3.0, -1.5] → i_gate ≈ [0.047, 0.18] (write rate via sigmoid)
     w_mem2v_scale ∈ [0.5, 1.0]  (memory contribution)
     ema_alpha ∈ [0.90, 0.99]  (cross-layer memory aggregation)
     noise_scale ∈ [0.001, 0.05]  (parameter noise for exploration)
@@ -762,7 +788,9 @@ class AdaptiveController:
         """Decay bias (average across layers). High exploration → shorter memory.
 
         τ = -1/ln(sigmoid(b_d))
-        Per-layer init: L0=2.0(τ≈7), L31=5.0(τ≈150), capped at 5.0 by exploration.
+        Per-layer init: L0=2.0(τ≈7), L31=5.0(τ≈150).
+        Formula: b_d = b_d_max - expl * (b_d_max - b_d_min)
+        so high expl → low b_d → short memory.
         """
         expl, _ = AdaptiveController.stats(blocks)
         return 5.0 - expl * 2.0

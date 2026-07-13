@@ -3,8 +3,8 @@
 Место на Drive: /content/drive/MyDrive/widebind_data/
 (или где у вас лежат исходники)
 
-1. core/config.py — 35 полей, все гиперпараметры
-2. core/model.py — per-expert params, noise_scale, gate_pred_scale acceleration
+1. core/config.py — 37 полей, все гиперпараметры (gate_pred_scale_init=0.0, W_pred identity init)
+2. core/model.py — per-expert params, noise_scale, W_pred identity init (eye*0.99 + noise*0.01)
 3. compression/fcf_cpr.py — sparse_block_codes patch (уже должен быть, если не обновлялся)
 4. scripts/mini_test.py — smoke test для MX550/Colab
 5. notebooks/colab.ipynb — обновлён (см. ниже)
@@ -20,7 +20,8 @@
 !cp /content/drive/MyDrive/widebind_data/src/compression/fcf_cpr.py /content/widebind_src/compression/fcf_cpr.py
 
 === Что изменилось в ноутбуке ===
-- Config: добавлены комментарии со всеми 35 полями (можно раскомментировать для тюнинга)
-- MirrorLRScheduler: принимает cfg напрямую (scheduler = MirrorLRScheduler(model, optimizer, cfg=cfg))
+- Config: gateway_pred_scale_init=0.0 (β=0.5 с первого шага), W_pred identity init
+- RAM-оптимизация: seq_len=64, B=4, нет LiveInference, del+gc.collect(), eval без state
+- Resume: force gps=0.0, W_pred identity reinit, simple load_state_dict(strict=False)
 - Status log: показывает β0, βL, α_skip (gate_pred_scale первой/последней layers, skip connection strength)
-- Reinit: w_pred_scale 0.1→0.5 для старых чекпоинтов (рядом с gate_pred_scale reinit)
+- Batch test: [4, 2, 1] вместо [8, 6, 4, 2, 1] (B=6 OOM с state)

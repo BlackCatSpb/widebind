@@ -1,6 +1,10 @@
 # WideBind: Architecture & Method Description
 
-> Version: 2.0 (GroupedMLP)
+> **⚠️ This document describes the 41M architecture (D=896, L=24, K=16, 2026-07 epoch).**
+> **Current architecture (2026-07): 221M params, D=3584, L=32, K=32, G=32, bind_K=32.**
+> **See `README.md` for the current spec. This file is preserved as historical reference.**
+>
+> Version: 2.0 (GroupedMLP era)
 > Params: 41,246,336 (41.25M)
 > Last updated: 2026-07-07
 

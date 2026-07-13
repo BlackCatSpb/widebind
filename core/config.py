@@ -36,7 +36,7 @@ class WideBindConfig:
     mag_threshold: float = 0.3
     lr_min_ratio: float = 0.05
     max_decay_steps: int = 50000
-    var_min_for_lr_decay: float = 0.001
+    var_min_for_lr_decay: float = 0.005  # log_scale init std=0.05 → var=0.0025; only decay when var exceeds 2× init noise
 
     # AdaptiveController
     exploration_threshold: float = 0.25   # normalization: |mirror| / thresh → [0,1]

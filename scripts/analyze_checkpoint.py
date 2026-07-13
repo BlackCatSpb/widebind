@@ -112,14 +112,43 @@ def analyze_single_checkpoint(ckpt_path):
         d['mirror_proj_norm'] = m.W_proj.data.norm().item()
         d['mirror_out_norm'] = m.W_out.data.norm().item()
         d['mirror_temp_mean'] = m.w_temp.data.mean().item()
+        d['mirror_temp_std'] = m.w_temp.data.std().item()
         d['mirror_global_mean'] = m.w_global.data.mean().item()
+        d['mirror_global_std'] = m.w_global.data.std().item()
         d['mirror_sym_u_mean'] = m.w_sym_u.data.mean().item()
+        d['mirror_sym_u_std'] = m.w_sym_u.data.std().item()
         d['mirror_sym_v_mean'] = m.w_sym_v.data.mean().item()
+        d['mirror_sym_v_std'] = m.w_sym_v.data.std().item()
         d['mirror_log_scale_mean'] = m.log_scale.data.mean().item()
         d['mirror_log_scale_std'] = m.log_scale.data.std().item()
         d['mirror_log_scale_min'] = m.log_scale.data.min().item()
         d['mirror_log_scale_max'] = m.log_scale.data.max().item()
         d['mirror_log_scale_sparsity'] = (m.log_scale.data.abs() < 0.01).float().mean().item() * 100
+        
+        # ─── Gate / Prediction ───
+        d['gate_pred_scale'] = m.gate_pred_scale.data.item()
+        d['gate_beta'] = torch.sigmoid(m.gate_pred_scale.data).item()
+        d['w_pred_scale_mean'] = m.w_pred_scale.data.mean().item()
+        d['w_pred_scale_std'] = m.w_pred_scale.data.std().item()
+        # W_pred identity check
+        wp = m.W_pred.data  # (G, k, k)
+        k_dim = wp.shape[-1]
+        eye = torch.eye(k_dim).unsqueeze(0).expand_as(wp)
+        diff_from_eye = (wp - eye).abs()
+        d['w_pred_max_diff'] = diff_from_eye.max().item()
+        d['w_pred_mean_diff'] = diff_from_eye.mean().item()
+        d['w_pred_diag_mean'] = torch.stack([wp[g].diag().mean() for g in range(wp.shape[0])]).mean().item()
+        d['w_pred_offdiag_mean'] = (wp * (1 - torch.eye(k_dim).unsqueeze(0))).mean().item()
+        d['w_pred_mean'] = wp.mean().item()
+        d['w_pred_std'] = wp.std().item()
+        
+        # Per-expert learned modulation
+        d['log_skip_alpha_mean'] = m.log_skip_alpha.data.mean().item()
+        d['skip_alpha'] = m.log_skip_alpha.data.exp().mean().item()
+        d['log_dvar_mod_scale_mean'] = m.log_dvar_mod_scale.data.mean().item()
+        d['dvar_mod_bias_mean'] = m.dvar_mod_bias.data.mean().item()
+        d['log_grad_mod_scale_mean'] = m.log_grad_mod_scale.data.mean().item()
+        d['grad_mod_bias_mean'] = m.grad_mod_bias.data.mean().item()
         
         # Mirror conv smooth
         d['mirror_conv_norm'] = m.conv_smooth.weight.data.norm().item()
@@ -172,7 +201,54 @@ def analyze_single_checkpoint(ckpt_path):
     return model, cfg, step, best_val, total, trainable, all_w, out, layers_data, opt_info, has_opt, has_sch, missing
 
 
-def generate_report(ckpt_path):
+def append_to_log(ckpt_path, layers_data, model, cfg, step, best_val, all_w, out):
+    log_path = os.path.join(os.path.dirname(__file__), '..', 'docs', 'TRAINING_LOG.md')
+    log_path = os.path.normpath(log_path)
+    
+    from core import AdaptiveController
+    d0 = layers_data[0]
+    dL = layers_data[-1]
+    betas = [d['gate_beta'] for d in layers_data]
+    gps = [d['gate_pred_scale'] for d in layers_data]
+    ls_stds = [d['mirror_log_scale_std'] for d in layers_data]
+    expl, diff = AdaptiveController.stats(model.layers)
+    
+    val_str = f'val_loss={best_val:.4f}' if best_val != float('inf') else 'no eval'
+    
+    entry = f'''
+### Step {step} — {os.path.basename(ckpt_path)}
+| Metric | Value |
+|--------|-------|
+| Step | {step} |
+| best_val_loss | {best_val if best_val != float('inf') else 'N/A'} |
+| beta_0 | {betas[0]:.4f} |
+| beta_31 | {betas[-1]:.4f} |
+| beta mean / std | {sum(betas)/len(betas):.4f} / {torch.tensor(betas).std():.4f} |
+| gate_pred_scale range | [{min(gps):.4f}, {max(gps):.4f}] |
+| W_pred diff from I (max) | {max(d['w_pred_mean_diff'] for d in layers_data):.4f} |
+| W_pred diag L0/L31 | {d0['w_pred_diag_mean']:.3f} / {dL['w_pred_diag_mean']:.3f} |
+| skip_alpha mean | {sum(d['skip_alpha'] for d in layers_data)/len(layers_data):.4f} |
+| var(log_scale) mean | {sum(s**2 for s in ls_stds)/len(ls_stds):.6f} |
+| log_scale sigma mean | {sum(ls_stds)/len(ls_stds):.4f} |
+| MLP eff_rank mean | {sum(d['mlp_eff_rank'] for d in layers_data)/len(layers_data):.1f} |
+| Bind rank mean | {sum(d['bind_proj_rank'] for d in layers_data)/len(layers_data):.1f} |
+| tau range | [{min(d['tau'] for d in layers_data):.0f}, {max(d['tau'] for d in layers_data):.0f}] |
+| i_gate | {d0['i_gate']:.3f} |
+| w_pred_scale mu | {d0['w_pred_scale_mean']:.3f} |
+| log_dvar_mod_scale | {d0['log_dvar_mod_scale_mean']:.3f} |
+| log_grad_mod_scale | {d0['log_grad_mod_scale_mean']:.3f} |
+| Exploration | {expl:.4f} |
+| Differentiation | {diff:.6f} |
+| Output std (fwd) | {out.std():.4f} |
+| Weights std | {all_w.std():.4f} |
+'''
+    
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(entry)
+    print(f'  Appended to {os.path.relpath(log_path)}')
+
+
+def generate_report(ckpt_path, append_log=False):
     model, cfg, step, best_val, total, trainable, all_w, out, layers_data, opt_info, has_opt, has_sch, missing = analyze_single_checkpoint(ckpt_path)
     
     base = os.path.splitext(ckpt_path)[0]
@@ -211,7 +287,7 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 <table>
 <tr><td>Params</td><td class="num">{total:,} ({total/1e6:.2f}M)</td></tr>
 <tr><td>Trainable</td><td class="num">{trainable:,}</td></tr>
-<tr><td>D / K / bottleneck</td><td class="num">{cfg.D} / {cfg.bind_K} / {cfg.bottleneck}</td></tr>
+<tr><td>D / K</td><td class="num">{cfg.D} / {cfg.bind_K}</td></tr>
 <tr><td>MLP groups / expand</td><td class="num">{cfg.mlp_groups} / {cfg.mlp_expand}×</td></tr>
 <tr><td>Layers</td><td class="num">{cfg.n_layers}</td></tr>
 <tr><td>SEQ_LEN / Batch</td><td class="num">{cfg.seq_len} / {cfg.batch_size}</td></tr>
@@ -232,6 +308,28 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 </table>
 '''
     
+    # ─── Gate / β Summary ───
+    betas = [d['gate_beta'] for d in layers_data]
+    gps = [d['gate_pred_scale'] for d in layers_data]
+    skip_alphas = [d['skip_alpha'] for d in layers_data]
+    ls_stds = [d['mirror_log_scale_std'] for d in layers_data]
+    wp_md = [d['w_pred_mean_diff'] for d in layers_data]
+    html += f'''<h2>Gate & Prediction Summary</h2>
+<table>
+<tr><td>β₀ (L0)</td><td class="num">{betas[0]:.4f}</td><td>β = σ(gate_pred_scale)</td></tr>
+<tr><td>β_{cfg.n_layers-1} (L{cfg.n_layers-1})</td><td class="num">{betas[-1]:.4f}</td></tr>
+<tr><td>β mean / std across layers</td><td class="num">{sum(betas)/len(betas):.4f} / {torch.tensor(betas).std():.4f}</td></tr>
+<tr><td>gate_pred_scale range</td><td class="num">[{min(gps):.4f}, {max(gps):.4f}]</td></tr>
+<tr><td>W_pred |I-diff| mean (strongest layer)</td><td class="num">{max(wp_md):.4f} (L{wp_md.index(max(wp_md))})</td></tr>
+<tr><td>W_pred |I-diff| mean (weakest layer)</td><td class="num">{min(wp_md):.4f} (L{wp_md.index(min(wp_md))})</td></tr>
+<tr><td>W_pred diag mean (L0 / L{cfg.n_layers-1})</td><td class="num">{layers_data[0]["w_pred_diag_mean"]:.3f} / {layers_data[-1]["w_pred_diag_mean"]:.3f}</td></tr>
+<tr><td>w_pred_scale μ / σ</td><td class="num">{layers_data[0]["w_pred_scale_mean"]:.3f} / {layers_data[0]["w_pred_scale_std"]:.3f}</td></tr>
+<tr><td>skip_alpha μ (all layers)</td><td class="num">{sum(skip_alphas)/len(skip_alphas):.4f}</td></tr>
+<tr><td>var(log_scale) per-layer mean</td><td class="num">{sum(s**2 for s in ls_stds)/len(ls_stds):.6f}</td></tr>
+<tr><td>log_skip_alpha μ (L31)</td><td class="num">{layers_data[-1]["log_skip_alpha_mean"]:.4f}</td></tr>
+</table>
+'''
+
     if opt_info:
         html += f'''<h2>Optimizer State (from momentum)</h2>
 <table>
@@ -306,12 +404,13 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 <table>
 <tr>
 <th>L</th>
-<th>||W_proj||</th><th>||W_out||</th>
-<th>w_temp μ</th><th>w_temp σ</th>
-<th>w_global μ</th><th>w_global σ</th>
-<th>w_sym_u μ</th><th>w_sym_v μ</th>
-<th>log_scale [min,max]</th>
-<th>||conv_sm||</th>
+<th>||W_p||</th><th>||W_o||</th>
+<th>β</th><th>|W_pred-I|</th>
+<th>skip_α</th>
+<th>w_temp σ</th><th>w_glob σ</th>
+<th>w_sym_u σ</th><th>w_sym_v σ</th>
+<th>log_scl [min,max]</th>
+<th>dvar_mod</th><th>grad_mod</th>
 </tr>
 '''
     for d in layers_data:
@@ -319,14 +418,16 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
         html += f'<td>{d["idx"]}</td>'
         html += f'<td class="num">{d["mirror_proj_norm"]:.2f}</td>'
         html += f'<td class="num">{d["mirror_out_norm"]:.2f}</td>'
-        html += f'<td class="num">{d["mirror_temp_mean"]:.4f}</td>'
+        html += f'<td class="num">{d["gate_beta"]:.4f}</td>'
+        html += f'<td class="num">{d["w_pred_mean_diff"]:.4f}</td>'
+        html += f'<td class="num">{d["skip_alpha"]:.4f}</td>'
         html += f'<td class="num">{d["mirror_w_temp_std"]:.4f}</td>'
-        html += f'<td class="num">{d["mirror_global_mean"]:.4f}</td>'
         html += f'<td class="num">{d["mirror_w_global_std"]:.4f}</td>'
-        html += f'<td class="num">{d["mirror_sym_u_mean"]:.4f}</td>'
-        html += f'<td class="num">{d["mirror_sym_v_mean"]:.4f}</td>'
+        html += f'<td class="num">{d["mirror_w_sym_u_std"]:.4f}</td>'
+        html += f'<td class="num">{d["mirror_w_sym_v_std"]:.4f}</td>'
         html += f'<td class="num">[{fmt_small(d["mirror_log_scale_min"])}, {fmt_small(d["mirror_log_scale_max"])}]</td>'
-        html += f'<td class="num">{d["mirror_conv_norm"]:.4f}</td>'
+        html += f'<td class="num">{d["log_dvar_mod_scale_mean"]:.3f}</td>'
+        html += f'<td class="num">{d["log_grad_mod_scale_mean"]:.3f}</td>'
         html += f'</tr>\n'
     html += '''</table>
 '''
@@ -354,9 +455,15 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
     metrics = [
         ('Bind proj rank', [d['bind_proj_rank'] for d in layers_data], '{:.1f}'),
         ('MLP eff rank', [d['mlp_eff_rank'] for d in layers_data], '{:.1f}'),
+        ('β (gate)', [d['gate_beta'] for d in layers_data], '{:.4f}'),
+        ('W_pred |I-diff|', [d['w_pred_mean_diff'] for d in layers_data], '{:.4f}'),
+        ('skip_alpha', [d['skip_alpha'] for d in layers_data], '{:.4f}'),
+        ('w_pred_scale μ', [d['w_pred_scale_mean'] for d in layers_data], '{:.4f}'),
         ('i_gate', [d['i_gate'] for d in layers_data], '{:.4f}'),
         ('τ (decay steps)', [d['tau'] for d in layers_data], '{:.0f}'),
         ('log_scale σ', [d['mirror_log_scale_std'] for d in layers_data], '{:.4f}'),
+        ('log_dvar_mod_scale', [d['log_dvar_mod_scale_mean'] for d in layers_data], '{:.3f}'),
+        ('log_grad_mod_scale', [d['log_grad_mod_scale_mean'] for d in layers_data], '{:.3f}'),
         ('Conv ||W||', [d['conv_norm'] for d in layers_data], '{:.2f}'),
         ('MLP ||W_up||', [d['mlp_norm'] for d in layers_data], '{:.1f}'),
     ]
@@ -420,15 +527,21 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f'  Report saved to {html_path}')
+    
+    if append_log:
+        append_to_log(ckpt_path, layers_data, model, cfg, step, best_val, all_w, out)
+    
     return html_path
 
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('Usage: python scripts/analyze_checkpoint.py <checkpoint.pt>')
+        print('Usage: python scripts/analyze_checkpoint.py <checkpoint.pt> [--log]')
+        print('  --log : append summary to docs/TRAINING_LOG.md')
         sys.exit(1)
     ckpt_path = sys.argv[1]
+    append_log = '--log' in sys.argv
     if not os.path.isfile(ckpt_path):
         print(f'File not found: {ckpt_path}')
         sys.exit(1)
-    generate_report(ckpt_path)
+    generate_report(ckpt_path, append_log=append_log)

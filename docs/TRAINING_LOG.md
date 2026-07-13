@@ -1,80 +1,141 @@
-# Training Log — GroupedMLP architecture
+# Training Log — WideBind 221M (2026-07)
 
-**Architecture:** WideBind 24L D=896 K=16 GroupedMLP (G=8, expand=8×)
-**Params:** 41,246,336 (41.25M)
-**Data:** 2,859,675,614 tokens (ACTION 1.1B + DETECT 1.8B)
-**GPU:** MX550 2GB, B=2, L=128, fp32
+**Architecture:** WideBind D=3584 L=32 K=32 G=32 mirror_k=8
+**Params:** 221,740,064 (221.74M)
+**Data:** 1,429,837,807 tokens (2 streams, clean .bin)
+**GPU:** Colab T4, B=4, seq_len=64, fp32
+**Init:** gate_pred_scale_init=0.0 (β=0.5), W_pred≈I (eye×0.99 + noise×0.01)
+**LR:** 0.0003, warmup=2000, scheduler=mirror
 
 ---
 
-## Run 1 — GroupedMLP (8×112→896→112, 8× expansion per group)
+## Run 1 — β=0.5 fresh start
 
-| Step | Train Loss | LR | Notes |
-|------|-----------|-----|-------|
-| 0 | 12.93 | 3e-07 | init, warmup start |
-| 100 | 11.62 | 3e-05 | warmup |
-| 200 | 6.03 | 6e-05 | warmup |
-| 300 | 7.60 | 9e-05 | spike |
-| 400 | 4.28 | 1.2e-04 | |
-| 500 | 4.26 | 1.5e-04 | |
-| 600 | 4.43 | 1.8e-04 | spike |
-| 700 | 4.18 | 2.1e-04 | |
-| 800 | 2.98 | 2.4e-04 | sharp drop — MLP found useful direction |
-| 900 | 1.60 | 2.7e-04 | |
-| 1000 | **1.44** | 3.0e-04 | warmup complete, **val_loss=1.99 ppl=7.32** |
+| Step | Train Loss | β0 | βL | α_skip | tok/s | Notes |
+|------|-----------|----|----|--------|-------|-------|
+| 0 | 10.9585 | 0.003 | 0.003 | 0.100 | 201 | Init |
+| 100 | 10.0215 | 0.003 | 0.003 | 0.100 | 244 | |
+| 200 | 10.1421 | 0.003 | 0.004 | 0.100 | 241 | |
+| 300 | 10.6762 | 0.003 | 0.005 | 0.100 | 240 | |
+| 400 | 6.9265 | 0.003 | 0.008 | 0.100 | 239 | |
+| 500 | 10.7270 | 0.003 | 0.008 | 0.100 | 239 | Spike |
+| 600 | 6.3853 | 0.003 | 0.009 | 0.100 | 239 | |
+| 700 | 6.8465 | 0.003 | 0.009 | 0.100 | 239 | |
+| 800 | 6.4704 | 0.003 | 0.008 | 0.100 | 239 | |
+| 900 | 6.3821 | 0.003 | 0.009 | 0.100 | 238 | |
+| 1000 | 6.8329 | 0.003 | 0.008 | 0.100 | 238 | |
+| 1100 | 6.3584 | 0.003 | 0.008 | 0.100 | 238 | |
+| 1200 | 6.9656 | 0.003 | 0.009 | 0.100 | 238 | |
+| 1300 | 6.8758 | 0.003 | 0.009 | 0.100 | 238 | |
+| 1400 | 6.3485 | 0.003 | 0.006 | 0.100 | 238 | βL упал |
+| 1500 | 6.5600 | 0.003 | 0.006 | 0.100 | 238 | |
+| 1600 | 6.5589 | 0.003 | 0.006 | 0.100 | 238 | |
+| 1700 | 6.4433 | 0.003 | 0.005 | 0.100 | 238 | |
+| 1800 | 6.5218 | 0.003 | 0.006 | 0.100 | 238 | |
+| 1900 | 6.5249 | 0.003 | 0.004 | 0.100 | 238 | |
+| **2000** | **6.5339** | **0.003** | **0.003** | **0.100** | **238** | **Eval: val_loss=6.575** |
 
-### Eval at step 1000
+### Checkpoint: best.pt (step 2000) — Полный анализ
 
-| Metric | Old MLP (step 1000) | GroupedMLP (step 1000) |
-|--------|-------------------|------------------------|
-| Train loss | ~3.5 | **1.44** |
-| Val loss | ~8.22 | **1.99** |
-| Val ppl | ~3700 | **7.32** |
+#### Архитектура
+| Параметр | Значение |
+|----------|----------|
+| Params | 221,740,064 |
+| D / K | 3584 / 32 |
+| MLP | 32 groups × 8× expand |
+| seq_len / batch | 64 / 4 |
+| LR | 0.0003 (mirror scheduler) |
 
-### Layer stats at step 1000
+#### Веса
+| Метрика | Значение |
+|---------|----------|
+| Mean | 0.0026 |
+| Std | 0.1388 |
+| Min | -4.746 |
+| Max | 5.443 |
+| Output std (fwd) | 0.9999 |
+| Output mean (fwd) | 0.0155 |
 
-| Layer | eff_r(MLP) | λ_k mean | log_scale μ | bind_er |
-|-------|-----------|----------|------------|---------|
-| L0 | 62.1 / 112 | 0.50 | 0.0000 | 13.1 |
-| L10 | 62.5 / 112 | 0.93 | 0.0000 | 12.9 |
-| L17 | 58.2 / 112 | 1.24 | −0.0002 | 12.8 |
-| L20 | 32.8 / 112 | 1.37 | 0.0005 | 12.7 |
-| L23 | 11.8 / 112 | 1.50 | 0.0004 | 10.9 |
+#### Gate & Prediction (все слои — frozen at init)
+| Метрика | Значение |
+|---------|----------|
+| β0 (L0) | 0.5008 |
+| β31 (L31) | 0.5007 |
+| β mean ± std | 0.5001 ± 0.0008 |
+| gate_pred_scale range | [-0.0032, 0.0089] |
+| W_pred \|I-diff\| mean (min) | 0.0086 (L29) |
+| W_pred \|I-diff\| mean (max) | 0.0091 (L21) |
+| W_pred diag (L0 / L31) | 0.987 / 0.987 |
+| w_pred_scale μ / σ | 0.499 / 0.001 |
+| skip_alpha μ | 0.1000 |
+| var(log_scale) per-layer | 0.002477 |
+| log_skip_alpha μ (L31) | -2.2955 |
 
-- L0-L17 all groups active (eff_rank ~55-62/112)
-- Gradual collapse L18→L23 (structural, LM head compression)
-- λ_k grows 0.50→1.50 with increasing per-dim variation (std 0.002→0.015)
-- Mirror not yet active (log_scale ≈ 0, exp=1)
-- Gates frozen at init (b_i=−3.0, b_d=5.0)
-- Bind healthy (eff_rank 10.9-13.6/16)
+#### Per-Layer Analysis (summary)
 
-| 1000 | 1.44 | 3.0e-04 | warmup done, **val_loss=1.99 ppl=7.32** |
-| 2000 | 1.53 | 3.0e-04 | **val_loss=2.27 ppl=9.67** — plateau at constant LR |
-| 2100-2700 | 1.3-1.7 | 3.0e-04 | high variance (B=2), no trend — cosine decay not yet felt |
+| Layer | β | \|W_pred-I\| | skip_α | log_scale σ | w_temp σ | w_global σ |
+|-------|---|-------------|--------|-------------|---------|-----------|
+| 0 | 0.5008 | 0.0087 | 0.1000 | 0.0490 | 0.9836 | 0.9640 |
+| 5 | 0.5008 | 0.0088 | 0.1000 | 0.0496 | 0.9510 | 0.9529 |
+| 10 | 0.5007 | 0.0087 | 0.1000 | 0.0498 | 0.9834 | 1.0031 |
+| 15 | 0.5008 | 0.0087 | 0.1000 | 0.0483 | 1.0415 | 0.9902 |
+| 20 | 0.4993 | 0.0089 | 0.1000 | 0.0499 | 1.0077 | 1.0454 |
+| 25 | 0.5008 | 0.0086 | 0.1001 | 0.0506 | 0.8824 | 0.9740 |
+| 30 | 0.5022 | 0.0089 | 0.1004 | 0.0486 | 0.9838 | 1.0455 |
+| 31 | 0.5007 | 0.0089 | 0.1007 | 0.0505 | 0.9647 | 0.9651 |
 
-### Eval at step 2000
+**Bind proj rank:** 31.9 (все слои) — K=32 почти полностью используется.
+**MLP eff rank:** 108.4/112 — 97% utilisation.
+**i_gate:** 0.047 (frozen at init, b_i=-3.00).
+**τ (decay):** 8 (L0) → 149 (L31) — растёт линейно с lambda_k.
+**dvar_mod / grad_mod:** log=-2.303 (exp=0.1) — frozen at init.
+**Conv ||W||:** 4.13 (L0) → 5.39 (L31) — нижние слои учатся сильнее.
 
-| Metric | Old MLP | GroupedMLP |
-|--------|---------|------------|
-| Train loss | 1.34 | 1.53 |
-| Val loss | **5.33** | **2.27** |
-| Generalization gap | 3.99 | 0.74 |
-| L23 eff_rank | 4.2 / 896 | 11.8 / 112 |
+#### Adaptive Controller
+| Метрика | Значение |
+|---------|----------|
+| Exploration | 0.807 |
+| Differentiation | 0.031 |
+| b_d (τ bias) | 3.386 |
+| b_i (i_gate) | -1.789 |
+| w_mem2v_scale | 0.985 |
+| EMA α | 0.903 |
+| Noise scale | 0.048 |
 
-**Key improvement:** Generalization gap reduced 5.4× (3.99 → 0.74). Model generalizes, not memorizes.
+#### Диагноз (step 2000)
+- **Core MLP/Bind:** работают — loss с 10.96 → 6.58. eff_rank=108/112.
+- **β:** gate_pred_scale заморожен на init (±0.003). Градиента нет.
+- **W_pred:** всё ещё identity (\|I-diff\|=0.0088, init=~0.01). Не учится.
+- **skip_alpha:** frozen at 0.100.
+- **log_scale:** var=0.0025 — ноль per-dim специализации.
+- **dvar_mod/grad_mod:** frozen at init (log=-2.303).
+- **Вывод:** β=0.5 слишком высок для свежего W_pred. Gate режет 50% сигнала,
+   W_pred не может выйти из identity. Требуется снижение gate_pred_scale_init
+   или ждать ~5-10K шагов для накопления градиента к ранним слоям.
 
-### Current status
 
-- Train loss plateau ~1.4 at constant LR=3e-4
-- Cosine decay too slow — switching to MirrorLRScheduler at step 3000+
-- MirrorLRScheduler: modulates LR from log_scale variance + mirror magnitude
-  - var(log_scale) grows → decay factor drops
-  - |mirror| shrinks at convergence → mag_factor drops
-  - Combined: LR_adapt = base_lr × (1 - var/0.1) × min(1, mag/0.3)
-  - Fallback: forced cosine decay over 50K steps if mirror frozen
-- Expected: adaptive LR breaks plateau by reducing LR when mirror stabilizes
-
-### Comparison with Run 0 (flat MLP 896→896→896)
-
-Flat MLP at step 2000: train_loss=1.34, val_loss=5.33, MLP barely moved (std=0.033), L23 eff_rank=4.2.
-GroupedMLP at step 1000: val_loss=1.99, L23 eff_rank=11.8 — **22× better utilization at L23, 4× better val_loss in half the steps.****
+### Step 2000 — best.pt
+| Metric | Value |
+|--------|-------|
+| Step | 2000 |
+| best_val_loss | 6.5750534725189205 |
+| beta_0 | 0.5008 |
+| beta_31 | 0.5007 |
+| beta mean / std | 0.5001 / 0.0008 |
+| gate_pred_scale range | [-0.0032, 0.0089] |
+| W_pred diff from I (max) | 0.0091 |
+| W_pred diag L0/L31 | 0.987 / 0.987 |
+| skip_alpha mean | 0.1000 |
+| var(log_scale) mean | 0.002477 |
+| log_scale sigma mean | 0.0498 |
+| MLP eff_rank mean | 108.4 |
+| Bind rank mean | 31.9 |
+| tau range | [149, 149] |
+| i_gate | 0.047 |
+| w_pred_scale mu | 0.499 |
+| log_dvar_mod_scale | -2.303 |
+| log_grad_mod_scale | -2.303 |
+| Exploration | 0.8060 |
+| Differentiation | 0.030967 |
+| Output std (fwd) | 0.9999 |
+| Weights std | 0.1388 |

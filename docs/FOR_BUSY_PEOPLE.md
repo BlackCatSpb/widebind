@@ -77,9 +77,9 @@ token → Sparse Embed (32×112) → [Block × 32] → RMS Norm → LM Head
 | Слоёв | 32 |
 | Размерность D | 3584 |
 | VRAM (fp16) | ~0.55 GB |
-| Скорость | ~240 tok/s на T4 |
+| Скорость | ~190 tok/s на T4 (seq_len 64, B=4) |
 | Размер чекпоинта | ~221 MB (c FCF-CPR) |
-| Время до β=0.5 | ~12K шагов (с gate_pred_scale LR×10) |
+| gate_pred_scale init | 0.0 (β=0.5 с первого шага) |
 
 ---
 
@@ -101,5 +101,5 @@ token → Sparse Embed (32×112) → [Block × 32] → RMS Norm → LM Head
 | Cognitive Mirror | `core/model.py:263-398` — `GroupedCognitiveMirror` |
 | AdaptiveController | `core/model.py:700-793` — все 5 адаптивных параметров |
 | MirrorLRScheduler | `core/model.py:795-863` |
-| Все гиперпараметры | `core/config.py` — `WideBindConfig` (35 полей) |
+| Все гиперпараметры | `core/config.py` — `WideBindConfig` (37 полей) |
 | Тесты | `tests/test_model.py` — 46 тестов |

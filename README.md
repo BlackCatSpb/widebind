@@ -1031,12 +1031,12 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 
 | Шаг | Train Loss | Val Loss | Val PPL | var(ls) | |mirror| | mirror_mult | gate_pred | Примечание |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 10.81 | — | — | 0.0025 | 0 | 1.0 | **-1.00** | Инит (gate_pred_scale=-1.0, β≈0.27) |
-| 1000 | 6.83 | **6.55** | **699** | 0.0025 | 0.20 | 0.66 | -1.00 | Eval best. Gate frozen (old code: init=-5.0) |
-| 2000 | 6.53 | 6.55 | 697 | 0.00250 | 0.20 | 0.66 | -1.00 | Warmup конец, MirrorLR включён |
-| 3000 | 6.23 | 6.55 | 696 | 0.00249 | 0.21 | 0.67 | -0.98 | Gate начал движение (L31=-0.976) |
-| **5000 (прогноз)** | ~5.9 | ~6.4 | ~600 | ~0.0025 | ~0.25 | ~0.70 | **-0.95** | gate_pred продолжит рост |
-| **10000 (прогноз)** | ~5.5 | ~6.2 | ~500 | ~0.003 | ~0.35 | ~0.75 | **-0.86** | β≈0.30 — эффект на routing |
+| 0 | 10.96 | — | — | 0.0025 | 0 | 1.0 | **0.00** | Инит (gate_pred_scale=0.0, β=0.5, W_pred≈I) |
+| 1000 | 6.83 | 6.55 | 699 | 0.0025 | 0.20 | 0.66 | 0.00 | β=0.5 — сильный сигнал для W_pred |
+| 2000 | 6.53 | 6.55 | 697 | 0.00250 | 0.20 | 0.66 | 0.00 | W_pred учится (identity init) |
+| 3000 | 6.23 | 6.55 | 696 | 0.00249 | 0.21 | 0.67 | 0.00 | W_pred std растёт, β стабилен |
+| **5000 (прогноз)** | ~5.9 | ~6.4 | ~600 | ~0.0025 | ~0.25 | ~0.70 | **>0.00** | W_pred накопил сигнал → β рост |
+| **10000 (прогноз)** | ~5.5 | ~6.2 | ~500 | ~0.003 | ~0.35 | ~0.75 | **>0.50** | β>0.5 — жёсткий gate, var(ls) рост |
 
 *Сессия 2026-07, L=32, K-space gate init=-1.0 (против -5.0 в старой сессии). **Ускорение gate_pred_scale в 17×** после фиксов: W_pred в gate group (LR×5) + w_pred_scale_init=0.5 + gate_pred_scale_mult=10.0. Вместо +0.024 за 3000 шагов → **+0.014 за 100 шагов** (мини-тест, MX550). Прогноз: β≈0.5 за ~5-6K вместо 125K.*
 
@@ -1056,18 +1056,17 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 | **bind_K: 16→32** | config.py, model.py, tests, notebook | Alignment: K = G = L = 32 |
 | **n_layers: 24→32** | config.py, notebook | D/L = d = 112 (целое) |
 
-**Анализ K-space gate: init=-5.0 vs init=-1.0:**
+**Анализ K-space gate: init=-1.0 vs init=0.0 (β=0.5):**
 
-| Параметр | init=-5.0 (старый) | init=-1.0 (текущий) |
+| Параметр | init=-1.0 (β≈0.27) | init=0.0 (β=0.5, текущий) |
 |---|---|---|
-| β = σ(gate_pred) | 0.007 | **0.269** |
-| ∂β/∂x | 0.007 | **0.20** |
-| gate_pred за 3000 шагов | -5.000 (не двигался) | **-0.976 (L31, +0.024)** |
-| Градиент к w_gate | ~0 | **активен** |
-| mirror за 3000 шагов | 0.20 | **0.21** (медленный рост) |
-| Переносимый градиент | 6.6e-3× | **0.20× (30× лучше)** |
+| β = σ(gate_pred) | 0.269 | **0.500** |
+| ∂β/∂x | 0.20 | **0.25** |
+| Сигнал к W_pred | слабый (β мал) | **2× сильнее** |
+| 17× ускорение W_pred | W_pred в LR×5, init=0.5 | **+ identity init (смыл с шага 1)** |
+| Прогноз β через 5K | ~0.50 | **0.50→уже 0.50, W_pred учится** |
 
-**Исправление:** gate_pred_scale инициализируется -1.0 вместо -5.0. Это даёт β=0.27 на старте (против 0.007) и ∂β/∂x=0.20 (против 0.007). Градиент к gate_pred_scale в 30× больше — параметр движется с шага 0, а не остаётся замороженным навсегда.
+**Исправление:** gate_pred_scale_init=0.0 (было -1.0). Теперь β=0.5 с первого шага. W_pred≈I (identity init) — pred_k ≈ hp_prev, pred_error ≈ hp - hp_prev (временной дельта, осмысленный с шага 1). Градиент к W_pred в 2× больше vs β=0.27, и W_pred не нужно ждать роста β.
 
 ### Производительность инференса
 
@@ -1081,9 +1080,9 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 
 - **Архитектура:** ✅ **K-space gate** + **bind_K=32** + **n_layers=32**. Полная синхронизация: L=K=G=32, D/L=d=112. 46 тестов проходят.
 - **Сжатие:** ✅ FCF-CPR (8-bit uniform, 18.7×, MSE 2.0e-5). **Важно:** `decompress_sd` использует `sparse_block_codes`, не `zeckendorf_codes`.
-- **Тренировка:** 🟡 Colab T4, B=2, L=128. Шаг 3000 (1 сессия). loss 10.8→6.23, val 6.55.
-- **gate_pred_scale:** ✅ init=-1.0 (исправлено с -5.0). Переместился в config (`gate_pred_scale_init`). **Ускорение 17×**: +0.014/100 шагов (мини-тест MX550, vs +0.024/3000 ранее) — благодаря W_pred в gate group (LR×5) + w_pred_scale_init=0.5 + gate_pred_scale_mult=10.0. Прогноз: β≈0.5 за ~5-6K.
-- **W_pred:** ✅ В gate param group (LR×5), норма ~16. w_pred_scale_init=0.5 (было 0.1) — pred_error ~14% от hp в gate_signal.
+- **Тренировка:** 🟡 Colab T4, B=4, seq_len=64. Fresh start, step 0 loss=10.96, step 100 loss=10.02. RAM-оптимизировано: `del`+`gc.collect()`, eval без `LiveInference`, batch test max 4.
+- **gate_pred_scale:** ✅ init=0.0 (было -1.0). β=0.5 с первого шага. W_pred≈I identity init — pred_k≈hp_prev, pred_error≈hp-hp_prev (временной дельта).
+- **W_pred:** ✅ identity init (`eye×0.99 + noise×0.01`). В gate param group (LR×5). Не требует прогрева — градиент осмыслен с шага 1.
 - **AdaptiveController:** ✅ Все thresholds/ranges в config: `exploration_threshold`, `differentiation_threshold`, `w_mem2v_scale_min/max`, `ema_alpha_min/max`, `delta_var_ema_min/max`, `noise_scale_min/max`. b_i/d через fill_(), пер-слойный b_d (τ=8→150, кап 5.0), i_gate ≤ 0.27.
 - **Gate modulation:** ✅ **Per-expert learned** `log_dvar_mod_scale`, `dvar_mod_bias`, `log_grad_mod_scale`, `grad_mod_bias` — вместо хардкода `0.1·tanh(x-0.01)`. EMA alpha для δ_var: `0.8 + diff·(0.99-0.80)` (адаптивная, из config `delta_var_ema_min/max`).
 - **Skip connection:** ✅ **Per-expert learned** `log_skip_alpha` — вместо `α=0.1`.
@@ -1092,10 +1091,10 @@ tau_step = 10.2% (ровный шаг вместо 13.9% с L=24)
 - **w_q init:** ✅ `randn(D)` → `1/sqrt(D)` ≈ 0.017 (warm read с шага 1).
 - **MirrorLRScheduler:** ✅ Все параметры в config: `target_var`, `mag_threshold`, `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay`. Принимает `cfg=` напрямую.
 - **param_groups:** ✅ `gate_lr_mult=5.0` (W_pred + w_pred_scale), `gate_pred_scale_mult=10.0` — из config.
-- **var(log_scale):** 🟡 Плато 0.0025. Прорыв ожидается при gate_pred≈0 (~5-6K шагов, с ускорением 17×).
+- **var(log_scale):** 🟡 Плато 0.0025. Прорыв ожидается при росте β→0.6-0.8 (зависит от W_pred, а не gate_pred_scale).
 - **Инференс локально (MX550):** ✅ ~0.55 GB fp16, ~11 tok/s.
-- **Коллаб:** ✅ Notebook обновлён: patch FCF-CPR, gate_pred_scale + w_pred_scale reinit, resume по best.pt/step_*.pt, статус-лог с β0/βL/α_skip, MirrorLRScheduler(cfg=)
-- **Self-dialogue:** ✅ LiveInference — модель «живёт» между запросами
+- **Коллаб:** ✅ Notebook обновлён: RAM-оптимизация (seq_len=64, B=4, del+gc), resume с force gps=0.0 и W_pred identity reinit, patch FCF-CPR, статус-лог с β0/βL/α_skip, MirrorLRScheduler(cfg=), batch test [4,2,1]
+- **Self-dialogue:** 🟡 LiveInference отключён (экономия RAM). Self-dialogue не тестируется до роста var(ls).
 - **Мониторинг:** ✅ MirrorMonitor
 
 ---

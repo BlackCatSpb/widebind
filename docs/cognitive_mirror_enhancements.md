@@ -1,5 +1,9 @@
 # Cognitive Mirror: Предлагаемые улучшения
 
+> **⚠️ Этот документ описывает концепции, предложенные для 41M/221M архитектуры.**
+> **Текущие реализованные улучшения (2026-07): per-expert `log_skip_alpha`, per-expert `log_dvar_mod_scale`/`dvar_mod_bias`/`log_grad_mod_scale`/`grad_mod_bias`, gate_pred_scale_init=0.0 (β=0.5), W_pred≈I.**
+> **См. `config.py` для полного списка гиперпараметров (37 полей).**
+
 ## Текущее состояние
 
 ```
