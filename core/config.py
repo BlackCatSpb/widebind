@@ -21,14 +21,14 @@ class WideBindConfig:
     code_sparsity: int = 6       # S: единиц на токен (C(32,6)=906K>=50000)
 
     # Mirror
-    mirror_k: int = 8            # K-space dim per expert
+    mirror_k: int = 16           # K-space dim per expert (was 8)
     w_pred_scale_init: float = 0.5
     log_scale_init_std: float = 0.05
     gate_pred_scale_init: float = 0.0    # β=σ(0)=0.5, старт с половинным coupling
 
     # MLP
-    mlp_groups: int = 32         # D/mlp_groups=112 — aligned with embed seg и mirror G
-    mlp_expand: int = 8
+    mlp_groups: int = 16         # D/mlp_groups=224 — wider experts, fewer groups
+    mlp_expand: int = 4
 
     # Scheduler
     scheduler: str = 'mirror'
