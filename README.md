@@ -852,7 +852,7 @@ loss = ce_loss + pred_weight * pred_loss / n_layers   # pred_weight=0.01 default
 
 Стандартная кросс-энтропия через partitioned head (см. 3.9). Дополнительно: **auxiliary loss** — MSE между предсказанием K-space (pred_k = W_pred @ hp_prev) и истинным состоянием (hp), усреднённый по всем 32 слоям. Weight=0.01 — мал, чтобы не доминировать над CE, но достаточен, чтобы обеспечить ~50% градиента к W_pred на старте (когда gate |pred_error| ещё слаб).
 
-`compute_loss(h, targets, pred_weight=0.01)` — обратно совместим: 2 аргумента = CE only (pred_weight=0), 3 аргумента = CE + aux.
+`compute_loss(h, targets, pred_weight=0.1)` — по умолчанию pred_weight=0.1. 2 аргумента = CE+aux, 3 аргумента = override.
 
 ---
 

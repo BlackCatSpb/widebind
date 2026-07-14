@@ -676,7 +676,7 @@ class WideBindStack(nn.Module):
         """Token indices -> D-space vectors."""
         return self.embed(tokens)
     
-    def compute_loss(self, h, targets, pred_weight=0.01):
+    def compute_loss(self, h, targets, pred_weight=0.1):
         """h: (B, L, D) -> logits -> cross-entropy + W_pred auxiliary loss"""
         logits = self.lm_head(h)
         ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
