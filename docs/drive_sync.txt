@@ -4,11 +4,13 @@
 (или где у вас лежат исходники)
 
 1. core/config.py — 37 полей; var_min_for_lr_decay=0.005 (было 0.001)
-2. core/model.py — b_d фикс, grad_mod hook, EMA exploration, W_pred identity init
+2. core/model.py — b_d фикс, grad_mod hook, EMA exploration, W_pred identity init,
+   gate signal = |pred_error|, W_pred auxiliary loss (MSE), gate открыт init
 3. compression/fcf_cpr.py — sparse_block_codes patch
 4. scripts/analyze_checkpoint.py — новые метрики, --log флаг
 5. scripts/mini_test.py — smoke test для MX550/Colab
 6. notebooks/colab.ipynb — обновлён (RAM-opt, β=0.5)
+7. scripts/colab_train.py — авто-resume, MirrorLRScheduler
 
 === Команда для копирования ===
 # В Colab, после cell[1] (drive.mount):
@@ -21,10 +23,9 @@
 !cp /content/drive/MyDrive/widebind_data/src/compression/fcf_cpr.py /content/widebind_src/compression/fcf_cpr.py
 !cp /content/drive/MyDrive/widebind_data/src/scripts/analyze_checkpoint.py /content/widebind_src/scripts/analyze_checkpoint.py
 
-=== Что изменилось (commit 3658fdc) ===
-- b_d формула ИНВЕРТИРОВАНА: high exploration → SHORT memory (было LONG).
-  τ-иерархия L0=13,L31=148 вместо коллапса 83-148.
-- grad_mod заработал: backward hook на hp заполняет _prev_grad_norm.
-- EMA exploration (τ=500): сглаживает шум random init (|mirror|≈0.2).
-- var_min_for_lr_decay=0.005: scheduler не режет LR на noise floor (0.0025).
-- analyze_checkpoint.py: --log для авто-добавления в TRAINING_LOG.md.
+=== Что изменилось (последнее обновление) ===
+- **gate signal = |pred_error|**: gate открывается где ошибка предсказания велика
+- **W_pred auxiliary loss**: MSE(pred_k, hp.detach()) со всех 32 слоёв, weight=0.01
+- **Cache pred_k/hp** в Mirror.forward, сбор в WideBindStack.forward
+- compute_loss обратно совместим (pred_weight опциональный, по умолч. 0.01)
+- b_gate init=0, gate_pred_scale не используется в gate signal (но параметр сохранён)

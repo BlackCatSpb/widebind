@@ -139,3 +139,87 @@
 | Differentiation | 0.030967 |
 | Output std (fwd) | 0.9999 |
 | Weights std | 0.1388 |
+
+### Step 10000 — step_10000.pt
+| Metric | Value |
+|--------|-------|
+| Step | 10000 |
+| best_val_loss | 6.5692786645889285 |
+| beta_0 | 0.5008 |
+| beta_31 | 0.4982 |
+| beta mean / std | 0.5000 / 0.0009 |
+| gate_pred_scale range | [-0.0071, 0.0113] |
+| W_pred diff from I (max) | 0.0107 |
+| W_pred diag L0/L31 | 0.972 / 0.972 |
+| skip_alpha mean | 0.1000 |
+| var(log_scale) mean | 0.002406 |
+| log_scale sigma mean | 0.0490 |
+| MLP eff_rank mean | 108.4 |
+| Bind rank mean | 31.9 |
+| tau range | [149, 149] |
+| i_gate | 0.047 |
+| w_pred_scale mu | 0.491 |
+| log_dvar_mod_scale | -2.303 |
+| log_grad_mod_scale | -2.303 |
+| Exploration | 0.7827 |
+| Differentiation | 0.030074 |
+| Output std (fwd) | 1.0000 |
+| Weights std | 0.1383 |
+
+---
+
+## Session 2026-07-14 — Catch-22 Analysis & Fix
+
+### Три причины catch-22 (W_pred frozen after 10K steps)
+
+| Причина | Механизм | Доказательство |
+|---|---|---|
+| **Weight decay (3:1)** | lr·wd·\|W_pred\| = 1.96e-6; lr·\|grad\|/√N = 6.72e-7/step | wd в 2.9× сильнее градиента |
+| **Gate saturation** (trained) | sigmoid_deriv: 0.042 (old) vs 0.198 (new) при 5× W_proj | Gate тупеет когда W_proj растёт |
+| **Per-param grad 42× меньше** | einsum усредняет градиент W_pred по B×L; pred_scale — поэлементно | W_pred: 2048 params, grad 7e-5; pred_scale: 256 params, grad 1e-3 |
+
+### Исправления в core/model.py
+
+1. **Gate: hp + β·pred_error → |pred_error|** — gate открывается при плохом предсказании. 32× больше градиента к W_pred.
+2. **W_pred weight_decay=0** — moved в gate_no_decay. WD убивал слабый градиент.
+3. **Auxiliary loss** — MSE(pred_k, hp.detach()) с weight=0.01. ~50% градиента к W_pred.
+4. **compute_loss** — обратно совместим: `(h, targets)` = CE; `(h, targets, pred_weight)` = CE+aux.
+
+### Верификация (63 теста, все PASS)
+
+| Тест | Результат |
+|---|---|
+| 46 unit tests (test_model.py) | 46/46 PASS |
+| mini_test --full (16 checks) | 16/16 PASS |
+| Gate comparison (old vs new) | 12/12 PASS — W_pred grad 32× больше, sigmoid_deriv 0.198 vs 0.042 |
+| AR-1 synthetic: W_pred учится | \|I-diff\| 0.0084→0.0322 (4×), diag→0.801 (target 0.8) |
+| Full model D=3584, L=32 fwd+bwd | 19.9s, 32/32 слоёв с W_pred grad |
+| Memory leak (50 iter) | 16MB growth |
+| Checkpoint step_10000 load | 0 missing, 0 unexpected. W_pred frozen (\|I-diff\|=0.010), pred_scale=0.491 |
+
+### Анализ чекпоинта step_10000
+
+| Параметр | Init | Step 10000 (old code) | Вывод |
+|---|---|---|---|
+| W_pred \|I-diff\| | ~0.010 | 0.0104 | Не двигался |
+| W_pred diag | ~0.990 | 0.972 | Чуть уменьшился (wd толкает к 0) |
+| w_pred_scale | 0.1 | 0.491 | Вырос в 5× (градиент сильнее wd) |
+| W_proj std | 0.183 | 0.178 | Не вырос (1.0×) — gate не насыщен |
+| beta (gate_pred_scale) | 0.5 | 0.500 | Не изменился |
+| b_gate | 0 | ~0.000 | Не изменился |
+
+### Gradient per-param comparison
+
+| Параметр | Shape | Params | Grad norm | Per-param grad |
+|---|---|---|---|---|
+| pred_scale | (32, 8) | 256 | ~1e-3 | **6.3e-5** |
+| W_pred | (32, 8, 8) | 2048 | ~7e-5 | **1.5e-6** (42× меньше) |
+
+### Следующий шаг
+
+Возобновить тренировку на Colab T4 с чекпоинта step_10000. Ожидания после исправлений:
+- W_pred |I-diff| растёт (первые 1000 шагов: >0.015)
+- Gate разнообразие (across_experts_std > 0.05)
+- Loss падает ниже 6.5
+- pred_scale продолжает расти
+- log_scale var начинает расти

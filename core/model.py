@@ -312,6 +312,9 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
+        # Cache for W_pred auxiliary loss
+        self._cached_pred_k = None
+        self._cached_hp = None
         
         # ─── Per-expert learned modulation ───
         self.log_dvar_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
@@ -357,6 +360,8 @@ class GroupedCognitiveMirror(nn.Module):
         # Predictive: error in K-space self-prediction (t-1 -> t)
         pred_k = torch.einsum('blgk,gkk->blgk', hp_prev, self.W_pred)
         pred_error = (hp - pred_k) * self.w_pred_scale  # (B, L, G, k)
+        self._cached_pred_k = pred_k
+        self._cached_hp = hp
         
         # ─── Fast signals (hi half of K-space) ───
         # Smoothness: local coherence in K-space
@@ -384,11 +389,10 @@ class GroupedCognitiveMirror(nn.Module):
         mirror = mirror * torch.exp(self.log_scale)  # per-dim scale
         
         # ─── K-Space Gate (per-token, per-expert) ───
-        # Gate signal: hp + β·pred_error where β = σ(gate_pred_scale)
-        # hp: (B, L, G, k) — expert's own K-state (directly reflects output quality)
-        # pred_error: (B, L, G, k) — prediction quality (W_pred dynamics)
-        gate_beta = torch.sigmoid(self.gate_pred_scale)
-        gate_signal = hp + gate_beta * pred_error  # (B, L, G, k)
+        # Gate signal: magnitude of prediction error
+        # |pred_error| large → expert is wrong → open gate (apply correction)
+        # |pred_error| small → expert is right → close gate (trust identity)
+        gate_signal = torch.abs(pred_error)  # (B, L, G, k)
         gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
         grad_mod = torch.exp(self.log_grad_mod_scale) * torch.tanh(self._prev_grad_norm + self.grad_mod_bias)
         gate_logits = gate_logits + grad_mod.unsqueeze(0).unsqueeze(0)
@@ -654,6 +658,7 @@ class WideBindStack(nn.Module):
             global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
         
         new_state = []
+        self._pred_cache = []
         for layer, s in zip(self.layers, state):
             h, s_out = layer(h, s, global_state=global_state, mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale)
             if s_out is not None:
@@ -664,6 +669,10 @@ class WideBindStack(nn.Module):
                                 (1.0 - ema_alpha) * mem_avg)
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
+            # Collect W_pred predictions for auxiliary loss
+            mir = layer.mirror
+            if mir._cached_pred_k is not None and mir._cached_hp is not None:
+                self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
         
         return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state.detach()
     
@@ -671,11 +680,21 @@ class WideBindStack(nn.Module):
         """Token indices -> D-space vectors."""
         return self.embed(tokens)
     
-    def compute_loss(self, h, targets):
-        """h: (B, L, D) -> logits -> cross-entropy loss"""
+    def compute_loss(self, h, targets, pred_weight=0.01):
+        """h: (B, L, D) -> logits -> cross-entropy + W_pred auxiliary loss"""
         logits = self.lm_head(h)
-        return F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
-                               targets.reshape(-1), reduction='mean')
+        ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
+                                  targets.reshape(-1), reduction='mean')
+        # W_pred auxiliary loss: predict K-space state directly
+        pred_loss = 0.0
+        n_pred = 0
+        cache = getattr(self, '_pred_cache', [])
+        for pred_k, hp in cache:
+            pred_loss = pred_loss + F.mse_loss(pred_k, hp.detach())
+            n_pred = n_pred + 1
+        if n_pred > 0:
+            pred_loss = pred_loss / n_pred
+        return ce_loss + pred_weight * pred_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -714,7 +733,7 @@ class WideBindStack(nn.Module):
                                                '.log_grad_mod_scale', '.grad_mod_bias',
                                                '.log_skip_alpha'])
             if is_gate:
-                if p.ndim < 2:
+                if p.ndim < 2 or 'W_pred' in name:
                     gate_no_decay.append(p)
                 else:
                     gate_decay.append(p)
