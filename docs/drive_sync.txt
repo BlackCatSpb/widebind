@@ -1,28 +1,41 @@
-=== Что обновить на Google Drive ===
+=== WideBind — Files to copy to Google Drive for Colab training ===
 
-Место на Drive: /content/drive/MyDrive/widebind_data/
-(или где у вас лежат исходники)
+D=4096, G=16, d=256, K=32, mirror_k=32, expand=4, ~293M params
 
-Заменить вручную:
-  1. core/config.py — Option C: mlp_groups=16, mlp_expand=4, mirror_k=16
-  2. core/model.py — gate=|pred_error|, W_pred aux loss, pred cache, wd=0
-  3. notebooks/colab.ipynb — Option C параметры, surv=2.0
-  4. scripts/colab_train.py — без изменений (читает из config)
-  5. scripts/mini_test.py — (опционально, для локальных тестов)
+Manual copy (overwrite all):
 
-Можно скопировать командой:
-  !cp /content/drive/MyDrive/widebind_data/src/core/config.py /content/widebind_src/core/config.py
-  !cp /content/drive/MyDrive/widebind_data/src/core/model.py /content/widebind_src/core/model.py
-  !cp /content/drive/MyDrive/widebind_data/src/notebooks/colab.ipynb /content/widebind_src/notebooks/colab.ipynb
+  1. core/config.py
+  2. core/model.py
+  3. notebooks/colab.ipynb
 
-Или целиком:
-  !rm -rf /content/widebind_src
-  !cp -r /content/drive/MyDrive/widebind_data/src /content/widebind_src
+Optional (scripts for analysis, not required for training):
 
-=== Последнее обновление (2026-07-14, Option C) ===
-- **Option C+**: G=16, d=224, expand=4, mirror_k=32, surv=K/G=2.0
-  16 экспертов по 224, каждый получает 2 K-space dim через bind.
-  Зеркало видит 32 K-space чисел на эксперта (d/k=7:1).
-  MLP 224→896→224: expand=4, скрытая размерность 896.
-- **Params**: ~224M (было 221M, разница в большем mirror_k)
-- **Совместимость**: checkpoint step_10000 несовместим (G=16≠32) — нужен fresh start
+  4. scripts/colab_train.py
+  5. scripts/mini_test.py
+  6. scripts/analyze_checkpoint.py
+  7. compression/fcf_cpr.py
+
+Drive structure expected:
+  widebind_data/
+    core/config.py
+    core/model.py
+    notebooks/colab.ipynb
+    compression/fcf_cpr.py
+    scripts/colab_train.py
+    scripts/mini_test.py
+    scripts/analyze_checkpoint.py
+    token_stream_*.bin
+
+=== IMPORTANT ===
+
+step_10000.pt checkpoint is INCOMPATIBLE (G=32→16, D=3584→4096).
+Start fresh training from scratch.
+
+=== Quick check after copy ===
+
+In Colab first cell (imports):
+  from core import WideBindConfig
+  cfg = WideBindConfig(D=4096, n_layers=2, mlp_groups=16, mirror_k=32)
+  m = WideBindStack(cfg)
+  print(m.param_count())  # Should print ~18M (2 layers)
+  assert m.layers[0].mirror.w_gate.shape == (16, 32)
