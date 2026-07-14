@@ -3,29 +3,27 @@
 Место на Drive: /content/drive/MyDrive/widebind_data/
 (или где у вас лежат исходники)
 
-1. core/config.py — 37 полей; var_min_for_lr_decay=0.005 (было 0.001)
-2. core/model.py — b_d фикс, grad_mod hook, EMA exploration, W_pred identity init,
-   gate signal = |pred_error|, W_pred auxiliary loss (MSE), gate открыт init
-3. compression/fcf_cpr.py — sparse_block_codes patch
-4. scripts/analyze_checkpoint.py — новые метрики, --log флаг
-5. scripts/mini_test.py — smoke test для MX550/Colab
-6. notebooks/colab.ipynb — обновлён (RAM-opt, β=0.5)
-7. scripts/colab_train.py — авто-resume, MirrorLRScheduler
+Заменить вручную:
+  1. core/config.py — Option C: mlp_groups=16, mlp_expand=4, mirror_k=16
+  2. core/model.py — gate=|pred_error|, W_pred aux loss, pred cache, wd=0
+  3. notebooks/colab.ipynb — Option C параметры, surv=2.0
+  4. scripts/colab_train.py — без изменений (читает из config)
+  5. scripts/mini_test.py — (опционально, для локальных тестов)
 
-=== Команда для копирования ===
-# В Colab, после cell[1] (drive.mount):
-!rm -rf /content/widebind_src
-!cp -r /content/drive/MyDrive/widebind_data/src /content/widebind_src
+Можно скопировать командой:
+  !cp /content/drive/MyDrive/widebind_data/src/core/config.py /content/widebind_src/core/config.py
+  !cp /content/drive/MyDrive/widebind_data/src/core/model.py /content/widebind_src/core/model.py
+  !cp /content/drive/MyDrive/widebind_data/src/notebooks/colab.ipynb /content/widebind_src/notebooks/colab.ipynb
 
-# Или частями:
-!cp /content/drive/MyDrive/widebind_data/src/core/config.py /content/widebind_src/core/config.py
-!cp /content/drive/MyDrive/widebind_data/src/core/model.py /content/widebind_src/core/model.py
-!cp /content/drive/MyDrive/widebind_data/src/compression/fcf_cpr.py /content/widebind_src/compression/fcf_cpr.py
-!cp /content/drive/MyDrive/widebind_data/src/scripts/analyze_checkpoint.py /content/widebind_src/scripts/analyze_checkpoint.py
+Или целиком:
+  !rm -rf /content/widebind_src
+  !cp -r /content/drive/MyDrive/widebind_data/src /content/widebind_src
 
-=== Что изменилось (последнее обновление) ===
-- **gate signal = |pred_error|**: gate открывается где ошибка предсказания велика
-- **W_pred auxiliary loss**: MSE(pred_k, hp.detach()) со всех 32 слоёв, weight=0.01
-- **Cache pred_k/hp** в Mirror.forward, сбор в WideBindStack.forward
-- compute_loss обратно совместим (pred_weight опциональный, по умолч. 0.01)
-- b_gate init=0, gate_pred_scale не используется в gate signal (но параметр сохранён)
+=== Последнее обновление (2026-07-14, Option C) ===
+- **Option C**: G=16, d=224, expand=4, mirror_k=16, surv=K/G=2.0
+  Вместо 32 экспертов по 112 — 16 экспертов по 224.
+  Каждый эксперт получает 2 K-space измерения через bind (было 1).
+  Зеркало видит 16 K-space чисел на эксперта (было 8).
+  MLP 224→896→224: expand=4, но скрытая размерность 896 (та же, expand*G=const).
+- **Params**: ~224M (было 221M, разница в большем mirror_k)
+- **Совместимость**: checkpoint step_10000 несовместим (G=16≠32) — нужен fresh start
