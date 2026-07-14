@@ -492,7 +492,7 @@ mirror = mirror * expert_gate.unsqueeze(-1)         # (B, L, G, d)
 - **Gate: hp + β·pred_error → |pred_error|** — gate открывается когда предсказание плохое (|pred_error| большой), закрывается когда хорошее. Градиента к W_pred в **32× больше** vs старая формула (при trained W_proj).
 - **W_pred weight_decay=0** — moved в `gate_no_decay` группу. Предотвращает подавление слабого градиента.
 - **Auxiliary loss** — MSE(pred_k, hp.detach()) с weight=0.01, собирается со всех 32 слоёв. Обеспечивает ~50% градиента к W_pred в обход gate.
-- **gate_pred_scale теперь не используется** — удалён из forward (оставлен в модели для совместимости чекпоинтов).
+- **gate_pred_scale удалён** — параметр не использовался в новой формуле gate (|pred\_error|).
 
 **Проверено на синтетических AR-1 данных:** W_pred |I-diff| вырос с 0.0084→0.0322 (4×), диагональ сошлась к истинному AR-коэффициенту (0.801, target=0.8).
 
@@ -700,7 +700,7 @@ differentiation = min(1, var(log_scale) / 0.1)
 
 b_i сужен: `-3.0 + expl·1.5` (было `-3.0 + expl·3.0`). При expl=0: i_gate=0.047, при expl=1: i_gate=0.27. Старая формула давала i_gate=0.5 при expl=1 → перегрузка VSA-памяти (||mem||² ~ 26, целевой ~5-6). Новая — i_gate ≤ 0.27, память в норме.
 
-**Gate LR:** gate_lr_mult=5.0. W_pred — в `gate_no_decay` (weight_decay=0, LR×5). Причина: per-param градиент W_pred в 42× меньше чем у pred_scale, weight decay (0.01) пересиливал градиент (3:1). WD=0 — essential fix. gate_pred_scale не используется в новом gate (оставлен для совместимости).
+**Gate LR:** gate_lr_mult=5.0. W_pred — в `gate_no_decay` (weight_decay=0, LR×5). Причина: per-param градиент W_pred в 42× меньше чем у pred_scale, weight decay (0.01) пересиливал градиент (3:1). WD=0 — essential fix.
 
 **Интуиция:**
 
@@ -733,7 +733,7 @@ enhanced = bind_out + mem_read * w_mem2v * mem2v_scale + mirror
 
 Обратите внимание: `.fill_()` устанавливает bias напрямую, минуя градиент. b_i и b_d исключены из optimiser parameter groups (`param_groups()` не включает их). Это предотвращает конфликт между адаптивным контролем и градиентными обновлениями.
 
-W_pred — в `gate_no_decay` (weight_decay=0, LR×5). Per-param градиент W_pred (усредняется через einsum по B×L) в 42× меньше чем у pred_scale (поэлементный). С weight_decay=0.01 градиент не мог преодолеть wd. WD=0 — ключевое исправление catch-22. w_pred_scale в `gate_decay` (WD=0.01, LR×5) — его градиент сильнее, wd работает как регуляризатор (в чекпоинте step_10000 вырос с 0.1 до 0.49). gate_pred_scale не используется в новом gate (|pred_error|), оставлен для совместимости.
+W_pred — в `gate_no_decay` (weight_decay=0, LR×5). Per-param градиент W_pred (усредняется через einsum по B×L) в 42× меньше чем у pred_scale (поэлементный). С weight_decay=0.01 градиент не мог преодолеть wd. WD=0 — ключевое исправление catch-22. w_pred_scale в `gate_no_decay` (WD=0, LR×5) — наравне с W_pred, так как его градиент также ослаблен через цепочку |pred_error| → gate → mirror.
 
 ### 3.11 MirrorLRScheduler
 

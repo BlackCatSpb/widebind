@@ -34,7 +34,6 @@ def snapshot(model, tag):
         lm = model.layers[-1].mirror
         print(f'\n=== {tag} ===')
         print(f'  expl={expl:.4f}  diff={diff:.6f}  noise={ns:.6f}')
-        print(f'  gate_pred_scale:  {m0.gate_pred_scale.item():+.4f} (L0)  {lm.gate_pred_scale.item():+.4f} (L31)')
         print(f'  W_pred.std:       {m0.W_pred.data.std().item():.4f}   pred_scale.std={m0.w_pred_scale.data.std().item():.4f}')
         print(f'  log_scale[L2].var:{diff:.6f}')
         print(f'  log_skip_alpha:   mean={m0.log_skip_alpha.data.mean().item():.4f}')

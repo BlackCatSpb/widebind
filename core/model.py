@@ -261,7 +261,6 @@ class GroupedCognitiveMirror(nn.Module):
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
     def __init__(self, D, G=32, k=8, w_pred_scale_init=0.1, log_scale_init_std=0.05,
-                 gate_pred_scale_init=-1.0, skip_alpha=None,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99):
         super().__init__()
         assert D % G == 0
@@ -298,12 +297,10 @@ class GroupedCognitiveMirror(nn.Module):
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
         
         # ─── K-space gate (per-token, per-expert from hp) ───
-        # w_gate: (G, k) — maps K-state (k=8) to gate logit per expert
+        # w_gate: (G, k) — maps K-state to gate logit per expert
         gate_std = 1.0 / (self.k + 1) ** 0.5
         self.w_gate = nn.Parameter(torch.randn(G, self.k) * gate_std)
         self.b_gate = nn.Parameter(torch.zeros(G))
-        # Gate coupling with W_pred: β = σ(gate_pred_scale), grows with W_pred
-        self.gate_pred_scale = nn.Parameter(torch.tensor(gate_pred_scale_init))
         
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -503,7 +500,6 @@ class WideBindBlock(nn.Module):
         # Cognitive Mirror (32 эксперта, grouped K-space)
         self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=cfg.mirror_k,
             w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
-            gate_pred_scale_init=cfg.gate_pred_scale_init,
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max)
         
         # ─── VSA Memory (gates) ───
@@ -699,28 +695,22 @@ class WideBindStack(nn.Module):
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
     
-    def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None, gate_pred_scale_mult=None):
+    def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None):
         """Optimizer parameter groups with weight decay.
         Gate biases (b_d, b_i) are excluded — set adaptively by AdaptiveController.
-        Gate weight params get increased lr for faster adaptation.
-        gate_pred_scale gets separate high lr for rapid β growth."""
+        Gate weight params get increased lr for faster adaptation."""
         cfg = self.cfg
         lr = lr or cfg.lr
         wd = weight_decay or cfg.weight_decay
         gate_lr_mult = cfg.gate_lr_mult if gate_lr_mult is None else gate_lr_mult
-        gate_pred_scale_mult = cfg.gate_pred_scale_mult if gate_pred_scale_mult is None else gate_pred_scale_mult
         
         decay = []
         no_decay = []
         gate_decay = []
         gate_no_decay = []
-        gate_pred_scale_params = []
         for name, p in self.named_parameters():
             if '.b_d' in name or '.b_i' in name:
                 continue  # adaptive controller handles these
-            if 'gate_pred_scale' in name:
-                gate_pred_scale_params.append(p)
-                continue
             is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_mem2v',
                                                '.w_k_mu', '.w_q_mu', '.w_mu_mem',
                                                '.w_u', '.w_v',
@@ -733,7 +723,7 @@ class WideBindStack(nn.Module):
                                                '.log_grad_mod_scale', '.grad_mod_bias',
                                                '.log_skip_alpha'])
             if is_gate:
-                if p.ndim < 2 or 'W_pred' in name:
+                if p.ndim < 2 or 'W_pred' in name or 'w_pred_scale' in name:
                     gate_no_decay.append(p)
                 else:
                     gate_decay.append(p)
@@ -751,9 +741,6 @@ class WideBindStack(nn.Module):
             groups.append({'params': gate_decay, 'lr': lr * gate_lr_mult, 'weight_decay': wd})
         if gate_no_decay:
             groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0})
-        if gate_pred_scale_params:
-            groups.append({'params': gate_pred_scale_params,
-                          'lr': lr * gate_pred_scale_mult, 'weight_decay': 0})
         return groups
 
 

@@ -444,7 +444,7 @@ def test_config_param_groups_multipliers():
     """param_groups uses config multipliers when called without overrides."""
     from core.config import WideBindConfig
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
-                         gate_lr_mult=3.0, gate_pred_scale_mult=7.0)
+                         gate_lr_mult=3.0)
     model = WideBindStack(cfg)
     groups = model.param_groups(1e-4)
 
@@ -452,17 +452,13 @@ def test_config_param_groups_multipliers():
     for n, p in model.named_parameters():
         param_to_name[id(p)] = n
 
-    found_gps = found_gate = False
+    found_gate = False
     for g in groups:
         for p in g['params']:
             name = param_to_name.get(id(p), '')
-            if 'gate_pred_scale' in name:
-                assert abs(g['lr'] - 7e-4) < 1e-7, f'gps lr={g["lr"]} != 7e-4'
-                found_gps = True
-            elif any(x in name for x in ['.w_gate', '.b_gate', '.log_skip']):
+            if any(x in name for x in ['.w_gate', '.b_gate', '.log_skip']):
                 assert abs(g['lr'] - 3e-4) < 1e-7, f'gate lr={g["lr"]} != 3e-4'
                 found_gate = True
-    assert found_gps, 'gate_pred_scale group not found'
     assert found_gate, 'gate param group not found'
 
 

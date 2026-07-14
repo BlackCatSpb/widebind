@@ -126,8 +126,6 @@ def analyze_single_checkpoint(ckpt_path):
         d['mirror_log_scale_sparsity'] = (m.log_scale.data.abs() < 0.01).float().mean().item() * 100
         
         # ─── Gate / Prediction ───
-        d['gate_pred_scale'] = m.gate_pred_scale.data.item()
-        d['gate_beta'] = torch.sigmoid(m.gate_pred_scale.data).item()
         d['w_pred_scale_mean'] = m.w_pred_scale.data.mean().item()
         d['w_pred_scale_std'] = m.w_pred_scale.data.std().item()
         # W_pred identity check
@@ -208,8 +206,6 @@ def append_to_log(ckpt_path, layers_data, model, cfg, step, best_val, all_w, out
     from core import AdaptiveController
     d0 = layers_data[0]
     dL = layers_data[-1]
-    betas = [d['gate_beta'] for d in layers_data]
-    gps = [d['gate_pred_scale'] for d in layers_data]
     ls_stds = [d['mirror_log_scale_std'] for d in layers_data]
     expl, diff = AdaptiveController.stats(model.layers)
     
@@ -221,10 +217,6 @@ def append_to_log(ckpt_path, layers_data, model, cfg, step, best_val, all_w, out
 |--------|-------|
 | Step | {step} |
 | best_val_loss | {best_val if best_val != float('inf') else 'N/A'} |
-| beta_0 | {betas[0]:.4f} |
-| beta_31 | {betas[-1]:.4f} |
-| beta mean / std | {sum(betas)/len(betas):.4f} / {torch.tensor(betas).std():.4f} |
-| gate_pred_scale range | [{min(gps):.4f}, {max(gps):.4f}] |
 | W_pred diff from I (max) | {max(d['w_pred_mean_diff'] for d in layers_data):.4f} |
 | W_pred diag L0/L31 | {d0['w_pred_diag_mean']:.3f} / {dL['w_pred_diag_mean']:.3f} |
 | skip_alpha mean | {sum(d['skip_alpha'] for d in layers_data)/len(layers_data):.4f} |
@@ -308,22 +300,16 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 </table>
 '''
     
-    # ─── Gate / β Summary ───
-    betas = [d['gate_beta'] for d in layers_data]
-    gps = [d['gate_pred_scale'] for d in layers_data]
+    # ─── Gate / Prediction Summary ───
     skip_alphas = [d['skip_alpha'] for d in layers_data]
     ls_stds = [d['mirror_log_scale_std'] for d in layers_data]
     wp_md = [d['w_pred_mean_diff'] for d in layers_data]
     html += f'''<h2>Gate & Prediction Summary</h2>
 <table>
-<tr><td>β₀ (L0)</td><td class="num">{betas[0]:.4f}</td><td>β = σ(gate_pred_scale)</td></tr>
-<tr><td>β_{cfg.n_layers-1} (L{cfg.n_layers-1})</td><td class="num">{betas[-1]:.4f}</td></tr>
-<tr><td>β mean / std across layers</td><td class="num">{sum(betas)/len(betas):.4f} / {torch.tensor(betas).std():.4f}</td></tr>
-<tr><td>gate_pred_scale range</td><td class="num">[{min(gps):.4f}, {max(gps):.4f}]</td></tr>
+<tr><td>w_pred_scale μ / σ</td><td class="num">{layers_data[0]["w_pred_scale_mean"]:.3f} / {layers_data[0]["w_pred_scale_std"]:.3f}</td></tr>
 <tr><td>W_pred |I-diff| mean (strongest layer)</td><td class="num">{max(wp_md):.4f} (L{wp_md.index(max(wp_md))})</td></tr>
 <tr><td>W_pred |I-diff| mean (weakest layer)</td><td class="num">{min(wp_md):.4f} (L{wp_md.index(min(wp_md))})</td></tr>
 <tr><td>W_pred diag mean (L0 / L{cfg.n_layers-1})</td><td class="num">{layers_data[0]["w_pred_diag_mean"]:.3f} / {layers_data[-1]["w_pred_diag_mean"]:.3f}</td></tr>
-<tr><td>w_pred_scale μ / σ</td><td class="num">{layers_data[0]["w_pred_scale_mean"]:.3f} / {layers_data[0]["w_pred_scale_std"]:.3f}</td></tr>
 <tr><td>skip_alpha μ (all layers)</td><td class="num">{sum(skip_alphas)/len(skip_alphas):.4f}</td></tr>
 <tr><td>var(log_scale) per-layer mean</td><td class="num">{sum(s**2 for s in ls_stds)/len(ls_stds):.6f}</td></tr>
 <tr><td>log_skip_alpha μ (L31)</td><td class="num">{layers_data[-1]["log_skip_alpha_mean"]:.4f}</td></tr>
