@@ -21,13 +21,13 @@ class WideBindConfig:
     code_sparsity: int = 6       # S: единиц на токен (C(32,6)=906K>=50000)
 
     # Mirror
-    mirror_k: int = 16           # K-space dim per expert (was 8)
+    mirror_k: int = 32           # K-space dim per expert (d/k=224/32=7:1)
     w_pred_scale_init: float = 0.5
     log_scale_init_std: float = 0.05
     gate_pred_scale_init: float = 0.0    # β=σ(0)=0.5, старт с половинным coupling
 
     # MLP
-    mlp_groups: int = 16         # D/mlp_groups=224 — wider experts, fewer groups
+    mlp_groups: int = 16         # D/mlp_groups=224, mirror_k=32 → d/k=7:1
     mlp_expand: int = 4
 
     # Scheduler

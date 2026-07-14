@@ -20,10 +20,9 @@
   !cp -r /content/drive/MyDrive/widebind_data/src /content/widebind_src
 
 === Последнее обновление (2026-07-14, Option C) ===
-- **Option C**: G=16, d=224, expand=4, mirror_k=16, surv=K/G=2.0
-  Вместо 32 экспертов по 112 — 16 экспертов по 224.
-  Каждый эксперт получает 2 K-space измерения через bind (было 1).
-  Зеркало видит 16 K-space чисел на эксперта (было 8).
-  MLP 224→896→224: expand=4, но скрытая размерность 896 (та же, expand*G=const).
+- **Option C+**: G=16, d=224, expand=4, mirror_k=32, surv=K/G=2.0
+  16 экспертов по 224, каждый получает 2 K-space dim через bind.
+  Зеркало видит 32 K-space чисел на эксперта (d/k=7:1).
+  MLP 224→896→224: expand=4, скрытая размерность 896.
 - **Params**: ~224M (было 221M, разница в большем mirror_k)
 - **Совместимость**: checkpoint step_10000 несовместим (G=16≠32) — нужен fresh start
