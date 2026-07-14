@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class WideBindConfig:
-    D: int = 3584
+    D: int = 4096
     n_layers: int = 32
     bind_K: int = 32             # bottleneck for bind projection (align with 32 segments)
     vocab: int = 50000
