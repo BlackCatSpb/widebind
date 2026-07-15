@@ -232,20 +232,21 @@ class GroupedCognitiveMirror(nn.Module):
     Каждый эксперт:
       - Имеет свой K-space (k=8) внутри своего d=112
       - Вычисляет 4 сигнала коррекции: temp, pred, smooth, sym
-      - lo half k: temp + pred (медленные/долгоживущие ошибки)
-      - hi half k: smooth + sym (быстрые/локальные ошибки)
+      - Все 4 сигнала суммируются по всем k размерностям (без lo/hi split)
+      - Даёт полный градиент pred_error всем k размерностям
       - Имеет свой tanh_bias + skip_connection + log_scale
       - Имеет meta-gate: учится доверять/игнорировать эксперта
     
     Predictive mirror:
-      - W_pred: линейный предсказатель K-space (t-1 → t)
+      - alpha: scalar per expert, pred_k = alpha_g * hp_{t-1}
+      - Вместо W_pred (G×k×k = 16K params) для сильного градиента
       - pred_error = hp_t - pred(hp_{t-1}) — ошибка предсказания
       - Обучает зеркало динамике VSA-состояния
     
-    Frequency-Adaptive K:
-      - Первые k/2 направлений K-space: temp + pred (медленные)
-      - Последние k/2 направлений: smooth + sym (быстрые)
-      - Естественная специализация, 0 дополнительных параметров
+    K-space Merge:
+      - Все 4 сигнала (temp, pred, smooth, sym) суммируются по всем k размерностям
+      - Без lo/hi split: полный градиент для всех сигналов
+      - Замена W_pred на alpha + полный k-градиент = W_pred наконец учится
     
     Gradient-Adaptive Gate:
       - delta_var: running EMA variance дельты K-space
@@ -288,10 +289,11 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_sym_u = nn.Parameter(torch.randn(G, k))
         self.w_sym_v = nn.Parameter(torch.randn(G, k))
         
-        # Predictive mirror: K-space prediction from previous step
-        # W_pred ≈ I: pred_k ≈ hp_prev, pred_error ≈ hp - hp_prev (temporal delta)
-        eye = torch.eye(k).unsqueeze(0).expand(G, -1, -1).clone()
-        self.W_pred = nn.Parameter(eye * 0.99 + torch.randn(G, k, k) * 0.01)
+        # Predictive mirror: scalar alpha per expert
+        # pred_k = alpha_g * hp_prev, pred_error ≈ hp - hp_prev (temporal delta)
+        # Scalar alpha (G,) — 1 param per expert vs (G,k,k)=16K params for W_pred
+        # Gives 1024× stronger gradient per param, enabling real W_pred learning
+        self.alpha = nn.Parameter(torch.full((G,), 0.99))
         self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
@@ -309,7 +311,7 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
-        # Cache for W_pred auxiliary loss
+        # Cache for alpha auxiliary loss
         self._cached_pred_k = None
         self._cached_hp = None
         
@@ -355,7 +357,8 @@ class GroupedCognitiveMirror(nn.Module):
             temp_k = temp_k + (hp - gs_k) * self.w_global
         
         # Predictive: error in K-space self-prediction (t-1 -> t)
-        pred_k = torch.einsum('blgk,gkk->blgk', hp_prev, self.W_pred)
+        # pred_k = alpha_g * hp_prev — scalar per expert, much stronger gradient
+        pred_k = hp_prev * self.alpha.view(1, 1, G, 1)  # (B, L, G, k)
         pred_error = (hp - pred_k) * self.w_pred_scale  # (B, L, G, k)
         self._cached_pred_k = pred_k
         self._cached_hp = hp
@@ -370,11 +373,8 @@ class GroupedCognitiveMirror(nn.Module):
         # Symmetry: bilinear temporal interaction
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
-        # ─── Frequency-Adaptive merge (lo/hi split) ───
-        k_lo = k // 2
-        delta_lo = temp_k[..., :k_lo] + pred_error[..., :k_lo]
-        delta_hi = smooth_k[..., k_lo:] + sym_k[..., k_lo:]
-        delta = torch.cat([delta_lo, delta_hi], dim=-1)
+        # ─── Merge all signals (no lo/hi split — full k gradient for pred_error) ───
+        delta = temp_k + pred_error + smooth_k + sym_k
         
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
         delta = delta + self.tanh_bias  # break zero-mean symmetry in K-space
@@ -665,7 +665,7 @@ class WideBindStack(nn.Module):
                                 (1.0 - ema_alpha) * mem_avg)
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
-            # Collect W_pred predictions for auxiliary loss
+            # Collect alpha predictions for auxiliary loss
             mir = layer.mirror
             if mir._cached_pred_k is not None and mir._cached_hp is not None:
                 self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
@@ -677,11 +677,11 @@ class WideBindStack(nn.Module):
         return self.embed(tokens)
     
     def compute_loss(self, h, targets, pred_weight=0.1):
-        """h: (B, L, D) -> logits -> cross-entropy + W_pred auxiliary loss"""
+        """h: (B, L, D) -> logits -> cross-entropy + alpha auxiliary loss"""
         logits = self.lm_head(h)
         ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                   targets.reshape(-1), reduction='mean')
-        # W_pred auxiliary loss: predict K-space state directly
+        # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0
         n_pred = 0
         cache = getattr(self, '_pred_cache', [])
@@ -717,13 +717,13 @@ class WideBindStack(nn.Module):
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
-                                               '.mirror.W_pred', '.mirror.w_pred_scale',
+                                                '.mirror.alpha', '.mirror.w_pred_scale',
                                                '.mirror.w_gate', '.mirror.b_gate',
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
                                                '.log_skip_alpha'])
             if is_gate:
-                if p.ndim < 2 or 'W_pred' in name or 'w_pred_scale' in name:
+                if p.ndim < 2 or 'w_pred_scale' in name:
                     gate_no_decay.append(p)
                 else:
                     gate_decay.append(p)

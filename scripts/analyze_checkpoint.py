@@ -128,17 +128,13 @@ def analyze_single_checkpoint(ckpt_path):
         # ─── Gate / Prediction ───
         d['w_pred_scale_mean'] = m.w_pred_scale.data.mean().item()
         d['w_pred_scale_std'] = m.w_pred_scale.data.std().item()
-        # W_pred identity check
-        wp = m.W_pred.data  # (G, k, k)
-        k_dim = wp.shape[-1]
-        eye = torch.eye(k_dim).unsqueeze(0).expand_as(wp)
-        diff_from_eye = (wp - eye).abs()
-        d['w_pred_max_diff'] = diff_from_eye.max().item()
-        d['w_pred_mean_diff'] = diff_from_eye.mean().item()
-        d['w_pred_diag_mean'] = torch.stack([wp[g].diag().mean() for g in range(wp.shape[0])]).mean().item()
-        d['w_pred_offdiag_mean'] = (wp * (1 - torch.eye(k_dim).unsqueeze(0))).mean().item()
-        d['w_pred_mean'] = wp.mean().item()
-        d['w_pred_std'] = wp.std().item()
+        # Alpha identity check (scalar per expert, pred_k = alpha_g * hp_prev)
+        alpha = m.alpha.data  # (G,)
+        d['alpha_mean'] = alpha.mean().item()
+        d['alpha_std'] = alpha.std().item()
+        d['alpha_min'] = alpha.min().item()
+        d['alpha_max'] = alpha.max().item()
+        d['alpha_deviation'] = (alpha - 1.0).abs().mean().item()
         
         # Per-expert learned modulation
         d['log_skip_alpha_mean'] = m.log_skip_alpha.data.mean().item()
@@ -217,8 +213,8 @@ def append_to_log(ckpt_path, layers_data, model, cfg, step, best_val, all_w, out
 |--------|-------|
 | Step | {step} |
 | best_val_loss | {best_val if best_val != float('inf') else 'N/A'} |
-| W_pred diff from I (max) | {max(d['w_pred_mean_diff'] for d in layers_data):.4f} |
-| W_pred diag L0/L31 | {d0['w_pred_diag_mean']:.3f} / {dL['w_pred_diag_mean']:.3f} |
+| alpha deviation from 1 | {max(d['alpha_deviation'] for d in layers_data):.4f} |
+| alpha mean / std | {sum(d['alpha_mean'] for d in layers_data)/len(layers_data):.3f} / {sum(d['alpha_std'] for d in layers_data)/len(layers_data):.4f} |
 | skip_alpha mean | {sum(d['skip_alpha'] for d in layers_data)/len(layers_data):.4f} |
 | var(log_scale) mean | {sum(s**2 for s in ls_stds)/len(ls_stds):.6f} |
 | log_scale sigma mean | {sum(ls_stds)/len(ls_stds):.4f} |
@@ -303,13 +299,12 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
     # ─── Gate / Prediction Summary ───
     skip_alphas = [d['skip_alpha'] for d in layers_data]
     ls_stds = [d['mirror_log_scale_std'] for d in layers_data]
-    wp_md = [d['w_pred_mean_diff'] for d in layers_data]
     html += f'''<h2>Gate & Prediction Summary</h2>
 <table>
 <tr><td>w_pred_scale μ / σ</td><td class="num">{layers_data[0]["w_pred_scale_mean"]:.3f} / {layers_data[0]["w_pred_scale_std"]:.3f}</td></tr>
-<tr><td>W_pred |I-diff| mean (strongest layer)</td><td class="num">{max(wp_md):.4f} (L{wp_md.index(max(wp_md))})</td></tr>
-<tr><td>W_pred |I-diff| mean (weakest layer)</td><td class="num">{min(wp_md):.4f} (L{wp_md.index(min(wp_md))})</td></tr>
-<tr><td>W_pred diag mean (L0 / L{cfg.n_layers-1})</td><td class="num">{layers_data[0]["w_pred_diag_mean"]:.3f} / {layers_data[-1]["w_pred_diag_mean"]:.3f}</td></tr>
+<tr><td>alpha μ / σ (L0)</td><td class="num">{layers_data[0]["alpha_mean"]:.4f} / {layers_data[0]["alpha_std"]:.4f}</td></tr>
+<tr><td>alpha min / max (L0)</td><td class="num">{layers_data[0]["alpha_min"]:.4f} / {layers_data[0]["alpha_max"]:.4f}</td></tr>
+<tr><td>alpha deviation from 1 (avg all layers)</td><td class="num">{sum(d["alpha_deviation"] for d in layers_data)/len(layers_data):.4f}</td></tr>
 <tr><td>skip_alpha μ (all layers)</td><td class="num">{sum(skip_alphas)/len(skip_alphas):.4f}</td></tr>
 <tr><td>var(log_scale) per-layer mean</td><td class="num">{sum(s**2 for s in ls_stds)/len(ls_stds):.6f}</td></tr>
 <tr><td>log_skip_alpha μ (L31)</td><td class="num">{layers_data[-1]["log_skip_alpha_mean"]:.4f}</td></tr>
@@ -391,7 +386,7 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 <tr>
 <th>L</th>
 <th>||W_p||</th><th>||W_o||</th>
-<th>β</th><th>|W_pred-I|</th>
+<th>β</th><th>α_dev</th>
 <th>skip_α</th>
 <th>w_temp σ</th><th>w_glob σ</th>
 <th>w_sym_u σ</th><th>w_sym_v σ</th>
@@ -405,7 +400,7 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
         html += f'<td class="num">{d["mirror_proj_norm"]:.2f}</td>'
         html += f'<td class="num">{d["mirror_out_norm"]:.2f}</td>'
         html += f'<td class="num">{d["gate_beta"]:.4f}</td>'
-        html += f'<td class="num">{d["w_pred_mean_diff"]:.4f}</td>'
+        html += f'<td class="num">{d["alpha_deviation"]:.4f}</td>'
         html += f'<td class="num">{d["skip_alpha"]:.4f}</td>'
         html += f'<td class="num">{d["mirror_w_temp_std"]:.4f}</td>'
         html += f'<td class="num">{d["mirror_w_global_std"]:.4f}</td>'
@@ -442,7 +437,7 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
         ('Bind proj rank', [d['bind_proj_rank'] for d in layers_data], '{:.1f}'),
         ('MLP eff rank', [d['mlp_eff_rank'] for d in layers_data], '{:.1f}'),
         ('β (gate)', [d['gate_beta'] for d in layers_data], '{:.4f}'),
-        ('W_pred |I-diff|', [d['w_pred_mean_diff'] for d in layers_data], '{:.4f}'),
+        ('α deviation from 1', [d['alpha_deviation'] for d in layers_data], '{:.4f}'),
         ('skip_alpha', [d['skip_alpha'] for d in layers_data], '{:.4f}'),
         ('w_pred_scale μ', [d['w_pred_scale_mean'] for d in layers_data], '{:.4f}'),
         ('i_gate', [d['i_gate'] for d in layers_data], '{:.4f}'),

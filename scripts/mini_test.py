@@ -1,6 +1,6 @@
 """Mini-test: 100 steps + comprehensive checks.
 Without args: quick smoke test (100 steps).
-With --full: adds W_pred grad flow, gate behavior, checkpoint, aux loss checks.
+With --full: adds alpha grad flow, gate behavior, checkpoint, aux loss checks.
 """
 import sys, os, math, time, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -34,7 +34,7 @@ def snapshot(model, tag):
         lm = model.layers[-1].mirror
         print(f'\n=== {tag} ===')
         print(f'  expl={expl:.4f}  diff={diff:.6f}  noise={ns:.6f}')
-        print(f'  W_pred.std:       {m0.W_pred.data.std().item():.4f}   pred_scale.std={m0.w_pred_scale.data.std().item():.4f}')
+        print(f'  alpha.mean:       {m0.alpha.data.mean().item():.4f}   alpha.std={m0.alpha.data.std().item():.4f}   pred_scale.std={m0.w_pred_scale.data.std().item():.4f}')
         print(f'  log_scale[L2].var:{diff:.6f}')
         print(f'  log_skip_alpha:   mean={m0.log_skip_alpha.data.mean().item():.4f}')
         print(f'  dvar_mod_bias:    mean={m0.dvar_mod_bias.data.mean().item():.4f}')
@@ -112,8 +112,8 @@ def check(name, cond, detail=''):
         n_fail += 1
         print(f'  FAIL {name}: {detail}')
 
-# ─── Check 1: W_pred gradient flows to all layers ───
-print('\n--- Check 1: W_pred gradient flow ---')
+# ─── Check 1: alpha gradient flows to all layers ───
+print('\n--- Check 1: alpha gradient flow ---')
 full_cfg = WideBindConfig(D=896, n_layers=8, mlp_groups=8, seq_len=64, batch_size=1)
 big_model = WideBindStack(full_cfg).to(device)
 big_model.train()
@@ -124,10 +124,10 @@ h2 = big_model.embed_tokens(x2)
 out2, _, _ = big_model(h2, None)
 loss2 = big_model.compute_loss(out2, y2)
 loss2.backward()
-grads = [l.mirror.W_pred.grad.norm().item() for l in big_model.layers]
-check('All layers have non-zero W_pred grad', all(g > 1e-6 for g in grads),
+grads = [l.mirror.alpha.grad.norm().item() for l in big_model.layers]
+check('All layers have non-zero alpha grad', all(g > 1e-6 for g in grads),
       f'min={min(grads):.6f}')
-check('Bottom layer W_pred grad > 1e-4', grads[0] > 1e-4,
+check('Bottom layer alpha grad > 1e-4', grads[0] > 1e-4,
       f'L0 grad={grads[0]:.6f}')
 check('Bottom/top grad ratio > 0.1', grads[0] / max(grads[-1], 1e-8) > 0.1,
       f'ratio={grads[0]/max(grads[-1],1e-8):.3f}')
@@ -216,19 +216,19 @@ os.remove(save_path)
 check('No missing keys', len(missing) == 0, f'{len(missing)} missing')
 check('No unexpected keys', len(unexpected) == 0, f'{len(unexpected)} unexpected')
 
-# ─── Check 7: W_pred no weight decay ───
-print('\n--- Check 7: W_pred param group ---')
+# ─── Check 7: alpha no weight decay ───
+print('\n--- Check 7: alpha param group ---')
 wd_model = WideBindStack(full_cfg)
 groups = wd_model.param_groups()
 wd_ok = True
 for g in groups:
     wd = g.get('weight_decay', None)
     for n, p in wd_model.named_parameters():
-        if 'W_pred' in n and any(id(p) == id(pp) for pp in g['params']):
+        if '.alpha' in n and any(id(p) == id(pp) for pp in g['params']):
             if wd != 0:
-                print(f'  FAIL: W_pred weight_decay={wd}')
+                print(f'  FAIL: alpha weight_decay={wd}')
                 wd_ok = False
-check('All W_pred have weight_decay=0', wd_ok, '')
+check('All alpha have weight_decay=0', wd_ok, '')
 del wd_model, ckpt_model, ckpt_model2
 
 # ─── Check 8: Training stability on deeper model ───

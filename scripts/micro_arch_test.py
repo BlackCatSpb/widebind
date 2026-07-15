@@ -145,15 +145,15 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
 
         if step % 100 == 0:
             with torch.no_grad():
-                idiff = torch.stack([
-                    (l.mirror.W_pred.data - torch.eye(cfg.mirror_k, device=l.mirror.W_pred.device).unsqueeze(0)).abs().mean()
+                alpha_dev = torch.stack([
+                    (1.0 - l.mirror.alpha.data).abs().mean()
                     for l in model.layers
                 ]).mean().item()
                 gv = torch.stack([l.mirror._last_gates.var() for l in model.layers]).mean().item()
                 lv = torch.stack([l.mirror.log_scale.data.var() for l in model.layers]).mean().item()
             dt = time.time() - t0
             tok_s = tokens_seen / max(dt, 1e-8)
-            print(f'  {step:>6}  {loss.item():.4f}  {idiff:.6f}  {gv:.6f}  {lv:.6f}  {tok_s:.0f}')
+            print(f'  {step:>6}  {loss.item():.4f}  {alpha_dev:.6f}  {gv:.6f}  {lv:.6f}  {tok_s:.0f}')
 
         if step > 0 and step % 5000 == 0:
             ckpt = {'step': step, 'model': model.state_dict(), 'cfg': cfg}
@@ -163,31 +163,30 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
     dt = time.time() - t0
     print(f'\nDone in {dt:.0f}s ({tokens_seen/dt:.0f} tok/s)')
 
-    # Final W_pred analysis
+    # Final alpha analysis
     with torch.no_grad():
         for i, l in enumerate(model.layers):
-            eye = torch.eye(cfg.mirror_k, device=l.mirror.W_pred.device).unsqueeze(0)
-            diff = (l.mirror.W_pred.data - eye).abs()
-            diag = l.mirror.W_pred.data[:, range(cfg.mirror_k), range(cfg.mirror_k)].mean().item()
-            print(f'  L{i}: |I-diff|={diff.mean().item():.6f} diag={diag:.4f} gate_mean={l.mirror._last_gates.mean().item():.4f} gate_var={l.mirror._last_gates.var().item():.4f}')
+            alpha = l.mirror.alpha.data
+            dev = (1.0 - alpha).abs().mean().item()
+            print(f'  L{i}: |1-alpha|_mean={dev:.6f} alpha_mean={alpha.mean().item():.4f} gate_mean={l.mirror._last_gates.mean().item():.4f} gate_var={l.mirror._last_gates.var().item():.4f}')
 
     # Summary verdict
     with torch.no_grad():
-        final_idiff = torch.stack([
-            (l.mirror.W_pred.data - torch.eye(cfg.mirror_k, device=l.mirror.W_pred.device).unsqueeze(0)).abs().mean()
+        final_alpha_dev = torch.stack([
+            (1.0 - l.mirror.alpha.data).abs().mean()
             for l in model.layers
         ]).mean().item()
 
     print(f'\n=== VERDICT ===')
-    print(f'Init |I-diff| ≈ 0.01  Final |I-diff| = {final_idiff:.6f}')
-    if final_idiff > 0.02:
-        print('✓ W_pred LEARNED (moved >2% from identity)')
-    elif final_idiff > 0.015:
-        print('~ W_pred slightly moved (>1.5%)')
+    print(f'Init |1-alpha| ≈ 0.01  Final |1-alpha| = {final_alpha_dev:.6f}')
+    if final_alpha_dev > 0.02:
+        print('✓ alpha LEARNED (moved >2% from 1.0)')
+    elif final_alpha_dev > 0.015:
+        print('~ alpha slightly moved (>1.5%)')
     else:
-        print('✗ W_pred NOT LEARNING (stuck near identity)')
+        print('✗ alpha NOT LEARNING (stuck near 1.0)')
 
-    return final_idiff
+    return final_alpha_dev
 
 
 if __name__ == '__main__':
