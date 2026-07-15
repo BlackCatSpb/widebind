@@ -1,13 +1,14 @@
 === WideBind — Files to copy to Google Drive for Colab training ===
 
-D=4096, G=16, d=256, K=32, mirror_k=32, expand=4, ~293M params
+D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, surv=1.0, ~293M params
 
 === CHANGES IN THIS VERSION ===
 
 - W_pred (G,k,k) → alpha (G,) — scalar per expert, 1024× stronger gradient
 - lo/hi k-space split removed — pred_error flows to all k dims
+- G=16→32 (d/k 8:1→4:1) — 2× stronger temporal signal
 - |1-alpha| logs instead of |I-diff|
-- w_pred_scale_init=3.0 in config
+- w_pred_scale_init=3.0 in config, surv=1.0
 
 === FILES TO COPY ===
 
