@@ -2,20 +2,28 @@
 
 D=4096, G=16, d=256, K=32, mirror_k=32, expand=4, ~293M params
 
-Manual copy (overwrite all):
+=== CHANGES IN THIS VERSION ===
 
+- W_pred (G,k,k) → alpha (G,) — scalar per expert, 1024× stronger gradient
+- lo/hi k-space split removed — pred_error flows to all k dims
+- |1-alpha| logs instead of |I-diff|
+- w_pred_scale_init=3.0 in config
+
+=== FILES TO COPY ===
+
+Required (overwrite on Drive):
   1. core/config.py
   2. core/model.py
   3. notebooks/colab.ipynb
 
-Optional (scripts for analysis, not required for training):
-
+Optional:
   4. scripts/colab_train.py
   5. scripts/mini_test.py
   6. scripts/analyze_checkpoint.py
   7. compression/fcf_cpr.py
+  8. scripts/wpred_ablation.py  (A/B/C comparison test)
 
-Drive structure expected:
+Drive structure:
   widebind_data/
     core/config.py
     core/model.py
@@ -28,14 +36,15 @@ Drive structure expected:
 
 === IMPORTANT ===
 
-step_10000.pt checkpoint is INCOMPATIBLE (G=32→16, D=3584→4096).
+Old step_10000.pt checkpoint INCOMPATIBLE (had W_pred).
 Start fresh training from scratch.
 
-=== Quick check after copy ===
+=== QUICK VERIFY ===
 
-In Colab first cell (imports):
-  from core import WideBindConfig
+In Colab:
+  from core import WideBindConfig, WideBindStack
   cfg = WideBindConfig(D=4096, n_layers=2, mlp_groups=16, mirror_k=32)
   m = WideBindStack(cfg)
-  print(m.param_count())  # Should print ~18M (2 layers)
-  assert m.layers[0].mirror.w_gate.shape == (16, 32)
+  print(m.param_count())  # ~18M (2 layers)
+  print(m.layers[0].mirror.alpha.shape)  # torch.Size([16])
+  print(m.layers[0].mirror.alpha.data)   # tensor([0.99, ..., 0.99])
