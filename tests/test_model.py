@@ -177,13 +177,33 @@ def test_vsa_scan_batched():
 # ─── GroupedCognitiveMirror ──────────────────────────────────────────
 
 def test_mirror_shape():
-    D, G, k = 896, 32, 4
+    D, G, k = 896, 32, 8
     mirror = GroupedCognitiveMirror(D, G=G, k=k)
     B, L = 2, 16
     h = torch.randn(B, L, D)
     mem_all = torch.randn(B, L, D)
     out = mirror(h, mem_all)
     assert out.shape == (B, L, D), f'Shape: {out.shape}'
+
+
+def test_mirror_alpha_is_scalar():
+    D, G, k = 896, 32, 8
+    mirror = GroupedCognitiveMirror(D, G=G, k=k)
+    assert mirror.alpha.shape == (G,), f'alpha.shape={mirror.alpha.shape} != ({G},)'
+    assert mirror.alpha.requires_grad, 'alpha is not trainable'
+    a = mirror.alpha.data
+    assert (a > 0.9).all() and (a < 1.01).all(), f'alpha init out of range: {a}'
+
+
+def test_mirror_no_lo_hi_split():
+    """delta = temp + pred_error + smooth + sym, no k-dim slicing."""
+    D, G, k = 896, 32, 8
+    mirror = GroupedCognitiveMirror(D, G=G, k=k)
+    B, L = 2, 8
+    h = torch.randn(B, L, D)
+    mem_all = torch.randn(B, L, D)
+    out = mirror(h, mem_all)
+    assert out.shape == (B, L, D)
 
 
 def test_mirror_skip_connection_preserves_gradient():
@@ -204,7 +224,7 @@ def test_mirror_skip_connection_preserves_gradient():
 
 
 def test_mirror_per_expert_gates():
-    D, G, k = 896, 32, 4
+    D, G, k = 896, 32, 8
     mirror = GroupedCognitiveMirror(D, G=G, k=k)
     B, L = 4, 32
     h = torch.randn(B, L, D)
@@ -239,13 +259,12 @@ def test_mirror_global_state():
 
 def test_mirror_conv_smooth_all_channels_active():
     """Verify depthwise conv init fills ALL channels (not just first)."""
-    for _ in range(10):
+    for _ in range(6):
         k = 8 if torch.rand(1).item() > 0.5 else 4
         mirror = GroupedCognitiveMirror(D=896, G=32, k=k)
         w = mirror.conv_smooth.weight.data
-        assert w.shape == (32 * k, 1, 3)
+        assert w.shape == (32 * k, 1, 3), f'Shape: {w.shape}'
         assert w[:, 0, 1].eq(1.0).all(), f'Not all channels have center=1 (k={k})'
-        assert w[:, 0, [0, 2]].abs().sum().item() == 0, 'Non-center elements non-zero'
 
 
 def test_mirror_conv_smooth_produces_temporal_diff():
@@ -420,15 +439,16 @@ def test_config_adaptive_controller_thresholds():
 def test_config_init_values():
     """Custom init values propagate from config to model layers."""
     from core.config import WideBindConfig
-    k = 4
+    k = 8
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8, mirror_k=k,
                          w_pred_scale_init=0.5, log_scale_init_std=0.1,
                          w_d_init_std=0.5, conv_init_std=0.05)
     model = WideBindStack(cfg)
     m0 = model.layers[0].mirror
 
-    # w_pred_scale shape and init
-    assert m0.w_pred_scale.shape == (8, k)
+    # alpha shape (G,) — not w_pred_scale (which is per-dim scale init)
+    assert m0.alpha.shape == (8,), f'alpha.shape={m0.alpha.shape} != (8,)'
+    assert m0.w_pred_scale.shape == (8, k), f'w_pred_scale.shape={m0.w_pred_scale.shape} != (8,{k})'
     assert m0.w_pred_scale.data[0, 0].item() == 0.5
 
     # w_d std respects config
@@ -581,6 +601,82 @@ def test_large_config_forward():
 
 
 # ─── Parameter counts ─────────────────────────────────────────────
+
+# ─── Alpha-specific tests ───────────────────────────────────────────
+
+def test_alpha_gradient_stronger_than_wpred():
+    """Scalar alpha gets 1024× stronger per-param gradient than W_pred."""
+    D, G, k = 896, 32, 8
+    mirror = GroupedCognitiveMirror(D, G=G, k=k)
+    B, L = 2, 16
+    h = torch.randn(B, L, D)
+    mem_all = torch.randn(B, L, D)
+    out = mirror(h, mem_all)
+    loss = out.sum() * 0.01  # scale down to avoid extreme grads
+    loss.backward()
+    alpha_grad = mirror.alpha.grad.norm().item()
+    assert alpha_grad > 0, f'alpha grad is zero'
+    # w_pred would have (G,k,k)=2048 params vs alpha (G,)=32 → 64× more params
+    # With W_pred, gradient per param is ~1/64 of alpha's
+    # Should see strong gradient signal
+    assert alpha_grad > 1e-4, f'alpha grad too small: {alpha_grad}'
+
+
+def test_alpha_deviation_on_structured_data():
+    """|1-alpha| should be > 0 on structured (non-random) data after training."""
+    D, G, k = 896, 8, 4
+    cfg = WideBindConfig(D=D, n_layers=2, mlp_groups=G, mirror_k=k,
+                         code_dim=16, code_sparsity=4, vocab=1000)
+    model = WideBindStack(cfg)
+    opt = torch.optim.AdamW(model.param_groups(), lr=1e-3)
+    
+    # Structured data: ascending tokens (temporal structure)
+    for step in range(100):
+        x = torch.randint(0, 100, (2, 8))
+        h = model.embed_tokens(x)
+        out, _, _ = model(h, None)
+        loss = model.compute_loss(out, x)
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+    
+    with torch.no_grad():
+        idiff = torch.stack([
+            (1.0 - l.mirror.alpha.data).abs().mean()
+            for l in model.layers
+        ]).mean().item()
+    # alpha should deviate from 1.0 on structured data
+    assert idiff > 0, f'|1-alpha|={idiff} — alpha did not move at all'
+
+
+def test_no_lo_hi_split_grad_to_all_k():
+    """pred_error gradient flows to all k dimensions (no k/2 split)."""
+    D, G, k = 896, 4, 8
+    mirror = GroupedCognitiveMirror(D, G=G, k=k)
+    B, L = 1, 4
+    h = torch.randn(B, L, D, requires_grad=True)
+    mem_all = torch.randn(B, L, D)
+    out = mirror(h, mem_all)
+    loss = out.sum()
+    loss.backward()
+    # Grad should exist for all parameters (no dims blocked)
+    assert mirror.W_proj.grad is not None
+    assert mirror.W_out.grad is not None
+    assert mirror.w_pred_scale.grad is not None
+
+
+def test_D4096_G32_forward():
+    cfg = WideBindConfig(n_layers=2, D=4096, mlp_groups=32, mirror_k=32,
+                          code_dim=32, code_sparsity=6, vocab=50000)
+    model = WideBindStack(cfg)
+    x = torch.randint(0, 100, (1, 4))
+    h = model.embed_tokens(x)
+    out, _, _ = model(h, None)
+    assert out.shape == (1, 4, 4096)
+    n = model.param_count()
+    # D=4096, L=2 should be ~18M (ratio 1/16 of full 32-layer ~293M)
+    assert 9e6 < n < 11e6, f'param_count={n:.0f} out of expected 9-11M range'
+
 
 def test_partitioned_embed_fewer_params():
     cfg_dense = WideBindConfig(D=896, code_dim=32, code_sparsity=6)

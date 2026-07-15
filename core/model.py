@@ -262,7 +262,7 @@ class GroupedCognitiveMirror(nn.Module):
       - mirror = tanh(linear + bias) + alpha * linear
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
-    def __init__(self, D, G=32, k=8, w_pred_scale_init=0.1, log_scale_init_std=0.05,
+    def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99):
         super().__init__()
         assert D % G == 0
@@ -510,7 +510,7 @@ class WideBindBlock(nn.Module):
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         # Linear decay across layers: shallow → short memory, deep → long
         layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
-        b_d_init = 2.0 + 3.0 * layer_frac  # L0: τ≈7, L23: τ≈400
+        b_d_init = 2.0 + 3.0 * layer_frac  # L0: τ≈7, L23: τ≈63, L31: τ≈150
         self.b_i = nn.Parameter(torch.full((cfg.D,), -2.5))   # i_gate ~0.08 init (was -3.0, ~0.05)
         self.b_d = nn.Parameter(torch.full((cfg.D,), b_d_init))
 
@@ -753,12 +753,12 @@ class AdaptiveController:
 
     Two fundamental signals drive every parameter:
     ──────────────────────────────────────────────────────────
-    exploration = min(1, |mirror| / 0.3)
+    exploration = min(1, |mirror| / 0.25)
         How much correction is the mirror applying.
         High → model is actively adjusting, needs aggressive learning.
         Low → model is stable, needs conservative parameters.
 
-    differentiation = min(1, var(log_scale) / 0.1)
+    differentiation = min(1, var(log_scale) / 0.08)
         How specialized has the mirror become (per-dim scaling).
         High → mirror has learned which dims to trust/suppress.
         Low → mirror hasn't differentiated, still exploring.

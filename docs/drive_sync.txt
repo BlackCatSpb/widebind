@@ -1,6 +1,6 @@
-=== WideBind — Files to copy to Google Drive for Colab training ===
+=== WideBind — Files for Cloud training (Сферум / Colab) ===
 
-D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, surv=1.0, ~293M params
+D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, ~293M params
 
 === CHANGES IN THIS VERSION ===
 
@@ -8,44 +8,25 @@ D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, surv=1.0, ~293M params
 - lo/hi k-space split removed — pred_error flows to all k dims
 - G=16→32 (d/k 8:1→4:1) — 2× stronger temporal signal
 - |1-alpha| logs instead of |I-diff|
-- w_pred_scale_init=3.0 in config, surv=1.0
+- w_pred_scale_init=3.0 in config
 
-=== FILES TO COPY ===
+=== FILES REQUIRED ===
 
-Required (overwrite on Drive):
   1. core/config.py
   2. core/model.py
-  3. notebooks/colab.ipynb
-
-Optional:
-  4. scripts/colab_train.py
-  5. scripts/mini_test.py
-  6. scripts/analyze_checkpoint.py
-  7. compression/fcf_cpr.py
-  8. scripts/wpred_ablation.py  (A/B/C comparison test)
-
-Drive structure:
-  widebind_data/
-    core/config.py
-    core/model.py
-    notebooks/colab.ipynb
-    compression/fcf_cpr.py
-    scripts/colab_train.py
-    scripts/mini_test.py
-    scripts/analyze_checkpoint.py
-    token_stream_*.bin
-
-=== IMPORTANT ===
-
-Old step_10000.pt checkpoint INCOMPATIBLE (had W_pred).
-Start fresh training from scratch.
+  3. notebooks/colab.ipynb  (or notebooks/cloud.ipynb)
+  4. token_stream_*_clean.bin  (data files)
 
 === QUICK VERIFY ===
 
-In Colab:
-  from core import WideBindConfig, WideBindStack
-  cfg = WideBindConfig(D=4096, n_layers=2, mlp_groups=16, mirror_k=32)
-  m = WideBindStack(cfg)
-  print(m.param_count())  # ~18M (2 layers)
-  print(m.layers[0].mirror.alpha.shape)  # torch.Size([16])
-  print(m.layers[0].mirror.alpha.data)   # tensor([0.99, ..., 0.99])
+>>> from core import WideBindConfig, WideBindStack
+>>> cfg = WideBindConfig(D=4096, n_layers=2, mlp_groups=32, mirror_k=32)
+>>> m = WideBindStack(cfg)
+>>> m.param_count()  # ~18M (2 layers)
+>>> m.layers[0].mirror.alpha.shape  # torch.Size([32])
+>>> m.layers[0].mirror.alpha.data   # tensor([0.99, ..., 0.99])
+
+=== IMPORTANT ===
+
+Old checkpoints with W_pred INCOMPATIBLE. Fresh start required.
+alpha must show |1-alpha| > 0.01 within first 1000 steps on structured data.
