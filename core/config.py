@@ -22,7 +22,7 @@ class WideBindConfig:
 
     # Mirror
     mirror_k: int = 32           # K-space dim per expert (d/k=256/32=8:1)
-    w_pred_scale_init: float = 1.0
+    w_pred_scale_init: float = 3.0
     log_scale_init_std: float = 0.05
     # MLP
     mlp_groups: int = 16         # D/mlp_groups=256, mirror_k=32 → d/k=8:1

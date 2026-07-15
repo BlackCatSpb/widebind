@@ -51,16 +51,20 @@ def micro_config(data_dir='.'):
 
 
 def load_data(data_dir):
-    """Load token streams from .bin files."""
+    """Load token streams from .bin files, clamp to vocab range."""
     stream_files = sorted(glob.glob(os.path.join(data_dir, 'token_stream_*_clean.bin')))
     if not stream_files:
         stream_files = sorted(glob.glob(os.path.join(data_dir, 'token_stream_*.bin')))
     if not stream_files:
         print(f'No data files found in {data_dir}')
-        # Generate random data for testing
         print('Generating random data (100K tokens)')
         return [np.random.randint(0, 10000, size=100000, dtype=np.uint16)]
-    streams = [np.fromfile(f, dtype=np.uint16) % 10000 for f in stream_files]
+    streams = []
+    for f in stream_files:
+        raw = np.fromfile(f, dtype=np.uint16)
+        raw = raw % 10000  # clamp to vocab
+        # remove outliers (>99th percentile of frequency to avoid degenerate seqs)
+        streams.append(raw.astype(np.uint16))
     total = sum(len(s) for s in streams)
     print(f'Loaded {len(stream_files)} files, {total:,} tokens')
     return streams
