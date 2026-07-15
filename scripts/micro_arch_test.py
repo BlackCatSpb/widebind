@@ -27,7 +27,7 @@ def micro_config(data_dir='.'):
         code_dim=16,
         code_sparsity=8,
         mirror_k=4,
-        w_pred_scale_init=1.0,
+        w_pred_scale_init=5.0,
         mlp_groups=4,
         mlp_expand=4,
         conv_kernel=8,
@@ -39,6 +39,7 @@ def micro_config(data_dir='.'):
         weight_decay=0.01,
         grad_clip=1.0,
         scheduler='mirror',
+        gate_lr_mult=20.0,
         target_var=0.1,
         mag_threshold=0.3,
         lr_min_ratio=0.05,
@@ -99,7 +100,7 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
 
     print(f'Training: {cfg.max_steps} steps, B={B}, L={L}')
     print(f'  step{"":>6} loss{"":>8} |I-diff|{"":>8} gate_var{"":>8} var(ls){"":>8} tok/s')
-    print('─' * 65)
+    print('-' * 65)
 
     for step in range(start_step, cfg.max_steps):
         stream = streams[si]
@@ -117,7 +118,7 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
 
         h = model.embed_tokens(x)
         out, state, gs = model(h, state, global_state=gs)
-        loss = model.compute_loss(out, y)
+        loss = model.compute_loss(out, y, pred_weight=1.0)
         del x, y, h, out
 
         if torch.isnan(loss) or torch.isinf(loss):
