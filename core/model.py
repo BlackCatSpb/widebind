@@ -787,15 +787,18 @@ class AdaptiveController:
 
     Two fundamental signals drive every parameter:
     ──────────────────────────────────────────────────────────
-    exploration = min(1, |mirror| / 0.25)
+    exploration = min(1, |mirror| / λ⁻²)
         How much correction is the mirror applying.
         High → model is actively adjusting, needs aggressive config.
         Low → model is stable, needs conservative config.
 
-    differentiation = min(1, var(log_scale) / 0.08)
+    differentiation = min(1, var(log_scale) / λ⁻⁴)
         How specialized has the mirror become (per-dim scaling).
         High → mirror has learned which dims to trust/suppress.
         Low → mirror hasn't differentiated, still exploring.
+
+    λ_d hierarchy (d=3): λ₃ ≈ 1.839, λ⁻² ≈ 0.296, λ⁻⁴ ≈ 0.087
+    All range defaults below are λ_d d=3 derived.
 
     Key design: ALL methods work at per-layer AND global resolution.
     ``layer_stats(layer)`` → per-layer (expl, diff)
@@ -813,22 +816,22 @@ class AdaptiveController:
       from delta_var (experts with volatile dynamics get more
       temporal teaching signal)
 
-    Mathematically derived ranges:
-    ──────────────────────────────
+    Mathematically derived ranges (λ_d d=3):
+    ────────────────────────────────────────
     b_d ∈ [b_d_min, 5.0] per layer, where b_d_min = 2.0 + 3.0*layer_frac
          expl=1 → b_d = b_d_min (shortest memory)
          expl=0 → b_d = 5.0 (longest memory)
          L0: τ≈[7, 150], L31: τ≈[150, 150]
     b_i  ∈ [-3.0, -1.5] → i_gate ≈ [0.047, 0.18] (write rate via sigmoid)
-    w_mem2v_scale ∈ [0.5, 1.0]  (memory contribution)
-    ema_alpha ∈ [0.90, 0.99]  (cross-layer memory aggregation)
-    noise_scale ∈ [0.001, 0.05]  (parameter noise for exploration)
-    pred_weight ∈ [0.05, 1.0]  (alpha auxiliary loss weight)
+    w_mem2v_scale ∈ [0.544, 1.0]  (memory contribution, λ⁻¹ to 1)
+    ema_alpha ∈ [0.974, 0.992]  (cross-layer memory, 1-λ⁻⁶ to 1-λ⁻⁸)
+    noise_scale ∈ [0.0076, 0.026]  (parameter noise, λ⁻⁸ to λ⁻⁶)
+    pred_weight ∈ [0.026, 0.296]  (alpha loss weight, λ⁻⁶ to λ⁻²)
     tanh_bias_mod ∈ [1.0, 1.5]  (exploration amplification)
-    spectral_mod ∈ [0.85, 1.15]  (differentiation frequency shaping)
+    spectral_mod ∈ [0.913, 1.087]  (differentiation, 1±λ⁻⁴)
     """
     @staticmethod
-    def layer_stats(layer, expl_thresh=0.25, diff_thresh=0.08):
+    def layer_stats(layer, expl_thresh=0.296, diff_thresh=0.087):
         """Per-layer (exploration, differentiation) from a single block."""
         m = layer.mirror
         ls = m.log_scale.data
@@ -837,7 +840,7 @@ class AdaptiveController:
         return min(1.0, mag / expl_thresh), min(1.0, var / diff_thresh)
 
     @staticmethod
-    def stats(blocks, expl_thresh=0.25, diff_thresh=0.08):
+    def stats(blocks, expl_thresh=0.296, diff_thresh=0.087):
         """Global average (exploration, differentiation) across all layers."""
         expl_sum = diff_sum = 0.0
         for layer in blocks:
@@ -867,21 +870,21 @@ class AdaptiveController:
         return -3.0 + expl * 1.5
 
     @staticmethod
-    def layer_w_mem2v_scale(layer, min_val=0.5, max_val=1.0, diff=None):
+    def layer_w_mem2v_scale(layer, min_val=0.544, max_val=1.0, diff=None):
         """Per-layer memory contribution."""
         if diff is None:
             _, diff = AdaptiveController.layer_stats(layer)
         return max_val - diff * (max_val - min_val)
 
     @staticmethod
-    def layer_noise_scale(layer, min_val=0.001, max_val=0.05, diff=None):
+    def layer_noise_scale(layer, min_val=0.0076, max_val=0.026, diff=None):
         """Per-layer parameter noise."""
         if diff is None:
             _, diff = AdaptiveController.layer_stats(layer)
         return max_val - diff * (max_val - min_val)
 
     @staticmethod
-    def layer_ema_alpha(layer, min_val=0.90, max_val=0.99, diff=None):
+    def layer_ema_alpha(layer, min_val=0.974, max_val=0.992, diff=None):
         """Per-layer EMA rate (for per-layer global_state aggregation)."""
         if diff is None:
             _, diff = AdaptiveController.layer_stats(layer)
@@ -890,7 +893,7 @@ class AdaptiveController:
     # ─── New intelligent adaptivity ───────────────────────────────
 
     @staticmethod
-    def pred_weight(blocks, min_val=0.05, max_val=1.0):
+    def pred_weight(blocks, min_val=0.026, max_val=0.296):
         """Adaptive alpha auxiliary loss weight.
 
         When mirror has differentiated (high diff), temporal prediction
@@ -905,11 +908,11 @@ class AdaptiveController:
         """Scale tanh_bias by exploration.
 
         High exploration → more asymmetric correction needed → amplify.
-        Range: [1.0, 1.5] (at most 50% boost).
+        Range: [1.0, 1.296] (at most 1+λ⁻² boost).
         """
         if expl is None:
             expl, _ = AdaptiveController.layer_stats(layer)
-        return 1.0 + 0.5 * expl
+        return 1.0 + 0.296 * expl
 
     @staticmethod
     def spectral_modulation(layer, diff=None):
@@ -918,11 +921,11 @@ class AdaptiveController:
         High diff → mirror has learned structure → amplify spectral
         contrast (more aggressive frequency shaping).
         Low diff → flatten spectral response (conservative).
-        Range: [0.85, 1.15].
+        Range: [0.913, 1.087] = 1 ± λ⁻⁴.
         """
         if diff is None:
             _, diff = AdaptiveController.layer_stats(layer)
-        return 1.0 + 0.15 * (diff - 0.5) * 2.0  # 0.85 at diff=0, 1.15 at diff=1
+        return 1.0 + 0.087 * (diff - 0.5) * 2.0  # 0.913 at diff=0, 1.087 at diff=1
 
     @staticmethod
     def pred_scale_mod(layer):
@@ -930,7 +933,7 @@ class AdaptiveController:
 
         Experts with volatile K-space dynamics (high delta_var relative
         to layer average) get more temporal teaching signal.
-        Range: [0.1, 3.0] per expert.
+        Range: [λ⁻⁴, λ²] = [0.087, 3.38] per expert at d=3.
         """
         dv = layer.mirror._delta_var
         dv_mean = dv.mean().clamp(min=1e-8)
@@ -949,17 +952,17 @@ class AdaptiveController:
         return -3.0 + expl * 1.5
 
     @staticmethod
-    def w_mem2v_scale(blocks, min_val=0.5, max_val=1.0):
+    def w_mem2v_scale(blocks, min_val=0.544, max_val=1.0):
         _, diff = AdaptiveController.stats(blocks)
         return max_val - diff * (max_val - min_val)
 
     @staticmethod
-    def ema_alpha(blocks, min_val=0.90, max_val=0.99):
+    def ema_alpha(blocks, min_val=0.974, max_val=0.992):
         _, diff = AdaptiveController.stats(blocks)
         return min_val + diff * (max_val - min_val)
 
     @staticmethod
-    def noise_scale(blocks, min_val=0.001, max_val=0.05):
+    def noise_scale(blocks, min_val=0.0076, max_val=0.026):
         _, diff = AdaptiveController.stats(blocks)
         return max_val - diff * (max_val - min_val)
 
@@ -974,11 +977,11 @@ class MirrorLRScheduler:
     2. |mirror| — mean absolute mirror correction magnitude. Large when
        model is unstable, shrinks at convergence. Caps LR.
 
-    LR_mult = max(0.05, (1 - var/target) * min(1, mag/threshold))
+    LR_mult = max(λ⁻⁶, (1 - var/target) * min(1, mag/threshold))
     """
     def __init__(self, model, optimizer, base_lr=None, warmup=1000,
-                 target_var=0.1, mag_threshold=0.3, lr_min_ratio=0.05,
-                 max_decay_steps=50000, var_min_for_lr_decay=0.001,
+                 target_var=0.161, mag_threshold=0.296, lr_min_ratio=0.026,
+                 max_decay_steps=2584, var_min_for_lr_decay=0.008,
                  cfg=None):
         if cfg is not None:
             base_lr = base_lr or cfg.lr

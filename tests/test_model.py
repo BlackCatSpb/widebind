@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from core.config import WideBindConfig
+from core.lambda_utils import LambdaConfig
 from core.model import (
     WideBindStack, WideBindBlock, GroupedCognitiveMirror, GroupedMLP,
     PartitionedEmbedding, PartitionedHead, LmHead,
@@ -425,6 +426,7 @@ def test_config_adaptive_controller_thresholds():
     from core.config import WideBindConfig
     from core.model import WideBindStack, AdaptiveController
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
+                         lambda_d_enabled=False,
                          exploration_threshold=0.5, differentiation_threshold=0.5)
     model = WideBindStack(cfg)
     h = torch.randn(1, 4, 896)
@@ -441,6 +443,7 @@ def test_config_init_values():
     from core.config import WideBindConfig
     k = 8
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8, mirror_k=k,
+                         lambda_d_enabled=False,
                          w_pred_scale_init=0.5, log_scale_init_std=0.1,
                          w_d_init_std=0.5, conv_init_std=0.05)
     model = WideBindStack(cfg)
@@ -464,6 +467,7 @@ def test_config_param_groups_multipliers():
     """param_groups uses config multipliers when called without overrides."""
     from core.config import WideBindConfig
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
+                         lambda_d_enabled=False,
                          gate_lr_mult=3.0)
     model = WideBindStack(cfg)
     groups = model.param_groups(1e-4)
@@ -480,6 +484,25 @@ def test_config_param_groups_multipliers():
                 assert abs(g['lr'] - 3e-4) < 1e-7, f'gate lr={g["lr"]} != 3e-4'
                 found_gate = True
     assert found_gate, 'gate param group not found'
+
+
+def test_lambda_d_hierarchy():
+    """lambda_d derivation overrides defaults sensibly at d=3."""
+    from core.config import WideBindConfig
+    cfg = WideBindConfig()  # d=3, enabled
+    lc = LambdaConfig(3)
+    assert abs(cfg.exploration_threshold - lc.exploration_threshold) < 1e-6
+    assert abs(cfg.differentiation_threshold - lc.differentiation_threshold) < 1e-6
+    assert abs(cfg.ema_alpha_max - lc.ema_alpha_max) < 1e-6
+    assert abs(cfg.gate_lr_mult - lc.gate_lr_mult) < 1e-6
+    assert cfg.warmup_steps == lc.warmup_steps
+    assert cfg.eval_interval == lc.eval_interval
+
+    # Disabled mode preserves legacy values
+    cfg2 = WideBindConfig(lambda_d_enabled=False)
+    assert abs(cfg2.exploration_threshold - 0.25) < 1e-6
+    assert abs(cfg2.ema_alpha_max - 0.99) < 1e-6
+    assert cfg2.warmup_steps == 1000
 
 
 # ─── LiveInference ─────────────────────────────────────────────────
