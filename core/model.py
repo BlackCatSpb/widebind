@@ -294,7 +294,7 @@ class GroupedCognitiveMirror(nn.Module):
         # pred_k = alpha_g * hp_prev, pred_error ≈ hp - hp_prev (temporal delta)
         # Scalar alpha (G,) — 1 param per expert vs (G,k,k)=16K params for W_pred
         # Gives 1024× stronger gradient per param, enabling real W_pred learning
-        self.alpha = nn.Parameter(torch.full((G,), 0.99))
+        self.alpha = nn.Parameter(torch.full((G,), 0.98))
         self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
