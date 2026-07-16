@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
+from .zeckendorf_readout import ZeckendorfReadout
 
 
 # ─── Utilities ──────────────────────────────────────────────────────────
@@ -613,7 +614,10 @@ class WideBindStack(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = PartitionedEmbedding(cfg)
-        self.lm_head = PartitionedHead(cfg)
+        if getattr(cfg, 'zeckendorf_readout', False):
+            self.lm_head = ZeckendorfReadout(cfg)
+        else:
+            self.lm_head = PartitionedHead(cfg)
         
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
@@ -712,9 +716,15 @@ class WideBindStack(nn.Module):
         """h: (B, L, D) -> logits -> cross-entropy + alpha auxiliary loss
         pred_weight: if None, uses adaptive value from forward pass.
         """
-        logits = self.lm_head(h)
-        ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
-                                  targets.reshape(-1), reduction='mean')
+        if isinstance(self.lm_head, ZeckendorfReadout):
+            B, L, D = h.shape
+            log_probs = self.lm_head.log_probs_for_target(
+                h.reshape(-1, D), targets.reshape(-1))
+            ce_loss = -log_probs.mean()
+        else:
+            logits = self.lm_head(h)
+            ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
+                                      targets.reshape(-1), reduction='mean')
         pw = pred_weight if pred_weight is not None else getattr(self, '_pred_weight', 0.1)
         # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0

@@ -505,6 +505,121 @@ def test_lambda_d_hierarchy():
     assert cfg2.warmup_steps == 1000
 
 
+# ─── Zeckendorf Readout ────────────────────────────────────────────
+
+def test_fibonacci_bases():
+    from core.zeckendorf_readout import fibonacci_bases, zeckendorf_code
+    fibs = fibonacci_bases(100)
+    assert fibs[-1] >= 100  # last fib >= vocab
+    assert fibs[-2] <= 100  # second-to-last < vocab
+    assert len(fibs) > 2
+    for i in range(2, len(fibs)):
+        assert fibs[i] == fibs[i-1] + fibs[i-2]
+
+
+def test_zeckendorf_code():
+    from core.zeckendorf_readout import fibonacci_bases, zeckendorf_code
+    fibs = fibonacci_bases(100)
+    bits = zeckendorf_code(0, fibs)
+    assert all(b == 0 for b in bits)
+    bits1 = zeckendorf_code(1, fibs)
+    assert bits1[-1] == 1
+    assert sum(bits1) == 1
+    bits100 = zeckendorf_code(100, fibs)
+    assert sum(bits100) > 0
+    # 100 = 89 + 8 + 3 → bits for 89, 8, 3 should be 1
+    # bits are MSB-first, aligned with reversed(fibs)
+    rev_idx = {f: i for i, f in enumerate(reversed(fibs))}
+    assert bits100[rev_idx[89]] == 1, f'89 bit not set: {bits100}'
+    assert bits100[rev_idx[8]] == 1, f'8 bit not set: {bits100}'
+    assert bits100[rev_idx[3]] == 1, f'3 bit not set: {bits100}'
+    assert bits100[rev_idx[2]] == 0, f'2 bit set (would be consecutive): {bits100}'
+    # No consecutive 1s
+    for i in range(len(bits100) - 1):
+        assert not (bits100[i] == 1 and bits100[i+1] == 1)
+
+
+def test_zeckendorf_readout_target():
+    from core.zeckendorf_readout import ZeckendorfReadout
+    from core.config import WideBindConfig
+    cfg = WideBindConfig(D=896, vocab=5000)
+    zr = ZeckendorfReadout(cfg)
+    h = torch.randn(4, 896)
+    target = torch.randint(0, 5000, (4,))
+    log_p = zr.log_probs_for_target(h, target)
+    assert log_p.shape == (4,)
+    assert (log_p < 0).all()  # log probs are negative
+
+
+def test_zeckendorf_readout_predict():
+    from core.zeckendorf_readout import ZeckendorfReadout
+    from core.config import WideBindConfig
+    cfg = WideBindConfig(D=896, vocab=5000)
+    zr = ZeckendorfReadout(cfg)
+    h = torch.randn(1, 896)
+    token = zr.predict(h, greedy=True)
+    assert token.shape == (1,)
+    assert 0 <= token.item() < 5000
+
+
+def test_zeckendorf_readout_param_count():
+    from core.zeckendorf_readout import ZeckendorfReadout
+    from core.config import WideBindConfig
+    cfg = WideBindConfig(D=896, vocab=5000)
+    zr = ZeckendorfReadout(cfg)
+    # centroids shape: (K, 2, 2, D) = K * 4 * D
+    expected = zr.K * 4 * cfg.D
+    assert zr.param_count() == expected, f'{zr.param_count()} != {expected}'
+
+
+def test_model_with_zeckendorf_readout():
+    """WideBindStack trains with ZeckendorfReadout replacing PartitionedHead."""
+    from core.config import WideBindConfig
+    from core.model import WideBindStack
+    from core.zeckendorf_readout import ZeckendorfReadout
+    cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
+                         zeckendorf_readout=True)
+    model = WideBindStack(cfg)
+    assert isinstance(model.lm_head, ZeckendorfReadout)
+    h = torch.randn(1, 4, 896)
+    out, new_state, gs = model(h)
+    targets = torch.randint(0, cfg.vocab, (1, 4))
+    loss = model.compute_loss(out, targets)
+    assert loss.item() > 0
+    loss.backward()
+    # Centroids should have gradients
+    assert model.lm_head.centroids.grad is not None
+
+
+# ─── Temporal Zeckendorf ───────────────────────────────────────────
+
+def test_temporal_zeckendorf_theta():
+    from core.temporal_zeckendorf import TemporalZeckendorf
+    tz = TemporalZeckendorf()
+    fast, slow = tz.theta(0)
+    assert fast == 1.0
+    assert slow == 1.0
+    fast, slow = tz.theta(1)
+    assert 0 < fast <= 1.0
+    assert 0 < slow <= 1.0
+    fast1, _ = tz.theta(1)
+    fast100, _ = tz.theta(100)
+    fast1000, _ = tz.theta(1000)
+    assert fast1 >= fast100  # monotonic non-increasing
+    assert fast100 >= fast1000
+
+
+def test_temporal_zeckendorf_trace():
+    from core.temporal_zeckendorf import TemporalZeckendorf
+    tz = TemporalZeckendorf()
+    t0 = tz.trace(0)
+    assert t0 == 0.0
+    t1 = tz.trace(1)
+    t2 = tz.trace(2)
+    assert t2 > 0
+    assert t2 >= t1  # monotonic
+
+
 # ─── LiveInference ─────────────────────────────────────────────────
 
 def test_live_inference_basic():

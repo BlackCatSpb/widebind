@@ -26,6 +26,12 @@ class WideBindConfig:
     lambda_d: int = 3            # dimension of generalized golden ratio
     lambda_d_enabled: bool = True  # True = apply λ_d derivation in __post_init__
 
+    # Zeckendorf Readout (experimental)
+    zeckendorf_readout: bool = False  # True = replace LM head with Zeckendorf tree
+
+    # Temporal Zeckendorf (experimental)
+    temporal_zeckendorf: bool = False  # True = use Zeckendorf-based temporal decay
+
     # Embed
     code_dim: int = 32
     code_sparsity: int = 6

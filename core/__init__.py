@@ -8,6 +8,8 @@ from .model import (
     dct_basis, zeckendorf_codes, sparse_block_codes,
     vsa_prefix_scan,
 )
+from .zeckendorf_readout import ZeckendorfReadout, fibonacci_bases, zeckendorf_code
+from .temporal_zeckendorf import TemporalZeckendorf
 
 from .live_inference import LiveInference, MirrorMonitor
 
