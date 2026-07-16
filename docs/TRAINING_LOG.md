@@ -1,7 +1,11 @@
-# Training Log — WideBind 221M (2026-07)
+# Training Log — WideBind (2026-07)
 
-**Architecture:** WideBind D=3584 L=32 K=32 G=32 mirror_k=8
-**Params:** 221,740,064 (221.74M)
+> **⚠️ Эта история — эпоха W_pred (D=3584, L=32, G=32, mirror_k=8, 221M).**
+> **Текущая архитектура (2026-07-16+): D=4096, L=32, G=32, mirror_k=32, alpha scalar per expert, 293M.**
+> **W_pred заменён на alpha. Все чекпоинты этой эпохи несовместимы.**
+
+**Architecture (old):** WideBind D=3584 L=32 K=32 G=32 mirror_k=8
+**Params (old):** 221,740,064 (221.74M)
 **Data:** 1,429,837,807 tokens (2 streams, clean .bin)
 **GPU:** Colab T4, B=4, seq_len=64, fp32
 **Init:** gate_pred_scale_init=0.0 (β=0.5), W_pred≈I (eye×0.99 + noise×0.01)
@@ -215,11 +219,13 @@
 | pred_scale | (32, 8) | 256 | ~1e-3 | **6.3e-5** |
 | W_pred | (32, 8, 8) | 2048 | ~7e-5 | **1.5e-6** (42× меньше) |
 
-### Следующий шаг
+### Следующий шаг (неактуально — архитектура изменена)
 
-Возобновить тренировку на Colab T4 с чекпоинта step_10000. Ожидания после исправлений:
-- W_pred |I-diff| растёт (первые 1000 шагов: >0.015)
-- Gate разнообразие (across_experts_std > 0.05)
-- Loss падает ниже 6.5
-- pred_scale продолжает расти
-- log_scale var начинает расти
+**Смена курса (2026-07-16):**
+- W_pred (G×k×k) → alpha (G, scalar per expert): 1024× сильнее градиент, учится за сотни шагов
+- lo/hi k-space split удалён: pred_error течёт во все k=32 dims
+- G=16→32: d/k с 8:1 до 4:1, вдвое сильнее временной сигнал
+- D=3584→4096: 293M params
+- Свежий старт (все старые чекпоинты несовместимы)
+
+Новый лог тренировки — см. Сферум/Colab сессию step 20000+.

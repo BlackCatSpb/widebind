@@ -1,8 +1,9 @@
 # Cognitive Mirror: Предлагаемые улучшения
 
-> **⚠️ Этот документ описывает концепции, предложенные для 41M/221M архитектуры.**
-> **Текущие реализованные улучшения (2026-07): per-expert `log_skip_alpha`, per-expert `log_dvar_mod_scale`/`dvar_mod_bias`/`log_grad_mod_scale`/`grad_mod_bias`, gate_pred_scale_init=0.0 (β=0.5), W_pred≈I.**
-> **См. `config.py` для полного списка гиперпараметров (37 полей).**
+> **⚠️ Исторический документ (эпоха W_pred, D=3584, mirror_k=8).**
+> **Текущая архитектура (2026-07-16): alpha (G,) вместо W_pred, G=32, mirror_k=32, D=4096, 293M.**
+> **W_pred не учился 10000 шагов — заменён на scalar alpha. Skip connection (п.4) реализован.**
+> **См. `core/model.py` `GroupedCognitiveMirror`.**
 
 ## Текущее состояние
 
