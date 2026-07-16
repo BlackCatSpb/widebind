@@ -325,7 +325,8 @@ class GroupedCognitiveMirror(nn.Module):
         self._delta_var_ema_min = delta_var_ema_min
         self._delta_var_ema_max = delta_var_ema_max
     
-    def forward(self, h, mem_all, global_state=None, diff=None):
+    def forward(self, h, mem_all, global_state=None, diff=None,
+                tanh_bias_mod=1.0, pred_scale_mod=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -360,7 +361,13 @@ class GroupedCognitiveMirror(nn.Module):
         # Predictive: error in K-space self-prediction (t-1 -> t)
         # pred_k = alpha_g * hp_prev — scalar per expert, much stronger gradient
         pred_k = hp_prev * self.alpha.view(1, 1, G, 1)  # (B, L, G, k)
-        pred_error = (hp - pred_k) * self.w_pred_scale  # (B, L, G, k)
+        # pred_scale_mod: (G,) per-expert modulator from delta_var
+        # Experts with volatile dynamics get more temporal teaching signal
+        if pred_scale_mod is None:
+            dv = self._delta_var
+            dv_mean = dv.mean().clamp(min=1e-8)
+            pred_scale_mod = (dv / dv_mean).clamp(0.1, 3.0)
+        pred_error = (hp - pred_k) * self.w_pred_scale * pred_scale_mod.view(G, 1)
         self._cached_pred_k = pred_k
         self._cached_hp = hp
         
@@ -378,7 +385,9 @@ class GroupedCognitiveMirror(nn.Module):
         delta = temp_k + pred_error + smooth_k + sym_k
         
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
-        delta = delta + self.tanh_bias  # break zero-mean symmetry in K-space
+        # tanh_bias_mod: scale bias by exploration level
+        # More exploration → more asymmetric correction
+        delta = delta + self.tanh_bias * tanh_bias_mod
         
         # Linear projection + skip connection
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
@@ -490,6 +499,7 @@ class WideBindBlock(nn.Module):
         
         # Pre-LN weight
         self.register_buffer('pre_ln_w', torch.ones(cfg.D))
+        self.total_layers = cfg.n_layers
         
         # ─── Bind: D -> K -> bilinear -> D ───
         proj_std = 1.0 / (cfg.D * cfg.bind_K) ** 0.25
@@ -533,7 +543,8 @@ class WideBindBlock(nn.Module):
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
     
     def forward(self, h, state=None, global_state=None,
-                mem2v_scale=1.0, diff=None, noise_scale=0.0):
+                mem2v_scale=1.0, diff=None, noise_scale=0.0,
+                tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -576,15 +587,16 @@ class WideBindBlock(nn.Module):
         mem_read = mem_read + mu_read * self.w_mu_mem
         
         # ─── Mirror (self-consistency: local + global) ───
-        mirror = self.mirror(h, mem_all, global_state=global_state, diff=diff)
+        mirror = self.mirror(h, mem_all, global_state=global_state, diff=diff,
+                             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod)
         
         # ─── Output (adaptive memory scale) ───
         enhanced = bind_out + mem_read * self.w_mem2v * mem2v_scale + mirror
         h = h + enhanced
         
-        # ─── Spectral ───
+        # ─── Spectral (adaptive: diff modulates frequency shaping) ───
         h_dct = h @ self.V_dct.T
-        h = h + (h_dct * self.lambda_k) @ self.V_dct
+        h = h + (h_dct * self.lambda_k * spectral_mod) @ self.V_dct
         
         # ─── MLP ───
         h = h + self.mlp(h)
@@ -611,53 +623,72 @@ class WideBindStack(nn.Module):
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
-    def forward(self, h, state=None, global_state=None):
+    def forward(self, h, state=None, global_state=None, pred_weight=None):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
+           pred_weight: adaptive alpha auxiliary loss weight (or None to compute)
         """
         if state is None:
             state = [None] * len(self.layers)
         B, L, D = h.shape
         
-        # ─── Adaptive gate biases from mirror stats ───
+        # ─── Adaptive gate biases from mirror stats (per-layer) ───
         with torch.no_grad():
+            # Global stats for cross-layer EMA and pred_weight
             expl_raw, diff = AdaptiveController.stats(self.layers,
                 expl_thresh=self.cfg.exploration_threshold,
                 diff_thresh=self.cfg.differentiation_threshold)
             # EMA-smooth exploration: τ ≈ 500 steps (α=0.998)
             self._expl_ema.mul_(0.998).add_(expl_raw * (1.0 - 0.998))
-            expl = self._expl_ema.clamp(0.0, 1.0).item()
+            global_expl = self._expl_ema.clamp(0.0, 1.0).item()
             
-            mem2v_scale = AdaptiveController.w_mem2v_scale(self.layers,
-                min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max)
-            ema_alpha = AdaptiveController.ema_alpha(self.layers,
-                min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
-            noise_scale = AdaptiveController.noise_scale(self.layers,
-                min_val=self.cfg.noise_scale_min, max_val=self.cfg.noise_scale_max)
+            # Adaptive pred_weight: more temporal learning when mirror specializes
+            self._pred_weight = (pred_weight if pred_weight is not None
+                else AdaptiveController.pred_weight(self.layers,
+                    min_val=0.05, max_val=1.0))
+            
             n = len(self.layers)
             for i, layer in enumerate(self.layers):
-                layer_frac = i / max(n - 1, 1)
-                b_i_val = -3.0 + expl * 1.5
-                # Fixed b_d: high expl → short memory (low b_d).
-                # τ hierarchy preserved: L0 shorter than L31 at any expl.
-                # base = 2.0 + 3.0*layer_frac ∈ [2.0, 5.0]
-                b_d_max = 5.0
-                b_d_min = 2.0 + 3.0 * layer_frac  # L0=2.0, L31=5.0
-                # expl=1 → b_d = b_d_min (shortest), expl=0 → b_d = b_d_max (longest)
-                b_d_val = b_d_max - expl * (b_d_max - b_d_min)
-                b_d_val = max(2.0, min(5.0, b_d_val))
+                # Per-layer exploration/differentiation (not global avg)
+                l_expl, l_diff = AdaptiveController.layer_stats(layer,
+                    expl_thresh=self.cfg.exploration_threshold,
+                    diff_thresh=self.cfg.differentiation_threshold)
+                
+                # Per-layer gate biases
+                b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
+                b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl)
                 layer.b_i.fill_(b_i_val)
                 layer.b_d.fill_(b_d_val)
         
         # Global self-model: running EMA of layer memory centroids
         if global_state is None:
             global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
+        # Global EMA alpha (from avg diff — single cross-layer rate)
+        ema_alpha = AdaptiveController.ema_alpha(self.layers,
+            min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
         
         new_state = []
         self._pred_cache = []
-        for layer, s in zip(self.layers, state):
-            h, s_out = layer(h, s, global_state=global_state, mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale)
+        for i, (layer, s) in enumerate(zip(self.layers, state)):
+            # Per-layer adaptive params
+            l_expl, l_diff = AdaptiveController.layer_stats(layer,
+                expl_thresh=self.cfg.exploration_threshold,
+                diff_thresh=self.cfg.differentiation_threshold)
+            mem2v_scale = AdaptiveController.layer_w_mem2v_scale(layer,
+                min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max,
+                diff=l_diff)
+            nscale = AdaptiveController.layer_noise_scale(layer,
+                min_val=self.cfg.noise_scale_min, max_val=self.cfg.noise_scale_max,
+                diff=l_diff)
+            tanh_bias_mod = AdaptiveController.tanh_bias_modulation(layer, expl=l_expl)
+            spectral_mod = AdaptiveController.spectral_modulation(layer, diff=l_diff)
+            pred_scale_mod = AdaptiveController.pred_scale_mod(layer)
+            
+            h, s_out = layer(h, s, global_state=global_state,
+                             mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
+                             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+                             spectral_mod=spectral_mod)
             if s_out is not None:
                 mem_out = s_out[0]  # (B, D) — layer's final memory state
                 # Update global state: adaptive EMA aggregation
@@ -677,11 +708,14 @@ class WideBindStack(nn.Module):
         """Token indices -> D-space vectors."""
         return self.embed(tokens)
     
-    def compute_loss(self, h, targets, pred_weight=0.1):
-        """h: (B, L, D) -> logits -> cross-entropy + alpha auxiliary loss"""
+    def compute_loss(self, h, targets, pred_weight=None):
+        """h: (B, L, D) -> logits -> cross-entropy + alpha auxiliary loss
+        pred_weight: if None, uses adaptive value from forward pass.
+        """
         logits = self.lm_head(h)
         ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                   targets.reshape(-1), reduction='mean')
+        pw = pred_weight if pred_weight is not None else getattr(self, '_pred_weight', 0.1)
         # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0
         n_pred = 0
@@ -691,7 +725,7 @@ class WideBindStack(nn.Module):
             n_pred = n_pred + 1
         if n_pred > 0:
             pred_loss = pred_loss / n_pred
-        return ce_loss + pred_weight * pred_loss
+        return ce_loss + pw * pred_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -749,19 +783,35 @@ class WideBindStack(nn.Module):
 
 class AdaptiveController:
     """
-    Computes all adaptive hyperparameters from cognitive mirror state.
+    Computes ALL adaptive hyperparameters from cognitive mirror state.
 
     Two fundamental signals drive every parameter:
     ──────────────────────────────────────────────────────────
     exploration = min(1, |mirror| / 0.25)
         How much correction is the mirror applying.
-        High → model is actively adjusting, needs aggressive learning.
-        Low → model is stable, needs conservative parameters.
+        High → model is actively adjusting, needs aggressive config.
+        Low → model is stable, needs conservative config.
 
     differentiation = min(1, var(log_scale) / 0.08)
         How specialized has the mirror become (per-dim scaling).
         High → mirror has learned which dims to trust/suppress.
         Low → mirror hasn't differentiated, still exploring.
+
+    Key design: ALL methods work at per-layer AND global resolution.
+    ``layer_stats(layer)`` → per-layer (expl, diff)
+    ``stats(blocks)`` → global average   (backward compat)
+
+    New intelligent adaptivity:
+    ──────────────────────────
+    - ``pred_weight(blocks)`` — alpha loss weight scales with diff
+      (more temporal learning when mirror has specialized)
+    - ``tanh_bias_modulation(layer)`` — tanh_bias amplified by exploration
+      (more asymmetric correction when actively exploring)
+    - ``spectral_modulation(layer)`` — lambda_k amplified by differentiation
+      (more aggressive freq shaping when experts are specialized)
+    - ``pred_scale_mod(layer)`` — per-expert w_pred_scale modulation
+      from delta_var (experts with volatile dynamics get more
+      temporal teaching signal)
 
     Mathematically derived ranges:
     ──────────────────────────────
@@ -773,75 +823,143 @@ class AdaptiveController:
     w_mem2v_scale ∈ [0.5, 1.0]  (memory contribution)
     ema_alpha ∈ [0.90, 0.99]  (cross-layer memory aggregation)
     noise_scale ∈ [0.001, 0.05]  (parameter noise for exploration)
+    pred_weight ∈ [0.05, 1.0]  (alpha auxiliary loss weight)
+    tanh_bias_mod ∈ [1.0, 1.5]  (exploration amplification)
+    spectral_mod ∈ [0.85, 1.15]  (differentiation frequency shaping)
     """
     @staticmethod
+    def layer_stats(layer, expl_thresh=0.25, diff_thresh=0.08):
+        """Per-layer (exploration, differentiation) from a single block."""
+        m = layer.mirror
+        ls = m.log_scale.data
+        var = ls.var().item()
+        mag = m._last_magnitude.item()
+        return min(1.0, mag / expl_thresh), min(1.0, var / diff_thresh)
+
+    @staticmethod
     def stats(blocks, expl_thresh=0.25, diff_thresh=0.08):
-        """Return (exploration, differentiation) from all blocks' mirrors."""
-        var_sum = mag_sum = 0.0
+        """Global average (exploration, differentiation) across all layers."""
+        expl_sum = diff_sum = 0.0
         for layer in blocks:
-            m = layer.mirror
-            ls = m.log_scale.data
-            var_sum += ls.var().item()
-            mag_sum += m._last_magnitude.item()
+            e, d = AdaptiveController.layer_stats(layer, expl_thresh, diff_thresh)
+            expl_sum += e
+            diff_sum += d
         n = len(blocks)
-        avg_var = var_sum / n
-        avg_mag = mag_sum / n
-        exploration = min(1.0, avg_mag / expl_thresh)
-        differentiation = min(1.0, avg_var / diff_thresh)
-        return exploration, differentiation
+        return expl_sum / n, diff_sum / n
+
+    # ─── Per-layer methods ────────────────────────────────────────
 
     @staticmethod
-    def b_d(blocks):
-        """Decay bias (average across layers). High exploration → shorter memory.
-
-        τ = -1/ln(sigmoid(b_d))
-        Per-layer init: L0=2.0(τ≈7), L31=5.0(τ≈150).
-        Formula: b_d = b_d_max - expl * (b_d_max - b_d_min)
-        so high expl → low b_d → short memory.
-        """
-        expl, _ = AdaptiveController.stats(blocks)
-        return 5.0 - expl * 2.0
+    def layer_b_d(layer, expl=None):
+        """Per-layer decay bias. Layer uses its own exploration."""
+        if expl is None:
+            expl, _ = AdaptiveController.layer_stats(layer)
+        lf = getattr(layer, 'layer_idx', 0) / max(getattr(layer, 'total_layers', 32) - 1, 1)
+        b_d_min = 2.0 + 3.0 * lf
+        b_d_val = 5.0 - expl * (5.0 - b_d_min)
+        return max(2.0, min(5.0, b_d_val))
 
     @staticmethod
-    def b_i(blocks):
-        """Write gate bias. High exploration → more writing (capture corrections).
-
-        i_gate = softplus(b_i) — note: softplus, not sigmoid.
-        b_i=-3.0 → i_gate≈0.049 (low write, model stable)
-        b_i=-1.5 → i_gate≈0.27 (high write, exploring, bounded)
-        """
-        expl, _ = AdaptiveController.stats(blocks)
+    def layer_b_i(layer, expl=None):
+        """Per-layer write gate bias."""
+        if expl is None:
+            expl, _ = AdaptiveController.layer_stats(layer)
         return -3.0 + expl * 1.5
 
     @staticmethod
-    def w_mem2v_scale(blocks, min_val=0.5, max_val=1.0):
-        """Memory contribution scaling. High diff → trust mirror, reduce memory.
-
-        Scale applied to w_mem2v in the enhanced output.
-        min_val = memory cut in half (mirror dominates)
-        max_val = full memory (mirror hasn't specialized)
-        """
-        _, diff = AdaptiveController.stats(blocks)
+    def layer_w_mem2v_scale(layer, min_val=0.5, max_val=1.0, diff=None):
+        """Per-layer memory contribution."""
+        if diff is None:
+            _, diff = AdaptiveController.layer_stats(layer)
         return max_val - diff * (max_val - min_val)
 
     @staticmethod
-    def ema_alpha(blocks, min_val=0.90, max_val=0.99):
-        """Cross-layer global EMA rate. High diff → stable self-model, slow EMA.
+    def layer_noise_scale(layer, min_val=0.001, max_val=0.05, diff=None):
+        """Per-layer parameter noise."""
+        if diff is None:
+            _, diff = AdaptiveController.layer_stats(layer)
+        return max_val - diff * (max_val - min_val)
 
-        min_val = fast update (model still learning)
-        max_val = slow update (model converged)
+    @staticmethod
+    def layer_ema_alpha(layer, min_val=0.90, max_val=0.99, diff=None):
+        """Per-layer EMA rate (for per-layer global_state aggregation)."""
+        if diff is None:
+            _, diff = AdaptiveController.layer_stats(layer)
+        return min_val + diff * (max_val - min_val)
+
+    # ─── New intelligent adaptivity ───────────────────────────────
+
+    @staticmethod
+    def pred_weight(blocks, min_val=0.05, max_val=1.0):
+        """Adaptive alpha auxiliary loss weight.
+
+        When mirror has differentiated (high diff), temporal prediction
+        is more meaningful → increase pred_weight to drive alpha learning.
+        When mirror hasn't specialized, pred would be noise → keep low.
         """
         _, diff = AdaptiveController.stats(blocks)
         return min_val + diff * (max_val - min_val)
 
     @staticmethod
-    def noise_scale(blocks, min_val=0.001, max_val=0.05):
-        """Parameter noise for exploration. Inversely proportional to diff.
+    def tanh_bias_modulation(layer, expl=None):
+        """Scale tanh_bias by exploration.
 
-        Applied as Gaussian noise to VSA gates during training.
-        max_val = high noise (model exploring, low diff)
-        min_val = low noise (model converged, high diff)
+        High exploration → more asymmetric correction needed → amplify.
+        Range: [1.0, 1.5] (at most 50% boost).
         """
+        if expl is None:
+            expl, _ = AdaptiveController.layer_stats(layer)
+        return 1.0 + 0.5 * expl
+
+    @staticmethod
+    def spectral_modulation(layer, diff=None):
+        """Modulate spectral lambda_k by differentiation.
+
+        High diff → mirror has learned structure → amplify spectral
+        contrast (more aggressive frequency shaping).
+        Low diff → flatten spectral response (conservative).
+        Range: [0.85, 1.15].
+        """
+        if diff is None:
+            _, diff = AdaptiveController.layer_stats(layer)
+        return 1.0 + 0.15 * (diff - 0.5) * 2.0  # 0.85 at diff=0, 1.15 at diff=1
+
+    @staticmethod
+    def pred_scale_mod(layer):
+        """Per-expert w_pred_scale modulation from delta_var.
+
+        Experts with volatile K-space dynamics (high delta_var relative
+        to layer average) get more temporal teaching signal.
+        Range: [0.1, 3.0] per expert.
+        """
+        dv = layer.mirror._delta_var
+        dv_mean = dv.mean().clamp(min=1e-8)
+        return (dv / dv_mean).clamp(0.1, 3.0)
+
+    # ─── Global (backward-compat) wrappers ────────────────────────
+
+    @staticmethod
+    def b_d(blocks):
+        expl, _ = AdaptiveController.stats(blocks)
+        return 5.0 - expl * 2.0
+
+    @staticmethod
+    def b_i(blocks):
+        expl, _ = AdaptiveController.stats(blocks)
+        return -3.0 + expl * 1.5
+
+    @staticmethod
+    def w_mem2v_scale(blocks, min_val=0.5, max_val=1.0):
+        _, diff = AdaptiveController.stats(blocks)
+        return max_val - diff * (max_val - min_val)
+
+    @staticmethod
+    def ema_alpha(blocks, min_val=0.90, max_val=0.99):
+        _, diff = AdaptiveController.stats(blocks)
+        return min_val + diff * (max_val - min_val)
+
+    @staticmethod
+    def noise_scale(blocks, min_val=0.001, max_val=0.05):
         _, diff = AdaptiveController.stats(blocks)
         return max_val - diff * (max_val - min_val)
 
