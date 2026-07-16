@@ -188,12 +188,13 @@ class LmHead(nn.Module):
 
 
 class PartitionedHead(nn.Module):
-    """D-space -> vocab logits via segment-addressed readout.
+    """D-space -> vocab logits via segment-addressed readout + per-token bias.
     
     h ∈ ℝᴰ → split по тем же K сегментам, что и в PartitionedEmbedding.
     Каждый сегмент h_k сравнивается со своим readout r_k:
-        logit_v = Σ_k z_{vk} · ⟨h_k, r_k⟩
+        logit_v = Σ_k z_{vk} · ⟨h_k, r_k⟩ + b_v
     
+    b_v — learnable per-token bias (token frequency prior).
     K=32: каждый сегмент выровнен с mirror group (1:1).
     """
     def __init__(self, cfg):
@@ -211,6 +212,8 @@ class PartitionedHead(nn.Module):
         
         self.readout = nn.Parameter(torch.randn(self.K, d))
         nn.init.normal_(self.readout, std=0.02)
+        # Per-token bias: token frequency prior (V params, negligible)
+        self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
     
     def forward(self, h):
         scores = []
@@ -221,7 +224,7 @@ class PartitionedHead(nn.Module):
             r_k = self.readout[k, :d]
             scores.append((h_k * r_k).sum(dim=-1))
         scores = torch.stack(scores, dim=-1)
-        return scores @ self.codes.T
+        return scores @ self.codes.T + self.token_bias.unsqueeze(0).unsqueeze(0)
 
 
 # ─── Grouped Cognitive Mirror (32 эксперта) ────────────────────────────
