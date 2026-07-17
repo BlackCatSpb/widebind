@@ -551,9 +551,10 @@ class WideBindBlock(nn.Module):
         self.w_q = nn.Parameter(torch.full((cfg.D,), 1.0 / math.sqrt(cfg.D)))  # warm read: mem_read ≈ mem_all at init
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         # Linear decay across layers: shallow → short memory, deep → long
+        # Per-channel (D,) — can differentiate via gradient when vsa_b_d_smooth < 1.0
         layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
         b_d_init = 2.0 + 3.0 * layer_frac  # L0: τ≈7, L23: τ≈63, L31: τ≈150
-        self.b_i = nn.Parameter(torch.full((cfg.D,), -2.5))   # i_gate ~0.08 init (was -3.0, ~0.05)
+        self.b_i = nn.Parameter(torch.full((cfg.D,), -2.5))   # i_gate ~0.08 init
         self.b_d = nn.Parameter(torch.full((cfg.D,), b_d_init))
 
         # First moment
@@ -696,9 +697,21 @@ class WideBindStack(nn.Module):
                 
                 # Per-layer gate biases
                 b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
-                b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl)
-                layer.b_i.fill_(b_i_val)
-                layer.b_d.fill_(b_d_val)
+                b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
+                    b_d_max=self.cfg.vsa_b_d_max)
+                # Soft push: lerp towards controller target, not hard overwrite.
+                # This allows per-channel gradient to differentiate b_d/b_i 
+                # while AdaptiveController provides exploration-based baseline.
+                # vsa_b_d_smooth=1.0 → instant overwrite (old behavior)
+                smooth = self.cfg.vsa_b_d_smooth
+                if smooth >= 1.0:
+                    layer.b_i.fill_(b_i_val)
+                    layer.b_d.fill_(b_d_val)
+                else:
+                    b_d_t = torch.tensor(b_d_val, device=layer.b_d.device, dtype=layer.b_d.dtype)
+                    b_i_t = torch.tensor(b_i_val, device=layer.b_i.device, dtype=layer.b_i.dtype)
+                    layer.b_d.data.lerp_(b_d_t, 1.0 - smooth)
+                    layer.b_i.data.lerp_(b_i_t, 1.0 - smooth)
         
         # Global self-model: running EMA of layer memory centroids
         if global_state is None:
@@ -777,7 +790,7 @@ class WideBindStack(nn.Module):
     
     def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None):
         """Optimizer parameter groups with weight decay.
-        Gate biases (b_d, b_i) are excluded — set adaptively by AdaptiveController.
+        b_d/b_i now learnable per-channel via gradient (slow LR).
         Gate weight params get increased lr for faster adaptation."""
         cfg = self.cfg
         lr = lr or cfg.lr
@@ -788,9 +801,11 @@ class WideBindStack(nn.Module):
         no_decay = []
         gate_decay = []
         gate_no_decay = []
+        vsa_bias = []  # b_d, b_i: per-channel, slow LR, no weight decay
         for name, p in self.named_parameters():
             if '.b_d' in name or '.b_i' in name:
-                continue  # adaptive controller handles these
+                vsa_bias.append(p)
+                continue
             is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_mem2v',
                                                '.w_k_mu', '.w_q_mu', '.w_mu_mem',
                                                '.w_u', '.w_v',
@@ -821,6 +836,8 @@ class WideBindStack(nn.Module):
             groups.append({'params': gate_decay, 'lr': lr * gate_lr_mult, 'weight_decay': wd})
         if gate_no_decay:
             groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0})
+        if vsa_bias:
+            groups.append({'params': vsa_bias, 'lr': lr * cfg.vsa_b_lr_mult, 'weight_decay': 0})
         return groups
 
 
@@ -863,11 +880,12 @@ class AdaptiveController:
 
     Mathematically derived ranges (λ_d d=3):
     ────────────────────────────────────────
-    b_d ∈ [b_d_min, 5.0] per layer, where b_d_min = 2.0 + 3.0*layer_frac
+    b_d ∈ [b_d_min, b_d_max] per layer, where b_d_min = 2.0 + 3.0*layer_frac
          expl=1 → b_d = b_d_min (shortest memory)
-         expl=0 → b_d = 5.0 (longest memory)
-         L0: τ≈[7, 150], L31: τ≈[150, 150]
-    b_i  ∈ [-3.0, -1.5] → i_gate ≈ [0.047, 0.18] (write rate via sigmoid)
+         expl=0 → b_d = b_d_max (longest memory, configurable vsa_b_d_max)
+         L0: τ≈[7, 150] (default b_d_max=5.0), up to τ≈160K (b_d_max=12.0)
+         Per-channel via gradient: b_d is (D,) with lerp-slow push to controller target
+    b_i  ∈ [-3.0, -1.5] → i_gate ≈ [0.047, 0.18] (write rate via softplus)
     w_mem2v_scale ∈ [0.544, 1.0]  (memory contribution, λ⁻¹ to 1)
     ema_alpha ∈ [0.974, 0.992]  (cross-layer memory, 1-λ⁻⁶ to 1-λ⁻⁸)
     noise_scale ∈ [0.0076, 0.026]  (parameter noise, λ⁻⁸ to λ⁻⁶)
@@ -898,14 +916,14 @@ class AdaptiveController:
     # ─── Per-layer methods ────────────────────────────────────────
 
     @staticmethod
-    def layer_b_d(layer, expl=None):
+    def layer_b_d(layer, expl=None, b_d_max=5.0):
         """Per-layer decay bias. Layer uses its own exploration."""
         if expl is None:
             expl, _ = AdaptiveController.layer_stats(layer)
         lf = getattr(layer, 'layer_idx', 0) / max(getattr(layer, 'total_layers', 32) - 1, 1)
         b_d_min = 2.0 + 3.0 * lf
-        b_d_val = 5.0 - expl * (5.0 - b_d_min)
-        return max(2.0, min(5.0, b_d_val))
+        b_d_val = b_d_max - expl * (b_d_max - b_d_min)
+        return max(2.0, min(b_d_max, b_d_val))
 
     @staticmethod
     def layer_b_i(layer, expl=None):
@@ -987,9 +1005,9 @@ class AdaptiveController:
     # ─── Global (backward-compat) wrappers ────────────────────────
 
     @staticmethod
-    def b_d(blocks):
+    def b_d(blocks, b_d_max=5.0):
         expl, _ = AdaptiveController.stats(blocks)
-        return 5.0 - expl * 2.0
+        return b_d_max - expl * 2.0
 
     @staticmethod
     def b_i(blocks):

@@ -83,10 +83,13 @@ def analyze_single_checkpoint(ckpt_path):
             d[f'{gate}_std'] = getattr(layer, gate).data.std().item()
         
         # Memory gate biases → actual gate values
-        d['b_i_val'] = layer.b_i.data[0].item()
-        d['b_d_val'] = layer.b_d.data[0].item()
-        d['i_gate'] = torch.sigmoid(layer.b_i.data[0]).item()
-        d['tau'] = -1.0 / math.log(max(torch.sigmoid(layer.b_d.data[0]).item(), 1e-10))
+        # b_d/b_i are (D,) per-channel; show stats across channels
+        d['b_i_val'] = layer.b_i.data.mean().item()
+        d['b_d_val'] = layer.b_d.data.mean().item()
+        d['b_d_std'] = layer.b_d.data.std().item()
+        d['b_i_std'] = layer.b_i.data.std().item()
+        d['i_gate'] = torch.sigmoid(layer.b_i.data).mean().item()
+        d['tau'] = -1.0 / math.log(max(torch.sigmoid(layer.b_d.data).mean().item(), 1e-10))
         
         # VSA vectors
         for vec in ['w_u', 'w_v']:

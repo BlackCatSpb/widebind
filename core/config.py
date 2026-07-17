@@ -87,6 +87,13 @@ class WideBindConfig:
     cov_tau_lo: int = 3
     cov_tau_hi: int = 200
 
+    # VSA long-range memory
+    vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
+    vsa_b_d_smooth: float = 0.999   # per-step lerp rate towards controller target
+                                    # 0.999 = 0.1%/step (τ_lerp≈1000 steps)
+                                    # 1.0 = instant overwrite (old behavior)
+    vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
+
     # Training
     max_steps: int = 500000
     log_interval: int = 100
