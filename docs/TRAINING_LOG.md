@@ -228,4 +228,46 @@
 - D=3584→4096: 293M params
 - Свежий старт (все старые чекпоинты несовместимы)
 
-Новый лог тренировки — см. Сферум/Colab сессию step 20000+.
+## Session 2026-07-17 — Expert Deadlock SOLVED (Bidirectional LR + Alpha Override)
+
+### Архитектура
+- D=4096, G=32, L=32, k=32, d=128, expand=4
+- alpha (G,) — scalar per expert
+- Bidirectional MirrorLR (нет forced cosine)
+- Alpha Warmup Override (0.5→0.25 during warmup)
+- tie_bind=True, tie_mirror_proj=True
+- 150,865,744 params
+
+### Resume с best.pt (step 2000, val_loss=5.92)
+
+| Step | Loss | Val Loss | \|1-alpha\| | gate_var | var(ls) | LR mult |
+|---|---|---|---|---|---|---|
+| 2000 | 7.11 | 5.92 | 0.0077 | 0.0017 | 0.00771 | 0.88 |
+| 2500 | 5.51 | — | 0.0101 | 0.0064 | 0.0078 | 2.34 |
+| 3000 | 4.42 | — | 0.0117 | 0.0197 | 0.0078 | 3.00 |
+| 3500 | 4.16 | — | 0.0127 | 0.0353 | 0.0079 | 3.00 |
+| 4000 | 3.36 | 3.35 | 0.0138 | 0.0481 | 0.0079 | 3.00 |
+| 4500 | 3.15 | — | 0.0135 | 0.0564 | 0.0079 | 3.00 |
+| 5000 | 2.44 | — | 0.0143 | 0.0712 | 0.0079 | 3.00 |
+| 5500 | 1.86 | — | 0.0142 | 0.0746 | 0.0080 | 3.00 |
+| 6000 | 1.72 | **1.90** | 0.0143 | 0.0789 | 0.0080 | 3.00 |
+| 6500 | 1.83 | — | 0.0142 | 0.0766 | 0.0080 | 3.00 |
+| 6900 | 1.64 | — | 0.0147 | 0.0910 | 0.0080 | 3.00 |
+
+### Диагноз (step 6900)
+
+**Что работает ✅:**
+- Expert deadlock полностью решён. Все 32 слоя с |1-alpha| > 0.01.
+- gate_var 0.091 — gate активно дифференцирует экспертов.
+- LR на 3× ceiling — модель ускоряет сама себя.
+- val_loss 1.90 и продолжает падать — нет признаков насыщения.
+- Checkpoint 159 MB (FCF-CPR uint8).
+
+**Что отличается от ожиданий:**
+- `var(ls)` растёт медленно (0.0077→0.0080, +4%) — специализация идёт через gate_var и alpha, не через log_scale.
+- LR упирается в ceiling 3.0 — возможно, стоит поднять `lr_max_ratio`.
+
+### Файлы
+- `core/model.py` — `GroupedCognitiveMirror._alpha_override`, `MirrorLRScheduler` bidirectional logic
+- `notebooks/cloud.ipynb` — упрощённый конструктор MirrorLRScheduler
+- `checkpoints/best.pt` — step 6000, val_loss=1.9035, 159 MB

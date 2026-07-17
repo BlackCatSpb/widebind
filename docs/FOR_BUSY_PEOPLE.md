@@ -73,16 +73,17 @@ token → Sparse Embed (32×112) → [Block × 32] → RMS Norm → LM Head
 
 | Параметр | Значение |
 |----------|----------|
-| Параметров | 293 млн |
+| Параметров | 151 млн |
 | Слоёв | 32 |
 | Размерность D | 4096 |
 | d (подпространство) | 128 (D / G = 4096 / 32) |
 | K-space dim (mirror) | 32 |
 | d/k ratio | 4:1 |
 | VRAM (fp16) | ~0.7 GB |
-| Скорость | ~200 tok/s на T4 (seq_len 128, B=2) |
-| Размер чекпоинта | ~293 MB |
-| Temporal gate | Scalar alpha (G,), не W_pred |
+| Скорость | ~175 tok/s на T4 (seq_len 64, B=2) |
+| Размер чекпоинта | ~159 MB (FCF-CPR) |
+| Temporal gate | Scalar alpha (G,) — учится, не W_pred |
+| LR scheduler | Bidirectional — растёт при специализации |
 
 ---
 
