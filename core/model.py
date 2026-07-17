@@ -267,19 +267,27 @@ class GroupedCognitiveMirror(nn.Module):
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
     def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
-                 delta_var_ema_min=0.8, delta_var_ema_max=0.99):
+                 delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False):
         super().__init__()
         assert D % G == 0
         self.D = D
         self.G = G
         self.k = k
         self.d = D // G
+        self.tie_mirror_proj = tie_mirror_proj
         
         proj_std = 1.0 / (self.d * k) ** 0.25
         
         self.W_proj = nn.Parameter(torch.randn(G, self.d, k) * proj_std)
-        self.W_out = nn.Parameter(torch.randn(G, k, self.d) * proj_std)
-        
+        if tie_mirror_proj:
+            self.register_buffer('W_out', torch.zeros(G, k, self.d))
+            with torch.no_grad():
+                self.W_out.copy_(self.W_proj.permute(0, 2, 1))
+            self._hook = self.register_forward_pre_hook(
+                lambda mod, args: mod._sync_W_out())
+        else:
+            self.W_out = nn.Parameter(torch.randn(G, k, self.d) * proj_std)
+
         self.w_temp = nn.Parameter(torch.randn(G, k))
         self.w_global = nn.Parameter(torch.randn(G, k))
         
@@ -328,6 +336,10 @@ class GroupedCognitiveMirror(nn.Module):
         self.log_skip_alpha = nn.Parameter(torch.full((G,), math.log(0.1)))
         self._delta_var_ema_min = delta_var_ema_min
         self._delta_var_ema_max = delta_var_ema_max
+    
+    def _sync_W_out(self):
+        with torch.no_grad():
+            self.W_out.copy_(self.W_proj.permute(0, 2, 1))
     
     def forward(self, h, mem_all, global_state=None, diff=None,
                 tanh_bias_mod=1.0, pred_scale_mod=None):
@@ -500,6 +512,7 @@ class WideBindBlock(nn.Module):
         self.D = cfg.D
         self.K = cfg.bind_K
         self.layer_idx = layer_idx
+        self.tie_bind = cfg.tie_bind
         
         # Pre-LN weight
         self.register_buffer('pre_ln_w', torch.ones(cfg.D))
@@ -510,12 +523,21 @@ class WideBindBlock(nn.Module):
         self.W_proj = nn.Parameter(torch.randn(cfg.D, cfg.bind_K) * proj_std)
         self.w_u = nn.Parameter(torch.randn(cfg.bind_K))
         self.w_v = nn.Parameter(torch.randn(cfg.bind_K))
-        self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
-        
+        if cfg.tie_bind:
+            self.register_buffer('W_out', torch.zeros(cfg.bind_K, cfg.D))
+            with torch.no_grad():
+                self.W_out.copy_(self.W_proj.T)
+            # sync before each forward
+            self._hook = self.register_forward_pre_hook(
+                lambda mod, args: mod._sync_W_out())
+        else:
+            self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
+
         # Cognitive Mirror (32 эксперта, grouped K-space)
         self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=cfg.mirror_k,
             w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
-            delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max)
+            delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
+            tie_mirror_proj=cfg.tie_mirror_proj)
         
         # ─── VSA Memory (gates) ───
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
@@ -545,6 +567,10 @@ class WideBindBlock(nn.Module):
         
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
+    
+    def _sync_W_out(self):
+        with torch.no_grad():
+            self.W_out.copy_(self.W_proj.T)
     
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,

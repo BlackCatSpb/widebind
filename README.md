@@ -11,6 +11,9 @@
 - **G=16→32** — d/k снижено с 8:1 до 4:1, вдвое сильнее временной сигнал при тех же параметрах.
 - **lo/hi k-space split удалён** — pred_error течёт во все k=32 размерности (+24% движения alpha в абляции).
 - **Root cause подтверждён:** скалярный alpha даёт в 3.1× быстрее обучение temporal dampening, чем baseline `|I-diff|`.
+- **λ-d иерархия (d=3)** — 24 константы (LR, EMA, noise, thresholds, buffer sizes, init stds) выводятся из λ₃≈1.839. Integrated в `config.py` + `AdaptiveController` + `MirrorLRScheduler`.
+- **PH+B (PartitionedHead + per-token bias)** — гибридный readout: `logit_v = Σ_k z_{vk} · ⟨h_k, r_k⟩ + b_v`. +50K params (0.017%), −0.22 loss vs baseline.
+- **tie_bind / tie_mirror_proj** — автоэнкодерное ограничение. `W_out = W_proj^T` (global bind) + mirror `W_out = W_proj^T` (per-expert). ~557K fewer params при D=4096. Включены по умолчанию.
 
 ---
 
@@ -317,6 +320,8 @@ K=32 синхронизирован с архитектурой: bind-канал
 
 **Инициализация — критический момент.** w_u и w_v инициализируются с std=1.0 (не 0.02, как дефолтный PyTorch Linear). Причина: произведение w_u × w_v × W_out масштабируется как std³. При std=0.02, градиент на ините = 0.02³ = 8e-6 — эффективный ноль. При std=1.0, градиент = 1.0³ = 1.0 — полный градиент. Разница в 125,000×.
 
+**tie_bind (по умолчанию True):** При включении `W_out = W_proj^T` — автоэнкодерное ограничение. `W_out` становится буфером (не параметром), синхронизированным с `W_proj.T` через forward_pre_hook. Градиент течёт только в `W_proj`. Экономия `bind_K × D = 64×4096 = 262K` параметров. Бенчмарк: почти без потери loss (−0.22 на D=256), небольшое улучшение самоорганизации (gate_std +8%).
+
 ### 3.5 VSA Vector Memory
 
 **Что делает.** Ведёт пер-слойную векторную память через рекуррентность с гейтами:
@@ -437,6 +442,8 @@ delta = temp + pred_error + smooth + sym + tanh_bias  # (B, L, 32), все k dim
 
 linear = delta @ W_out[g]                   # (B, L, 32) → (B, L, 128)
 mirror_g = tanh(linear) + α_g * linear      # per-expert skip connection
+
+**tie_mirror_proj (по умолчанию True):** `W_out[g] = W_proj[g]^T` — автоэнкодерное ограничение per-expert. `W_out` — буфер, синхронизированный с `W_proj.permute(0,2,1)`. Экономия `G × k × d = 32×32×128 = 131K` параметров на слой, ~4.2M всего. Почти без потери loss.
 mirror_g = mirror_g * exp(log_scale[g])     # per-dim amplitude
 ```
 

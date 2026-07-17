@@ -26,6 +26,10 @@ class WideBindConfig:
     lambda_d: int = 3            # dimension of generalized golden ratio
     lambda_d_enabled: bool = True  # True = apply λ_d derivation in __post_init__
 
+    # Symmetry constraints
+    tie_bind: bool = True  # True = W_out = W_proj^T (autoencoder bind bottleneck)
+    tie_mirror_proj: bool = True  # True = mirror W_out = W_proj^T (per-expert K-space AE)
+
     # Zeckendorf Readout (experimental)
     zeckendorf_readout: bool = False  # True = replace LM head with Zeckendorf tree
 

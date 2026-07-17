@@ -66,13 +66,19 @@ def train(cfg, data_dir, save_dir, resume_path=None):
     # ─── Model ───
     model = WideBindStack(cfg).to(device)
     print(f'Model: {model.param_count():,} params ({model.param_count()/1e6:.2f}M)')
+    print(f'  tie_bind={cfg.tie_bind}  tie_mirror_proj={cfg.tie_mirror_proj}')
+    print(f'  lambda_d={cfg.lambda_d}  bind_K={cfg.bind_K}  mirror_k={cfg.mirror_k}')
 
     # ─── Batch size (auto-fit) ───
     for bs in [2, 1]:
         torch.cuda.empty_cache()
         try:
             x = torch.randint(0, cfg.vocab, (bs, cfg.seq_len), device=device)
-            model.embed_tokens(x); model(x, None)
+            h = model.embed_tokens(x)
+            out, _, _ = model(h, None)
+            out[:, :1].sum().backward()
+            model.zero_grad()
+            del x, h, out
             cfg.batch_size = bs
             print(f'Batch size: {bs}')
             break
