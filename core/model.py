@@ -744,10 +744,6 @@ class WideBindStack(nn.Module):
     def compute_loss(self, h, targets, pred_weight=None):
         """h: (B, L, D) -> logits -> cross-entropy + alpha auxiliary loss
         pred_weight: if None, uses adaptive value from forward pass.
-
-        Alpha auxiliary loss uses Beta(98,2) prior to prevent alpha collapse to 1.0.
-        MSE(pred_k, hp) + Beta_prior(alpha) — байесовский компромисс:
-        данные тянут alpha к 1.0 (trivial MSE solution), а prior держит ~0.98.
         """
         if isinstance(self.lm_head, ZeckendorfReadout):
             B, L, D = h.shape
@@ -759,31 +755,16 @@ class WideBindStack(nn.Module):
             ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                       targets.reshape(-1), reduction='mean')
         pw = pred_weight if pred_weight is not None else getattr(self, '_pred_weight', 0.1)
-        # Alpha auxiliary loss: predict K-space + Beta prior
+        # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0
-        beta_prior_loss = 0.0
         n_pred = 0
         cache = getattr(self, '_pred_cache', [])
         for pred_k, hp in cache:
-            # pred_k: (B, L, G, k) = alpha_g * hp_prev
-            # hp: (B, L, G, k) — current K-space state
-            # Normalized MSE: dimension-free
-            hp_var = hp.var(unbiased=False).mean()
-            pred_loss = pred_loss + F.mse_loss(pred_k, hp.detach()) / (hp_var + 1e-8)
+            pred_loss = pred_loss + F.mse_loss(pred_k, hp.detach())
             n_pred = n_pred + 1
         if n_pred > 0:
             pred_loss = pred_loss / n_pred
-        # Beta(50, 2) prior: mode=(a-1)/(a+b-2)=49/50=0.98
-        # Barrier at alpha→1.0: -(b-1)*log(1-alpha) → +∞
-        # Equilibrium: alpha = (a-1)/(a+b-2) = 0.98 (matches init)
-        a_prior, b_prior = 50.0, 2.0
-        for layer in self.layers:
-            alpha = layer.mirror.alpha  # (G,)
-            log_prior = (a_prior - 1) * alpha.log().mean() + (b_prior - 1) * (1 - alpha).log().mean()
-            beta_prior_loss = beta_prior_loss - log_prior
-        beta_prior_loss = beta_prior_loss / len(self.layers)
-        # beta_prior ~ O(5). Normalize by mirror_k so pw*scale ≈ 0.1*5/32 ≈ 0.016
-        return ce_loss + pw * (pred_loss + beta_prior_loss / self.cfg.mirror_k)
+        return ce_loss + pw * pred_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
