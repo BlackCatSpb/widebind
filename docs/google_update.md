@@ -68,4 +68,36 @@ pip install --force-reinstall --no-deps torch==2.1.0
 | `alpha init` | 0.99 | 0.98 | +60% temporal gradient |
 | `bind_K` | 32 | 64 | Ближе к теорет. оптимуму K≈100 |
 
+Новые изменения:
+
+| Параметр | Описание |
+|---|---|
+| `Bidirectional MirrorLR` | LR растёт при var(ls)/\|1-alpha\|/gate_var↑, падает при сходимости. Нет forced cosine. |
+| `Alpha warmup override` | На время warmup alpha=0.5 (prинудительное обучение экспертов), после warmup отпускается |
+| `scheduler:` | Убраны `lr_min_ratio`, `max_decay_steps`, `var_min_for_lr_decay` — больше не нужны |
+
 Эти изменения активны при создании `WideBindConfig()` без явного override.
+
+### 8. Resume с step_5000
+
+```python
+# Ноутбук автоматически подхватывает последний чекпоинт
+# Для принудительного resume с step_5000:
+latest = os.path.join(cfg.save_dir, 'step_5000.pt')
+if os.path.exists(latest):
+    ckpt = torch.load(latest, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['model'], strict=False)  # strict=False для новых buffer'ов
+    optimizer.load_state_dict(ckpt['optimizer'])
+    scheduler.load_state_dict(ckpt['scheduler'])
+    start_step = ckpt['step']  # 5000
+```
+
+### 9. Ожидания после перезапуска
+
+| Метрика | Что будет |
+|---|---|
+| `|1-alpha|` | За время warmup вырастет до 0.5 (forced). После отпускания — равновесие ~0.05-0.08 |
+| `var(ls)` | Начнёт расти (специализация экспертов) |
+| `gate_var` | Пик 0.03-0.07 (дифференциация), затем спад |
+| `LR` | Плавающий 0.1× — 3.0× от base_lr |
+| `loss` | Может быть выше первое время (alpha далеко от init), но быстро догонит |
