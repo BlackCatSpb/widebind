@@ -1063,7 +1063,7 @@ class MirrorLRScheduler:
             var_sum += ls.var().item()
             mag_sum += m._last_magnitude.item()
             alpha = m.alpha.data
-            alpha_sum += (1.0 - alpha.abs()).mean().item()
+            alpha_sum += (1.0 - alpha).abs().mean().item()
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
