@@ -324,6 +324,9 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
+        # Alpha override: set to 0.5 during warmup to force large pred_error
+        # 0.0 = use learned alpha; >0 = override alpha for all experts
+        self.register_buffer('_alpha_override', torch.zeros(1), persistent=False)
         # Cache for alpha auxiliary loss
         self._cached_pred_k = None
         self._cached_hp = None
@@ -376,7 +379,10 @@ class GroupedCognitiveMirror(nn.Module):
         
         # Predictive: error in K-space self-prediction (t-1 -> t)
         # pred_k = alpha_g * hp_prev — scalar per expert, much stronger gradient
-        pred_k = hp_prev * self.alpha.view(1, 1, G, 1)  # (B, L, G, k)
+        # During warmup, _alpha_override > 0 forces low alpha for large pred_error
+        alpha_eff = self.alpha if self._alpha_override.item() == 0.0 else \
+                    self.alpha.new_full((G,), self._alpha_override.item())
+        pred_k = hp_prev * alpha_eff.view(1, 1, G, 1)  # (B, L, G, k)
         # pred_scale_mod: (G,) per-expert modulator from delta_var
         # Experts with volatile dynamics get more temporal teaching signal
         if pred_scale_mod is None:
@@ -1042,47 +1048,70 @@ class MirrorLRScheduler:
         self._step = 0
         self._last_log = 0
         self._init_var = None  # set on first post-warmup step
+        self._init_1malpha = None
+        self._init_gate_var = None
 
     def _mirror_stats(self):
         var_sum = 0.0
         mag_sum = 0.0
-        for layer in self.model.layers:
-            ls = layer.mirror.log_scale.data
-            var_sum += ls.var().item()
-            mag_sum += layer.mirror._last_magnitude.item()
+        alpha_sum = 0.0
+        gate_var_sum = 0.0
         n = len(self.model.layers)
-        return var_sum / n, mag_sum / n
+        for layer in self.model.layers:
+            m = layer.mirror
+            ls = m.log_scale.data
+            var_sum += ls.var().item()
+            mag_sum += m._last_magnitude.item()
+            alpha = m.alpha.data
+            alpha_sum += (1.0 - alpha.abs()).mean().item()
+            gate_var_sum += m._last_gates.var().item()
+        return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
     def step(self):
         self._step += 1
         if self._step < self.warmup:
             mult = self._step / max(self.warmup, 1)
+            # Phase 1: force low alpha to wake up experts
+            override = 0.5 * (1.0 - 0.5 * mult)  # 0.5 → 0.25 over warmup
+            for layer in self.model.layers:
+                layer.mirror._alpha_override.fill_(override)
         else:
-            var, mag = self._mirror_stats()
+            # Release alpha override after warmup
+            for layer in self.model.layers:
+                layer.mirror._alpha_override.fill_(0.0)
+            var, mag, mean_1malpha, gate_var = self._mirror_stats()
 
-            # Adaptive threshold: LR decays only when var(ls) has grown
-            # significantly above its initialization noise floor.
+            # Baseline capture on first post-warmup step
             if self._init_var is None:
-                self._init_var = var + 1e-10  # first measurement as baseline
-            var_growth = var / self._init_var
-            if var_growth < 2.0:  # need 2x growth from init to trigger decay
-                mirror_mult = 1.0
-            else:
-                decay = 1.0 - min(1.0, var / max(self.target_var, 1e-10))
-                mag_factor = min(1.0, max(self.lr_min_ratio, mag / max(self.mag_threshold, 1e-10)))
-                mirror_mult = max(self.lr_min_ratio, decay * mag_factor)
+                self._init_var = var + 1e-10
+                self._init_1malpha = mean_1malpha + 1e-10
+                self._init_gate_var = gate_var + 1e-10
 
-            # Fallback: forced cosine over full schedule (floored at lr_min_ratio)
-            post_warmup = self._step - self.warmup
-            progress = post_warmup / max(self.max_decay_steps, 1)
-            forced = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-            forced = max(self.lr_min_ratio, forced)
-            mult = min(mirror_mult, forced)
+            # --- var(ls): expert specialization ---
+            var_growth = var / self._init_var
+            var_mult = 1.0
+            if var_growth > 2.0:
+                var_mult = min(2.0, var_growth / 2.0)
+
+            # --- |1-alpha|: temporal structure discovery ---
+            alpha_growth = mean_1malpha / self._init_1malpha
+            alpha_mult = min(2.0, 0.5 + 0.5 * alpha_growth)
+
+            # --- gate_var: expert differentiation ---
+            gate_growth = gate_var / self._init_gate_var
+            gate_mult = min(2.0, 0.5 + 0.5 * gate_growth)
+
+            # --- mirror magnitude cap (prevent blowup) ---
+            mag_factor = min(2.0, max(0.2, mag / max(self.mag_threshold, 1e-10)))
+
+            # Bidirectional multiplier: >1 when learning, <1 when converged
+            mirror_mult = var_mult * alpha_mult * gate_mult * mag_factor
+            mult = max(0.05, min(3.0, mirror_mult))
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
-                print(f'  lr_adapt: var(ls)={var:.6f} |mirror|={mag:.4f} '
-                      f'mirror_mult={mirror_mult:.4f} forced={forced:.4f} '
+                print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
+                      f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
                       f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
 
         for pg in self.optimizer.param_groups:
