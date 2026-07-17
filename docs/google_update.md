@@ -78,19 +78,11 @@ pip install --force-reinstall --no-deps torch==2.1.0
 
 Эти изменения активны при создании `WideBindConfig()` без явного override.
 
-### 8. Resume с step_5000
+### 8. Resume
 
-```python
-# Ноутбук автоматически подхватывает последний чекпоинт
-# Для принудительного resume с step_5000:
-latest = os.path.join(cfg.save_dir, 'step_5000.pt')
-if os.path.exists(latest):
-    ckpt = torch.load(latest, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model'], strict=False)  # strict=False для новых buffer'ов
-    optimizer.load_state_dict(ckpt['optimizer'])
-    scheduler.load_state_dict(ckpt['scheduler'])
-    start_step = ckpt['step']  # 5000
-```
+Ноутбук автоматически подхватывает **последний** чекпоинт (по номеру шага в имени файла): `step_N.pt` с максимальным N. Если такого нет — `best.pt` (содержит шаг сохранения как `step`).
+
+При добавлении новых buffer'ов (`_alpha_override`) в model.py, resume работает через `strict=False`.
 
 ### 9. Ожидания после перезапуска
 
