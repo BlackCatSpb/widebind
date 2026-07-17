@@ -73,8 +73,12 @@ def sparse_block_codes(vocab=50000, K=32, S=6):
 # ─── VSA Prefix Scan ───────────────────────────────────────────────────
 
 def vsa_prefix_scan(a, b, state=None):
-    """Associative parallel prefix scan for VSA memory.
+    """Associative parallel prefix scan for VSA memory (O(L) log-space version).
     mem[t] = a[t] * mem[t-1] + b[t]  (element-wise)
+    
+    Log-space for numerical stability:
+      log_decay_sum[t] = sum_{r=0}^{t} log(a[r])
+      mem[t] = exp(log_decay_sum[t]) * (sum_{s=0}^{t} b[s]/exp(log_decay_sum[s]))
     
     a: (B, L, D) or (B, L) — decay factors
     b: (B, L, D) — input increments
@@ -86,29 +90,22 @@ def vsa_prefix_scan(a, b, state=None):
     if a.dim() == 2:
         a = a.unsqueeze(-1).expand(-1, -1, D)
     
-    if state is not None:
-        a_state = torch.ones(B, 1, D, device=b.device, dtype=b.dtype)
-        b_state = state.unsqueeze(1)
-        a = torch.cat([a_state, a], dim=1)
-        b = torch.cat([b_state, b], dim=1)
+    eps = 1e-10
+    log_a = torch.log(a.clamp(min=eps))
+    log_cum = torch.cumsum(log_a, dim=1)  # (B, L, D)
+    cum_decay = torch.exp(log_cum)
     
-    n = a.shape[1]
-    a_curr, b_curr = a, b
-    step = 1
-    while step < n:
-        a_left = a_curr[:, :step]
-        a_step = a_curr[:, step:]
-        a_prev = a_curr[:, :-step]
-        b_left = b_curr[:, :step]
-        b_step = b_curr[:, step:]
-        b_prev = b_curr[:, :-step]
-        a_curr = torch.cat([a_left, a_step * a_prev], dim=1)
-        b_curr = torch.cat([b_left, b_prev * a_step + b_step], dim=1)
-        step *= 2
+    # Weighted inputs in log space: b[t] * exp(-log_cum[t])
+    weighted = b * torch.exp(-log_cum)
+    cum_weighted = torch.cumsum(weighted, dim=1)
     
     if state is not None:
-        return b_curr[:, 1:], b_curr[:, -1]
-    return b_curr, b_curr[:, -1]
+        state_term = state.unsqueeze(1)  # (B, 1, D)
+        result = cum_decay * (state_term + cum_weighted)
+    else:
+        result = cum_decay * cum_weighted
+    
+    return result, result[:, -1]
 
 
 # ─── Embedding ──────────────────────────────────────────────────────────
@@ -154,9 +151,6 @@ class PartitionedEmbedding(nn.Module):
         D = cfg.D
         assert D % self.K == 0, f'D={D} must be divisible by K={self.K}'
         d = D // self.K
-        self.dims = [d] * self.K
-        offsets = list(range(0, D + 1, d))
-        self.register_buffer('_offsets', torch.tensor(offsets))
         
         self.basis = nn.Parameter(torch.randn(self.K, d))
         nn.init.normal_(self.basis, std=0.02)
@@ -164,13 +158,7 @@ class PartitionedEmbedding(nn.Module):
     def forward(self, tokens):
         codes = self.codes[tokens]
         B, L = tokens.shape
-        D = self._offsets[-1].item()
-        parts = []
-        for k in range(self.K):
-            o = int(self._offsets[k].item())
-            d = self.dims[k]
-            parts.append(codes[:, :, k:k+1] * self.basis[k, :d])
-        return torch.cat(parts, dim=-1)
+        return torch.einsum('blk,kd->blkd', codes, self.basis).reshape(B, L, -1)
 
 
 class LmHead(nn.Module):
@@ -206,9 +194,6 @@ class PartitionedHead(nn.Module):
         D = cfg.D
         assert D % self.K == 0
         d = D // self.K
-        self.dims = [d] * self.K
-        offsets = list(range(0, D + 1, d))
-        self.register_buffer('_offsets', torch.tensor(offsets))
         
         self.readout = nn.Parameter(torch.randn(self.K, d))
         nn.init.normal_(self.readout, std=0.02)
@@ -216,14 +201,9 @@ class PartitionedHead(nn.Module):
         self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
     
     def forward(self, h):
-        scores = []
-        for k in range(self.K):
-            o = int(self._offsets[k].item())
-            d = self.dims[k]
-            h_k = h[:, :, o:o+d]
-            r_k = self.readout[k, :d]
-            scores.append((h_k * r_k).sum(dim=-1))
-        scores = torch.stack(scores, dim=-1)
+        B, L, D = h.shape
+        h_g = h.reshape(B, L, self.K, -1)  # (B, L, K, d)
+        scores = torch.einsum('blkd,kd->blk', h_g, self.readout)
         return scores @ self.codes.T + self.token_bias.unsqueeze(0).unsqueeze(0)
 
 
@@ -291,31 +271,32 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_temp = nn.Parameter(torch.randn(G, k))
         self.w_global = nn.Parameter(torch.randn(G, k))
         
-        # Depthwise conv per group in K-space
-        self.conv_smooth = nn.Conv1d(G * k, G * k, 3, padding=2,
+        # Depthwise conv per group in K-space (CAUSAL: only past tokens)
+        self.conv_smooth = nn.Conv1d(G * k, G * k, 3, padding=0,
                                       groups=G * k, bias=False)
         with torch.no_grad():
-            # dirac_ bug: doesn't fill all channels for grouped convs
             self.conv_smooth.weight.zero_()
-            self.conv_smooth.weight[:, :, 1] = 1.0  # all channels get center dirac
+            self.conv_smooth.weight[:, :, 1] = 1.0  # all channels get center dirac (x_{t-1})
         
         self.w_sym_u = nn.Parameter(torch.randn(G, k))
         self.w_sym_v = nn.Parameter(torch.randn(G, k))
         
-        # Predictive mirror: scalar alpha per expert
-        # pred_k = alpha_g * hp_prev, pred_error ≈ hp - hp_prev (temporal delta)
-        # Scalar alpha (G,) — 1 param per expert vs (G,k,k)=16K params for W_pred
-        # Gives 1024× stronger gradient per param, enabling real W_pred learning
-        self.alpha = nn.Parameter(torch.full((G,), 0.98))
+        # Predictive mirror: per-dim alpha per expert
+        # pred_k = alpha_kg * hp_prev, per K-dimension timescale
+        # Alpha_diag (G, k) — k params per expert vs 1 scalar per expert
+        # Allows each K-dimension to have its own temporal dynamics
+        self.alpha_diag = nn.Parameter(torch.full((G, k), 0.98))
         self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
         
         # ─── K-space gate (per-token, per-expert from hp) ───
-        # w_gate: (G, k) — maps K-state to gate logit per expert
+        # w_gate: (G, k) — maps |pred_error| to gate logit per expert
         gate_std = 1.0 / (self.k + 1) ** 0.5
         self.w_gate = nn.Parameter(torch.randn(G, self.k) * gate_std)
         self.b_gate = nn.Parameter(torch.zeros(G))
+        # w_delta_gate: (G, k) — maps delta (correction) to gate logit
+        self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) * 0.01)
         
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -339,6 +320,23 @@ class GroupedCognitiveMirror(nn.Module):
         self.log_skip_alpha = nn.Parameter(torch.full((G,), math.log(0.1)))
         self._delta_var_ema_min = delta_var_ema_min
         self._delta_var_ema_max = delta_var_ema_max
+
+        # ─── Learnable signal weights (softmax-normalized) ───
+        self._signal_log_weights = nn.Parameter(torch.zeros(4))
+        
+        # ─── Self-organizing usefulness predictor ───
+        # Каждый эксперт предсказывает свою полезность по delta (K-space correction)
+        # и получает право модулировать параметры слоя пропорционально этой оценке
+        self.usefulness_predictor = nn.Sequential(
+            nn.Linear(k, k),
+            nn.Tanh(),
+            nn.Linear(k, 1),
+            nn.Sigmoid()
+        )
+        # Per-expert масштабы модуляции (learned log-scale)
+        # init: log(2.0) → sigmoid=0.67 (was 0.09 — dead), gives gradient room
+        self.mod_scale_mlp = nn.Parameter(torch.full((G,), math.log(2.0)))
+        self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
     
     def _sync_W_out(self):
         with torch.no_grad():
@@ -378,13 +376,14 @@ class GroupedCognitiveMirror(nn.Module):
             temp_k = temp_k + (hp - gs_k) * self.w_global
         
         # Predictive: error in K-space self-prediction (t-1 -> t)
-        # pred_k = alpha_g * hp_prev — scalar per expert, much stronger gradient
-        # During warmup, _alpha_override > 0 forces low alpha for large pred_error
-        alpha_eff = self.alpha if self._alpha_override.item() == 0.0 else \
-                    self.alpha.new_full((G,), self._alpha_override.item())
-        pred_k = hp_prev * alpha_eff.view(1, 1, G, 1)  # (B, L, G, k)
-        # pred_scale_mod: (G,) per-expert modulator from delta_var
-        # Experts with volatile dynamics get more temporal teaching signal
+        # Per-dim alpha: each K-dimension has its own timescale
+        # Alpha override smoothly interpolates: override=1 → identity (α=1),
+        # override=0 → learned alpha_diag. Provides smooth warmup transition.
+        alpha_eff = self.alpha_diag
+        override = self._alpha_override.item()
+        if override > 0:
+            alpha_eff = (1 - override) * alpha_eff + override * 1.0
+        pred_k = hp_prev * alpha_eff.view(1, 1, G, k)  # (B, L, G, k)
         if pred_scale_mod is None:
             dv = self._delta_var
             dv_mean = dv.mean().clamp(min=1e-8)
@@ -394,22 +393,33 @@ class GroupedCognitiveMirror(nn.Module):
         self._cached_hp = hp
         
         # ─── Fast signals (hi half of K-space) ───
-        # Smoothness: local coherence in K-space
+        # Smoothness: local coherence in K-space (CAUSAL: pad left only)
         hp_perm = hp.permute(0, 2, 3, 1).reshape(B, G * k, L)  # (B, G*k, L)
-        hp_smooth = self.conv_smooth(hp_perm)[:, :, :L]
+        hp_pad = F.pad(hp_perm, (2, 0))  # pad 2 zeros on left, 0 on right
+        hp_smooth = self.conv_smooth(hp_pad)  # (B, G*k, L) — kernel sees t-2, t-1, t
         hp_smooth = hp_smooth.reshape(B, G, k, L).permute(0, 3, 1, 2)  # (B, L, G, k)
         smooth_k = hp - hp_smooth
         
         # Symmetry: bilinear temporal interaction
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
-        # ─── Merge all signals (no lo/hi split — full k gradient for pred_error) ───
-        delta = temp_k + pred_error + smooth_k + sym_k
+        # ─── Learnable signal weights (softmax-normalized) ───
+        w = torch.softmax(self._signal_log_weights, dim=0)  # 4 weights summing to 1
+        
+        # ─── Merge all signals (weighted sum) ───
+        delta = (w[0] * temp_k + w[1] * pred_error + 
+                 w[2] * smooth_k + w[3] * sym_k)
         
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
-        # tanh_bias_mod: scale bias by exploration level
-        # More exploration → more asymmetric correction
         delta = delta + self.tanh_bias * tanh_bias_mod
+        
+        # ─── Self-organizing usefulness (per-token, per-expert) ───
+        # Предсказатель смотрит на delta и решает, насколько эксперт полезен
+        usefulness = self.usefulness_predictor(delta).squeeze(-1)  # (B, L, G)
+        
+        # Per-expert modulation strengths (gated by self-assessment)
+        mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
+        mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
         
         # Linear projection + skip connection
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
@@ -418,15 +428,14 @@ class GroupedCognitiveMirror(nn.Module):
         mirror = mirror * torch.exp(self.log_scale)  # per-dim scale
         
         # ─── K-Space Gate (per-token, per-expert) ───
-        # Gate signal: magnitude of prediction error
-        # |pred_error| large → expert is wrong → open gate (apply correction)
-        # |pred_error| small → expert is right → close gate (trust identity)
         gate_signal = torch.abs(pred_error)  # (B, L, G, k)
         gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
+        # Delta signal: how much correction is mirror applying (complements |pred_err|)
+        delta_gate = torch.einsum('blgk,gk->blg', delta, self.w_delta_gate)
+        gate_logits = gate_logits + delta_gate
         grad_mod = torch.exp(self.log_grad_mod_scale) * torch.tanh(self._prev_grad_norm + self.grad_mod_bias)
         gate_logits = gate_logits + grad_mod.unsqueeze(0).unsqueeze(0)
         
-        # Internal delta variance: expert with high variance is actively correcting
         with torch.no_grad():
             dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)  # (G,)
             if diff is not None:
@@ -439,14 +448,14 @@ class GroupedCognitiveMirror(nn.Module):
         
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         
-        mirror = mirror * expert_gate.unsqueeze(-1)  # (B, L, G, d) * (B, L, G, 1)
+        mirror = mirror * expert_gate.unsqueeze(-1)
         mirror = mirror.reshape(B, L, D)
         
         self._last_magnitude.fill_(mirror.abs().mean().item())
         self._last_gates.copy_(expert_gate.detach().mean(dim=(0, 1)))
-        self._last_h_pool.copy_(h_g.detach().mean(dim=(0, 1)))  # (G, d) for live_inference
+        self._last_h_pool.copy_(h_g.detach().mean(dim=(0, 1)))
         
-        return mirror
+        return mirror, mlp_mod, mem_mod
     
     def cache_grad_norms(self, grad_h=None):
         """Call after backward: store per-subspace gradient norm.
@@ -527,6 +536,7 @@ class WideBindBlock(nn.Module):
         # ─── Bind: D -> K -> bilinear -> D ───
         proj_std = 1.0 / (cfg.D * cfg.bind_K) ** 0.25
         self.W_proj = nn.Parameter(torch.randn(cfg.D, cfg.bind_K) * proj_std)
+        self.w_bind_bias = nn.Parameter(torch.zeros(cfg.bind_K))
         self.w_u = nn.Parameter(torch.randn(cfg.bind_K))
         self.w_v = nn.Parameter(torch.randn(cfg.bind_K))
         if cfg.tie_bind:
@@ -602,7 +612,7 @@ class WideBindBlock(nn.Module):
         h = h + h_conv
         
         # ─── Hybrid Bind: D -> K -> bilinear -> D ───
-        hp = h @ self.W_proj          # (B, L, K)
+        hp = h @ self.W_proj + self.w_bind_bias  # (B, L, K) with learnable offset
         u = hp * self.w_u             # (B, L, K)
         v = hp * self.w_v             # (B, L, K)
         bind_out = (u * v) @ self.W_out  # (B, L, D)
@@ -614,29 +624,55 @@ class WideBindBlock(nn.Module):
             noise = 1.0 + noise_scale * torch.randn_like(i_gate)
             i_gate = i_gate * noise
         
-        mem_all, mem_state_out = vsa_prefix_scan(decay, h * i_gate, mem_state)
+        # Shared prefix scan intermediates for mem + mu (same decay)
+        eps = 1e-10
+        log_a = torch.log(decay.clamp(min=eps))
+        log_cum = torch.cumsum(log_a, dim=1)
+        cum_decay = torch.exp(log_cum)
+        inv_cum_decay = torch.exp(-log_cum)
+        
+        def _scan(b, state):
+            weighted = b * inv_cum_decay
+            cum_w = torch.cumsum(weighted, dim=1)
+            if state is not None:
+                result = cum_decay * (state.unsqueeze(1) + cum_w)
+            else:
+                result = cum_decay * cum_w
+            return result, result[:, -1]
+        
+        mem_input = h * i_gate
+        mem_all, mem_state_out = _scan(mem_input, mem_state)
         mem_read = mem_all * self.w_q                    # (B, L, D)
         
-        # First moment
-        mu_all, mu_state_out = vsa_prefix_scan(
-            decay, h * i_gate * self.w_k_mu, mu_state)
+        # First moment (same decay, scaled input)
+        mu_all, mu_state_out = _scan(mem_input * self.w_k_mu, mu_state)
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
         
         # ─── Mirror (self-consistency: local + global) ───
-        mirror = self.mirror(h, mem_all, global_state=global_state, diff=diff,
-                             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod)
+        mirror, mlp_mod, mem_mod = self.mirror(
+            h, mem_all, global_state=global_state, diff=diff,
+            tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod)
         
-        # ─── Output (adaptive memory scale) ───
-        enhanced = bind_out + mem_read * self.w_mem2v * mem2v_scale + mirror
+        # ─── Output (adaptive memory scale, per-group modulation) ───
+        # mem_mod: per-token, per-expert gating of memory contribution
+        mm = mem_mod  # (B, L, G)
+        mm = mm.unsqueeze(-1)  # (B, L, G, 1)
+        g = self.mirror.G
+        d = self.mirror.d
+        mem_modulated = (mem_read.reshape(B, L, g, d) * mm).reshape(B, L, D)
+        enhanced = bind_out + mem_modulated * self.w_mem2v * mem2v_scale + mirror
         h = h + enhanced
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
         h_dct = h @ self.V_dct.T
         h = h + (h_dct * self.lambda_k * spectral_mod) @ self.V_dct
         
-        # ─── MLP ───
-        h = h + self.mlp(h)
+        # ─── MLP (per-group modulation by mlp_mod) ───
+        h_mlp = self.mlp(h)
+        mm2 = mlp_mod.unsqueeze(-1)  # (B, L, G, 1)
+        h_mlp = (h_mlp.reshape(B, L, g, d) * mm2).reshape(B, L, D)
+        h = h + h_mlp
         
         return h, (mem_state_out, mu_state_out, conv_state_out)
 
@@ -663,79 +699,81 @@ class WideBindStack(nn.Module):
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
-    def forward(self, h, state=None, global_state=None, pred_weight=None):
+    def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
            pred_weight: adaptive alpha auxiliary loss weight (or None to compute)
+           adaptive: if True, run AdaptiveController (training); if False, skip for speed (inference)
         """
         if state is None:
             state = [None] * len(self.layers)
         B, L, D = h.shape
         
         # ─── Adaptive gate biases from mirror stats (per-layer) ───
-        with torch.no_grad():
-            # Global stats for cross-layer EMA and pred_weight
-            expl_raw, diff = AdaptiveController.stats(self.layers,
-                expl_thresh=self.cfg.exploration_threshold,
-                diff_thresh=self.cfg.differentiation_threshold)
-            # EMA-smooth exploration: τ ≈ 500 steps (α=0.998)
-            self._expl_ema.mul_(0.998).add_(expl_raw * (1.0 - 0.998))
-            global_expl = self._expl_ema.clamp(0.0, 1.0).item()
-            
-            # Adaptive pred_weight: more temporal learning when mirror specializes
-            self._pred_weight = (pred_weight if pred_weight is not None
-                else AdaptiveController.pred_weight(self.layers,
-                    min_val=0.05, max_val=1.0))
-            
-            n = len(self.layers)
-            for i, layer in enumerate(self.layers):
-                # Per-layer exploration/differentiation (not global avg)
-                l_expl, l_diff = AdaptiveController.layer_stats(layer,
+        if adaptive:
+            with torch.no_grad():
+                expl_raw, diff = AdaptiveController.stats(self.layers,
                     expl_thresh=self.cfg.exploration_threshold,
                     diff_thresh=self.cfg.differentiation_threshold)
+                self._expl_ema.mul_(0.998).add_(expl_raw * (1.0 - 0.998))
+                global_expl = self._expl_ema.clamp(0.0, 1.0).item()
                 
-                # Per-layer gate biases
-                b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
-                b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
-                    b_d_max=self.cfg.vsa_b_d_max)
-                # Soft push: lerp towards controller target, not hard overwrite.
-                # This allows per-channel gradient to differentiate b_d/b_i 
-                # while AdaptiveController provides exploration-based baseline.
-                # vsa_b_d_smooth=1.0 → instant overwrite (old behavior)
-                smooth = self.cfg.vsa_b_d_smooth
-                if smooth >= 1.0:
-                    layer.b_i.fill_(b_i_val)
-                    layer.b_d.fill_(b_d_val)
-                else:
-                    b_d_t = torch.tensor(b_d_val, device=layer.b_d.device, dtype=layer.b_d.dtype)
-                    b_i_t = torch.tensor(b_i_val, device=layer.b_i.device, dtype=layer.b_i.dtype)
-                    layer.b_d.data.lerp_(b_d_t, 1.0 - smooth)
-                    layer.b_i.data.lerp_(b_i_t, 1.0 - smooth)
+                self._pred_weight = (pred_weight if pred_weight is not None
+                    else AdaptiveController.pred_weight(self.layers,
+                        min_val=0.05, max_val=1.0))
+                
+                for i, layer in enumerate(self.layers):
+                    l_expl, l_diff = AdaptiveController.layer_stats(layer,
+                        expl_thresh=self.cfg.exploration_threshold,
+                        diff_thresh=self.cfg.differentiation_threshold)
+                    
+                    b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
+                    b_d_max = getattr(self.cfg, 'vsa_b_d_max', 12.0)
+                    b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
+                        b_d_max=b_d_max)
+                    smooth = getattr(self.cfg, 'vsa_b_d_smooth', 0.999)
+                    if smooth >= 1.0:
+                        layer.b_i.fill_(b_i_val)
+                        layer.b_d.fill_(b_d_val)
+                    else:
+                        b_d_t = torch.tensor(b_d_val, device=layer.b_d.device, dtype=layer.b_d.dtype)
+                        b_i_t = torch.tensor(b_i_val, device=layer.b_i.device, dtype=layer.b_i.dtype)
+                        layer.b_d.data.lerp_(b_d_t, 1.0 - smooth)
+                        layer.b_i.data.lerp_(b_i_t, 1.0 - smooth)
         
         # Global self-model: running EMA of layer memory centroids
         if global_state is None:
             global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
-        # Global EMA alpha (from avg diff — single cross-layer rate)
-        ema_alpha = AdaptiveController.ema_alpha(self.layers,
-            min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
+        if adaptive:
+            ema_alpha = AdaptiveController.ema_alpha(self.layers,
+                min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
+        else:
+            ema_alpha = 0.99
         
         new_state = []
         self._pred_cache = []
         for i, (layer, s) in enumerate(zip(self.layers, state)):
-            # Per-layer adaptive params
-            l_expl, l_diff = AdaptiveController.layer_stats(layer,
-                expl_thresh=self.cfg.exploration_threshold,
-                diff_thresh=self.cfg.differentiation_threshold)
-            mem2v_scale = AdaptiveController.layer_w_mem2v_scale(layer,
-                min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max,
-                diff=l_diff)
-            nscale = AdaptiveController.layer_noise_scale(layer,
-                min_val=self.cfg.noise_scale_min, max_val=self.cfg.noise_scale_max,
-                diff=l_diff)
-            tanh_bias_mod = AdaptiveController.tanh_bias_modulation(layer, expl=l_expl)
-            spectral_mod = AdaptiveController.spectral_modulation(layer, diff=l_diff)
-            pred_scale_mod = AdaptiveController.pred_scale_mod(layer)
+            if adaptive:
+                l_expl, l_diff = AdaptiveController.layer_stats(layer,
+                    expl_thresh=self.cfg.exploration_threshold,
+                    diff_thresh=self.cfg.differentiation_threshold)
+                mem2v_scale = AdaptiveController.layer_w_mem2v_scale(layer,
+                    min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max,
+                    diff=l_diff)
+                nscale = AdaptiveController.layer_noise_scale(layer,
+                    min_val=self.cfg.noise_scale_min, max_val=self.cfg.noise_scale_max,
+                    diff=l_diff)
+                tanh_bias_mod = AdaptiveController.tanh_bias_modulation(layer, expl=l_expl)
+                spectral_mod = AdaptiveController.spectral_modulation(layer, diff=l_diff)
+                pred_scale_mod = AdaptiveController.pred_scale_mod(layer)
+            else:
+                l_expl = l_diff = 0.5
+                mem2v_scale = 1.0
+                nscale = 0.0
+                tanh_bias_mod = 1.0
+                spectral_mod = 1.0
+                pred_scale_mod = None
             
             h, s_out = layer(h, s, global_state=global_state,
                              mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
@@ -749,10 +787,10 @@ class WideBindStack(nn.Module):
                                 (1.0 - ema_alpha) * mem_avg)
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
-            # Collect alpha predictions for auxiliary loss
-            mir = layer.mirror
-            if mir._cached_pred_k is not None and mir._cached_hp is not None:
-                self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
+            if adaptive:
+                mir = layer.mirror
+                if mir._cached_pred_k is not None and mir._cached_hp is not None:
+                    self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
         
         return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state.detach()
     
@@ -812,7 +850,7 @@ class WideBindStack(nn.Module):
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
-                                                '.mirror.alpha', '.mirror.w_pred_scale',
+                                                '.mirror.alpha_diag', '.mirror.w_pred_scale',
                                                '.mirror.w_gate', '.mirror.b_gate',
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
@@ -837,7 +875,8 @@ class WideBindStack(nn.Module):
         if gate_no_decay:
             groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0})
         if vsa_bias:
-            groups.append({'params': vsa_bias, 'lr': lr * cfg.vsa_b_lr_mult, 'weight_decay': 0})
+            vsa_lr_mult = getattr(cfg, 'vsa_b_lr_mult', 0.1)
+            groups.append({'params': vsa_bias, 'lr': lr * vsa_lr_mult, 'weight_decay': 0})
         return groups
 
 
@@ -993,14 +1032,15 @@ class AdaptiveController:
     @staticmethod
     def pred_scale_mod(layer):
         """Per-expert w_pred_scale modulation from delta_var.
-
+        
         Experts with volatile K-space dynamics (high delta_var relative
         to layer average) get more temporal teaching signal.
-        Range: [λ⁻⁴, λ²] = [0.087, 3.38] per expert at d=3.
+        Uses tanh-based soft normalization instead of division to avoid NaN.
+        Range: [0.5, 2.0] centered at 1.0.
         """
         dv = layer.mirror._delta_var
-        dv_mean = dv.mean().clamp(min=1e-8)
-        return (dv / dv_mean).clamp(0.1, 3.0)
+        dv_centered = dv - dv.mean()
+        return (1.0 + 0.5 * torch.tanh(dv_centered)).clamp(0.1, 3.0)
 
     # ─── Global (backward-compat) wrappers ────────────────────────
 
@@ -1033,14 +1073,11 @@ class AdaptiveController:
 class MirrorLRScheduler:
     """LR scheduler modulated by cognitive mirror state dynamics.
 
-    Two signals:
-    1. var(log_scale) — per-dim amplitude divergence. Starts at 0, grows
-       as mirror learns which dimensions to amplify/suppress. LR decays
-       proportionally to var / target_var.
-    2. |mirror| — mean absolute mirror correction magnitude. Large when
-       model is unstable, shrinks at convergence. Caps LR.
-
-    LR_mult = max(λ⁻⁶, (1 - var/target) * min(1, mag/threshold))
+    Growth-ratio multipliers (neutral at growth=1):
+      var/alpha/gate growth  →  LR up when specialization grows, down when stalled
+    mag_factor (cap): |mirror| above threshold → LR reduced (counter-cyclical)
+    Loss damping (persistent): val_loss regression >2% → _loss_lr_factor halved
+      (ReduceLROnPlateau semantics; resets to 1.0 on new best).
     """
     def __init__(self, model, optimizer, base_lr=None, warmup=1000,
                  target_var=0.161, mag_threshold=0.296, lr_min_ratio=0.026,
@@ -1065,9 +1102,12 @@ class MirrorLRScheduler:
         self.var_min_for_lr_decay = var_min_for_lr_decay
         self._step = 0
         self._last_log = 0
-        self._init_var = None  # set on first post-warmup step
+        self._init_var = None
         self._init_1malpha = None
         self._init_gate_var = None
+        self._best_val_loss = float('inf')
+        self._loss_lr_factor = 1.0  # persistent damping factor (1.0 = no damping)
+        self._pending_val_loss = None
 
     def _mirror_stats(self):
         var_sum = 0.0
@@ -1080,57 +1120,94 @@ class MirrorLRScheduler:
             ls = m.log_scale.data
             var_sum += ls.var().item()
             mag_sum += m._last_magnitude.item()
-            alpha = m.alpha.data
+            alpha = m.alpha_diag.data
             alpha_sum += (1.0 - alpha).abs().mean().item()
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
+    def report_val_loss(self, val_loss):
+        """Report validation loss for LR damping. Called from training code after eval."""
+        self._pending_val_loss = val_loss
+
+    def _consume_pending_val_loss(self):
+        """Update persistent damping factor from reported val_loss."""
+        if self._pending_val_loss is None:
+            return
+        vl = self._pending_val_loss
+        self._pending_val_loss = None
+        if vl < self._best_val_loss:
+            if self._loss_lr_factor < 1.0:
+                print(f'  LR RESTORED: val_loss={vl:.4f} new best, factor 1.0')
+            self._best_val_loss = vl
+            self._loss_lr_factor = 1.0
+        elif vl > self._best_val_loss * 1.02:
+            old = self._loss_lr_factor
+            self._loss_lr_factor = max(0.1, self._loss_lr_factor * 0.5)
+            if self._loss_lr_factor < old:
+                print(f'  LR DAMPED: val_loss={vl:.4f} > best={self._best_val_loss:.4f}, '
+                      f'factor {old:.3f} -> {self._loss_lr_factor:.3f}')
+
     def step(self):
         self._step += 1
-        if self._step < self.warmup:
-            mult = self._step / max(self.warmup, 1)
-            # Phase 1: force low alpha to wake up experts
-            override = 0.5 * (1.0 - 0.5 * mult)  # 0.5 → 0.25 over warmup
+        self._consume_pending_val_loss()
+        # Alpha override: smoothly blended into learned alpha_diag by forward()
+        # override=1.0 → 0.0 provides smooth transition from identity to learned
+        warmup_end = self.warmup
+        blend_steps = 50
+        if self._step < warmup_end + blend_steps:
+            if self._step < warmup_end:
+                mult = self._step / max(warmup_end, 1)
+                override = max(0.0, 1.0 - mult * 0.7)  # 1.0 → 0.3
+            else:
+                blend = (self._step - warmup_end) / blend_steps  # 0 → 1
+                override = 0.3 * max(0.0, 1.0 - blend)  # 0.3 → 0.0
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(override)
         else:
-            # Release alpha override after warmup
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(0.0)
             var, mag, mean_1malpha, gate_var = self._mirror_stats()
 
-            # Baseline capture on first post-warmup step
             if self._init_var is None:
                 self._init_var = var + 1e-10
                 self._init_1malpha = mean_1malpha + 1e-10
                 self._init_gate_var = gate_var + 1e-10
 
-            # --- var(ls): expert specialization ---
+            # EMA smoothing to reduce noise (τ~100 steps at 0.99)
+            if not hasattr(self, '_var_ema'):
+                self._var_ema = var
+                self._1malpha_ema = mean_1malpha
+                self._gate_var_ema = gate_var
+            ema = 0.99
+            self._var_ema = ema * self._var_ema + (1 - ema) * var
+            self._1malpha_ema = ema * self._1malpha_ema + (1 - ema) * mean_1malpha
+            self._gate_var_ema = ema * self._gate_var_ema + (1 - ema) * gate_var
+            var, mean_1malpha, gate_var = self._var_ema, self._1malpha_ema, self._gate_var_ema
+
+            # Counter-cyclical multipliers: LR down when volatility grows, up when stagnant
             var_growth = var / self._init_var
-            var_mult = 1.0
-            if var_growth > 2.0:
-                var_mult = min(2.0, var_growth / 2.0)
+            var_mult = min(2.0, max(0.5, 1.0 / max(var_growth, 1e-10)))
 
-            # --- |1-alpha|: temporal structure discovery ---
             alpha_growth = mean_1malpha / self._init_1malpha
-            alpha_mult = min(2.0, 0.5 + 0.5 * alpha_growth)
+            alpha_mult = min(2.0, max(0.5, 1.0 / max(alpha_growth, 1e-10)))
 
-            # --- gate_var: expert differentiation ---
             gate_growth = gate_var / self._init_gate_var
-            gate_mult = min(2.0, 0.5 + 0.5 * gate_growth)
+            gate_mult = min(2.0, max(0.5, 1.0 / max(gate_growth, 1e-10)))
 
-            # --- mirror magnitude cap (prevent blowup) ---
-            mag_factor = min(2.0, max(0.2, mag / max(self.mag_threshold, 1e-10)))
+            # Magnitude cap: |mirror| above threshold reduces LR (counter-cyclical)
+            mag_factor = min(1.0, max(0.2, self.mag_threshold / max(mag, 1e-10)))
 
-            # Bidirectional multiplier: >1 when learning, <1 when converged
             mirror_mult = var_mult * alpha_mult * gate_mult * mag_factor
             mult = max(0.05, min(3.0, mirror_mult))
+
+            # Persistent loss damping applied every step
+            mult *= self._loss_lr_factor
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
                 print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
                       f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
-                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
+                      f'mult={mult:.4f} damp={self._loss_lr_factor:.3f} lr={self.base_lr*mult:.2e}')
 
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.base_lr * mult
@@ -1139,11 +1216,39 @@ class MirrorLRScheduler:
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
     def state_dict(self):
-        return {'step': self._step, 'last_log': self._last_log, 'type': 'MirrorLRScheduler'}
+        return {
+            'step': self._step,
+            'last_log': self._last_log,
+            'type': 'MirrorLRScheduler',
+            'init_var': self._init_var,
+            'init_1malpha': self._init_1malpha,
+            'init_gate_var': self._init_gate_var,
+            'best_val_loss': self._best_val_loss,
+            'loss_lr_factor': self._loss_lr_factor,
+        }
 
     def load_state_dict(self, sd):
         self._step = sd.get('step', 0)
         self._last_log = sd.get('last_log', 0)
+        self._init_var = sd.get('init_var')
+        self._init_1malpha = sd.get('init_1malpha')
+        self._init_gate_var = sd.get('init_gate_var')
+        self._best_val_loss = sd.get('best_val_loss', float('inf'))
+        self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
+
+    def reset_for_new_data(self, reset_warmup_steps=2000):
+        """Call when dataset changes (e.g. switching from ADVENTUR to FANTASY).
+        Resets loss damping and reruns warmup to prevent spurious LR damping."""
+        self._best_val_loss = float('inf')
+        self._loss_lr_factor = 1.0
+        self._pending_val_loss = None
+        self._init_var = None
+        self._init_1malpha = None
+        self._init_gate_var = None
+        if hasattr(self, '_var_ema'):
+            del self._var_ema
+            del self._1malpha_ema
+            del self._gate_var_ema
 
 
 # ─── Verify ────────────────────────────────────────────────────────────

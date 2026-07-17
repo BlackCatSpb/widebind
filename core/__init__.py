@@ -9,7 +9,6 @@ from .model import (
     vsa_prefix_scan,
 )
 from .zeckendorf_readout import ZeckendorfReadout, fibonacci_bases, zeckendorf_code
-from .temporal_zeckendorf import TemporalZeckendorf
 
 from .live_inference import LiveInference, MirrorMonitor
 

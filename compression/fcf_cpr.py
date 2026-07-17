@@ -13,8 +13,13 @@ REMOVABLE_PATTERNS = {'V_dct', 'codes'}
 def is_removable(k):
     return any(p in k for p in REMOVABLE_PATTERNS)
 
-def is_scalar_gate(k):
-    return 'b_i' in k or 'b_d' in k
+def is_scalar_gate(k, v=None):
+    """True for b_i/b_d ONLY if tensor is still uniform (safe to scalar-fold)."""
+    if not ('b_i' in k or 'b_d' in k):
+        return False
+    if v is not None and v.numel() > 1 and v.dtype.is_floating_point and v.std().item() >= 1e-8:
+        return False  # non-uniform — use Tier W quantization instead
+    return True
 
 
 def quantize_tensor(t, n_bits=8):
@@ -38,10 +43,52 @@ def quantize_tensor(t, n_bits=8):
 def dequantize_tensor(indices, t_min, scale, dtype=torch.float32):
     """Restore fp32 from uint8 + min + scale."""
     if indices is None:
-        # Scalar / constant
         return torch.tensor(t_min, dtype=dtype)
     restored = indices.float() * scale + t_min
     return restored.to(dtype)
+
+
+def quantize_tensor_channel(t, dim=0, n_bits=8):
+    """Per-channel uniform quantization: each slice along dim gets own min/scale.
+    For 2D weight (M, N): each row gets 256 levels instead of sharing across all M×N.
+    Returns (indices, mins, scales)."""
+    t_f = t.float()
+    n_levels = 2 ** n_bits
+    n_ch = t_f.shape[dim]
+    view_shape = [t_f.ndim] * n_ch  # fancy indexing not needed
+    mins = []
+    scales = []
+    indices_parts = []
+    for i in range(n_ch):
+        sl = t_f.select(dim, i)
+        sl_min = sl.min().item()
+        sl_max = sl.max().item()
+        if sl_min == sl_max:
+            mins.append(sl_min)
+            scales.append(0.0)
+            idx = torch.full(sl.shape, 0, dtype=torch.uint8, device=t.device)
+        else:
+            sc = (sl_max - sl_min) / (n_levels - 1)
+            idx = ((sl - sl_min) / sc).round_().clamp_(0, n_levels - 1).to(torch.uint8)
+            mins.append(sl_min)
+            scales.append(sc)
+        indices_parts.append(idx.unsqueeze(dim))
+    indices = torch.cat(indices_parts, dim=dim) if n_ch > 0 else t.new_empty(t.shape, dtype=torch.uint8)
+    return indices, torch.tensor(mins), torch.tensor(scales)
+
+
+def dequantize_tensor_channel(indices, mins, scales, orig_shape, dtype=torch.float32):
+    """Restore fp32 from per-channel uint8 + mins + scales."""
+    restored = torch.zeros(orig_shape, dtype=dtype)
+    n_ch = mins.shape[0]
+    dim = 0 if orig_shape[0] == n_ch else (1 if len(orig_shape) > 1 and orig_shape[1] == n_ch else 0)
+    for i in range(n_ch):
+        if scales[i] == 0.0:
+            sl = torch.full((orig_shape[1] if dim == 0 else orig_shape[0],), mins[i].item(), dtype=dtype)
+        else:
+            sl = indices.select(dim, i).float() * scales[i] + mins[i]
+        restored.select(dim, i).copy_(sl)
+    return restored
 
 
 def analyze_sd(sd):
@@ -57,7 +104,7 @@ def analyze_sd(sd):
     for k, v in sd.items():
         if is_removable(k):
             groups['removable'].append((k, v))
-        elif is_scalar_gate(k):
+        elif is_scalar_gate(k, v):
             groups['scalar_gates'].append((k, v))
         elif v.numel() == 1 or (v.dtype.is_floating_point and v.std().item() < 1e-8 and v.numel() > 1):
             groups['constant'].append((k, v))
@@ -115,35 +162,44 @@ class FCF_CPR:
             if is_removable(k):
                 continue  # skip entirely
             
-            if is_scalar_gate(k):
+            if is_scalar_gate(k, v):
                 result[k] = v[0:1].clone()
                 meta[k] = ('scalar', v.shape, v.dtype)
                 continue
             
             if v.numel() > 1 and v.dtype.is_floating_point and v.std().item() < 1e-8:
-                # Constant tensor: store as scalar
                 val = v[0:1].clone()
                 result[k] = val
                 meta[k] = ('scalar', v.shape, v.dtype)
                 continue
             
             if not v.dtype.is_floating_point:
-                # Non-float tensor: store as-is
                 result[k] = v.clone()
                 meta[k] = ('scalar', v.shape, v.dtype)
                 continue
             
-            # Uniform 8-bit quantization per tensor
-            indices, t_min, scale = quantize_tensor(v, n_bits=8)
-            if indices is None:
-                val = torch.tensor([t_min], dtype=torch.float32)
-                if v.ndim == 0:
-                    val = val.squeeze(0)  # preserve 0-dim scalar
-                result[k] = val
-                meta[k] = ('scalar', v.shape, v.dtype)
-            else:
+            # Per-channel quantization for 2D weight tensors (row-wise)
+            if v.ndim == 2 and v.shape[0] >= 16 and v.shape[1] >= 8:
+                indices, mins, scales = quantize_tensor_channel(v, dim=0, n_bits=8)
                 result[k] = indices
-                meta[k] = ('uniform8', v.shape, v.dtype, t_min, scale)
+                meta[k] = ('uniform8_channel', v.shape, v.dtype, mins, scales, 0)
+            elif v.ndim == 3 and v.shape[0] >= 4:
+                # Grouped tensors: per-group along dim=0
+                indices, mins, scales = quantize_tensor_channel(v, dim=0, n_bits=8)
+                result[k] = indices
+                meta[k] = ('uniform8_channel', v.shape, v.dtype, mins, scales, 0)
+            else:
+                # Per-tensor quantization for small/single-dim tensors
+                indices, t_min, scale = quantize_tensor(v, n_bits=8)
+                if indices is None:
+                    val = torch.tensor([t_min], dtype=torch.float32)
+                    if v.ndim == 0:
+                        val = val.squeeze(0)
+                    result[k] = val
+                    meta[k] = ('scalar', v.shape, v.dtype)
+                else:
+                    result[k] = indices
+                    meta[k] = ('uniform8', v.shape, v.dtype, t_min, scale)
         
         return result, meta
     
@@ -171,6 +227,9 @@ class FCF_CPR:
             elif info[0] == 'uniform8':
                 shape, dtype, t_min, scale = info[1], info[2], info[3], info[4]
                 sd[k] = dequantize_tensor(v, t_min, scale, dtype)
+            elif info[0] == 'uniform8_channel':
+                shape, dtype, mins, scales, dim = info[1], info[2], info[3], info[4], info[5]
+                sd[k] = dequantize_tensor_channel(v, mins, scales, shape, dtype)
         
         # Re-add deterministic buffers
         for i in range(n_layers):

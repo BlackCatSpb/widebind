@@ -1,7 +1,8 @@
 """Zeckendorf tree readout with learnable centroids.
 
 Port from fcp/ld_model/readout.py with WideBind adaptations.
-Replaces DxV LM head with tree-structured decoder (K levels, ~86K params).
+Replaces DxV LM head with tree-structured decoder (K levels, K*4*D params;
+K=24, D=4096 -> 393K params).
 """
 
 import torch
@@ -9,13 +10,19 @@ import torch.nn.functional as F
 
 
 def fibonacci_bases(vocab_size: int) -> list[int]:
-    """Fibonacci numbers up to vocab_size (Zeckendorf bases).
+    """Fibonacci numbers for Zeckendorf coding, minimising phantom leaves.
 
     F[0]=1, F[1]=2, F[k]=F[k-1]+F[k-2].
-    Covers tokens 0..V-1 iff F_K - 1 >= V-1.
+    Number of codewords of length K = F_{K+2} (F_0=0, F_1=1).
+    Stops when max_representable (F_{K+1} - 1 in our numbering) >= V-1,
+    avoiding the extra base that adds ~F_{K} phantom leaves.
+    For V=50000 this gives K=23 (33% phantoms) vs old K=24 (59%).
     """
     fibs = [1, 2]
-    while fibs[-1] < vocab_size:
+    while True:
+        max_repr = fibs[-1] + (fibs[-2] if len(fibs) > 1 else 1) - 1
+        if max_repr >= vocab_size - 1:
+            break
         fibs.append(fibs[-1] + fibs[-2])
     return fibs
 
@@ -145,6 +152,8 @@ class ZeckendorfReadout(torch.nn.Module):
         log_probs = torch.zeros(B, Vp, device=h.device)
         for k in range(K):
             log_probs += log_p_flat[:, k, combined_idx[:, k]]
+        # Renormalise over valid tokens: remove phantom leaf mass
+        log_probs = log_probs - log_probs.logsumexp(dim=-1, keepdim=True)
         return log_probs
 
     def predict(self, h: torch.Tensor, greedy: bool = True,
@@ -171,22 +180,29 @@ class ZeckendorfReadout(torch.nn.Module):
 
         tokens = torch.zeros(B, dtype=torch.long, device=device)
         fibs = self.fibs
+        max_id = self.vocab - 1
 
         for b in range(B):
             state = 0
             token_id = 0
             for k in range(K):
+                # MSB-first: level k holds the coefficient of fibs[K-1-k]
+                f = fibs[K - 1 - k].item()
                 p1 = probs[b, k, state, 1]
-                if state == 1:
+                # Prune phantom branches: bit=1 allowed only if the partial
+                # sum stays in vocab (prefix sums of a valid code never
+                # exceed the token value, so this prunes exactly phantoms).
+                can_one = (state == 0) and (token_id + f <= max_id)
+                if not can_one:
                     bit = 0
                 elif greedy:
                     bit = 1 if p1 > 0.5 else 0
                 else:
                     bit = 1 if torch.rand(1, device=device).item() < p1.item() else 0
                 if bit:
-                    token_id += fibs[k].item()
+                    token_id += f
                 state = bit
-            tokens[b] = min(token_id, self.vocab - 1)
+            tokens[b] = token_id
 
         return tokens
 

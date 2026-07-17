@@ -271,3 +271,68 @@
 - `core/model.py` — `GroupedCognitiveMirror._alpha_override`, `MirrorLRScheduler` bidirectional logic
 - `notebooks/cloud.ipynb` — упрощённый конструктор MirrorLRScheduler
 - `checkpoints/best.pt` — step 6000, val_loss=1.9035, 159 MB
+
+### Step 30000 — step_30000.pt
+| Metric | Value |
+|--------|-------|
+| Step | 30000 |
+| best_val_loss | 1.5277031564712524 |
+| alpha deviation from 1 | 0.0439 |
+| alpha mean / std | 1.015 / 0.0064 |
+| skip_alpha mean | 0.6693 |
+| var(log_scale) mean | 0.015965 |
+| log_scale sigma mean | 0.0948 |
+| MLP eff_rank mean | 99.6 |
+| Bind rank mean | 29.8 |
+| tau range | [8, 149] |
+| i_gate | 0.182 |
+| w_pred_scale mu | 3.025 |
+| log_dvar_mod_scale | -0.793 |
+| log_grad_mod_scale | -0.794 |
+| Exploration | 1.0000 |
+| Differentiation | 0.102411 |
+| Output std (fwd) | 0.9999 |
+| Weights std | 0.3087 |
+
+### Step 35000 — step_35000.pt
+| Metric | Value |
+|--------|-------|
+| Step | 35000 |
+| best_val_loss | 1.5277031564712524 |
+| alpha deviation from 1 | 0.0435 |
+| alpha mean / std | 1.014 / 0.0061 |
+| skip_alpha mean | 0.6585 |
+| var(log_scale) mean | 0.015971 |
+| log_scale sigma mean | 0.0949 |
+| MLP eff_rank mean | 99.5 |
+| Bind rank mean | 29.8 |
+| tau range | [8, 149] |
+| i_gate | 0.182 |
+| w_pred_scale mu | 3.025 |
+| log_dvar_mod_scale | -0.801 |
+| log_grad_mod_scale | -0.802 |
+| Exploration | 1.0000 |
+| Differentiation | 0.102646 |
+| Output std (fwd) | 0.9999 |
+| Weights std | 0.3091 |
+
+### Step 50000 — step_50000.pt
+| Metric | Value |
+|--------|-------|
+| Step | 50000 |
+| best_val_loss | 1.5020 |
+| alpha deviation from 1 | 0.0167 |
+| skip_alpha mean | 0.6382 |
+| var(log_scale) mean | 0.016025 |
+| log_scale sigma mean | 0.1266 |
+| MLP eff_rank mean | 99.5 |
+| tau range | [8, 149] |
+| i_gate | 0.1824 |
+| w_pred_scale mu | 3.025 |
+| log_dvar_mod_scale | -2.255 |
+| log_grad_mod_scale | -2.256 |
+| Exploration | 1.0000 |
+| Differentiation | 0.103805 |
+| Output std (fwd) | 1.0000 |
+
+**Диагноз:** Переобучение на ADVENTUR. alpha deviation упал с 0.0435→0.0167 (эксперты коллапсируют), val_loss 1.50→3.08. log_dvar_mod_scale −0.801→−2.255 — AdaptiveController отключил модуляцию. Требуется FANTASY для кросс-доменного обучения.

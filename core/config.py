@@ -19,7 +19,7 @@ class WideBindConfig:
     lr: float = 3e-4
     warmup_steps: int = 1000
     weight_decay: float = 0.01
-    grad_clip: float = 1.0
+    grad_clip: float = 0.5
     dtype: str = 'float32'
 
     # ─── λ_d hierarchy ─────────────────────────────────────────
@@ -32,9 +32,6 @@ class WideBindConfig:
 
     # Zeckendorf Readout (experimental)
     zeckendorf_readout: bool = False  # True = replace LM head with Zeckendorf tree
-
-    # Temporal Zeckendorf (experimental)
-    temporal_zeckendorf: bool = False  # True = use Zeckendorf-based temporal decay
 
     # Embed
     code_dim: int = 32
