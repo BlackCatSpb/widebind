@@ -39,6 +39,7 @@ class WideBindConfig:
 
     # Mirror
     mirror_k: int = 32
+    mirror_k_staircase: bool = True  # True = k_l∈{4,8,16} по третям глубины
     w_pred_scale_init: float = 3.0
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
@@ -66,6 +67,7 @@ class WideBindConfig:
 
     # Optimizer
     gate_lr_mult: float = 5.0
+    lambda_lr_hierarchy: bool = True  # True = LR mult по степеням λ_d^p
 
     # Init stds
     w_d_init_std: float = 0.1

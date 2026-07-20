@@ -168,8 +168,15 @@ def train(cfg=None, resume_path=None):
                 offset = 0
                 state = None  # reset state on stream switch (document boundary)
             
+            # ─── Multi-scale seq curriculum: чередование длины батча по октавам τ ───
+            # L=64 (τ≤32, октавы 0–13): 7/9 шагов
+            # L=256 (τ≤92, октавы 14–23): 1/9 шагов
+            # L=512 (τ≤149, октавы 24–31): 1/9 шагов
+            seq_pool = [64, 64, 64, 64, 64, 64, 64, 256, 512]
+            seq_len = seq_pool[step % len(seq_pool)]
+            
             stream = streams[stream_idx]
-            x, y, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, offset)
+            x, y, offset = stream.get_batch(seq_len, cfg.batch_size, offset)
             if offset == 0:
                 continue  # retry with new random stream
             
@@ -191,7 +198,7 @@ def train(cfg=None, resume_path=None):
             optimizer.step()
             scheduler.step()
             
-            tokens_seen += cfg.batch_size * cfg.seq_len
+            tokens_seen += cfg.batch_size * seq_len
             current_lr = scheduler.get_last_lr()[0]
             
             # ─── EOS-aware state reset: if batch ends with EOS (token 2),

@@ -480,6 +480,7 @@ def test_config_param_groups_multipliers():
     from core.config import WideBindConfig
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8,
                          lambda_d_enabled=False,
+                         lambda_lr_hierarchy=False,
                          gate_lr_mult=3.0)
     model = WideBindStack(cfg)
     groups = model.param_groups(1e-4)

@@ -628,7 +628,19 @@ class WideBindBlock(nn.Module):
             self.W_out = nn.Parameter(torch.randn(cfg.bind_K, cfg.D) * proj_std)
 
         # Cognitive Mirror (32 эксперта, grouped K-space)
-        self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=cfg.mirror_k,
+        if getattr(cfg, 'mirror_k_staircase', False):
+            # Иерархия k_l: 4/8/16 по третям глубины, d/k_l ∈ {32,16,8}
+            n = cfg.n_layers
+            l = layer_idx
+            if l < n // 3:
+                k = 4
+            elif l < (2 * n) // 3:
+                k = 8
+            else:
+                k = 16
+        else:
+            k = cfg.mirror_k
+        self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=k,
             w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
             tie_mirror_proj=cfg.tie_mirror_proj)
@@ -1043,19 +1055,79 @@ class WideBindStack(nn.Module):
         return sum(p.numel() for p in self.parameters())
     
     def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None):
-        """Optimizer parameter groups with weight decay.
-        b_d/b_i now learnable per-channel via gradient (slow LR).
-        Gate weight params get increased lr for faster adaptation."""
+        """Optimizer parameter groups with λ_d LR hierarchy or legacy flat groups.
+        
+        When cfg.lambda_lr_hierarchy=True (default), groups follow λ_d^p:
+          p=-2: embedding, readout       (0.29×)
+          p=-1: MLP cores, bind W_proj   (0.54×)
+          p= 0: conv, norm, W_out, head  (1.00×)
+          p=+1: mirror projections, α    (1.84×)
+          p=+2: gates, w_i, b_i, etc     (3.38×)
+          vsa:  b_d, b_i                 (λ^{-4} ≈ 0.087×)
+        """
         cfg = self.cfg
         lr = lr or cfg.lr
         wd = weight_decay or cfg.weight_decay
-        gate_lr_mult = cfg.gate_lr_mult if gate_lr_mult is None else gate_lr_mult
         
+        if getattr(cfg, 'lambda_lr_hierarchy', False):
+            from .lambda_utils import lambda_d
+            lam = lambda_d(cfg.lambda_d)
+            mlr = {
+                'embed': lam ** (-2),
+                'mlp': lam ** (-1),
+                'vsa': lam ** (-4),
+                'mirror': lam ** (1),
+                'gate': lam ** (2),
+            }
+            groups = {
+                'embed':    {'params': [], 'lr': lr * mlr['embed'], 'weight_decay': 0},
+                'embed_wd': {'params': [], 'lr': lr * mlr['embed'], 'weight_decay': wd},
+                'mlp':      {'params': [], 'lr': lr * mlr['mlp'],   'weight_decay': 0},
+                'mlp_wd':   {'params': [], 'lr': lr * mlr['mlp'],   'weight_decay': wd},
+                'mirror':   {'params': [], 'lr': lr * mlr['mirror'],'weight_decay': 0},
+                'mirror_wd':{'params': [], 'lr': lr * mlr['mirror'],'weight_decay': wd},
+                'gate':     {'params': [], 'lr': lr * mlr['gate'],  'weight_decay': 0},
+                'gate_wd':  {'params': [], 'lr': lr * mlr['gate'],  'weight_decay': wd},
+                'vsa':      {'params': [], 'lr': lr * mlr['vsa'],   'weight_decay': 0},
+                'default':  {'params': [], 'lr': lr,                'weight_decay': 0},
+                'default_wd':{'params': [], 'lr': lr,               'weight_decay': wd},
+            }
+            for name, p in self.named_parameters():
+                if '.b_d' in name or '.b_i' in name:
+                    groups['vsa']['params'].append(p)
+                elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
+                    k = 'embed_wd' if p.ndim >= 2 else 'embed'
+                    groups[k]['params'].append(p)
+                elif '.mlp.' in name or name.endswith('.W_proj') or name.endswith('.W_out'):
+                    # Block-level W_proj/W_out (not mirror) → mlp speed
+                    k = 'mlp_wd' if p.ndim >= 2 else 'mlp'
+                    groups[k]['params'].append(p)
+                elif any(g in name for g in ['.w_gate', '.b_gate', '.w_delta_gate', '.b_delta_gate',
+                                              '.w_i', '.w_d', '.w_q', '.w_mem2v',
+                                              '.w_k_mu', '.w_q_mu', '.w_mu_mem',
+                                              '.w_u', '.w_v']):
+                    k = 'gate_wd' if p.ndim >= 2 else 'gate'
+                    groups[k]['params'].append(p)
+                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale',
+                                              '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
+                                              '.mirror.w_temp', '.mirror.w_global',
+                                              '.mirror.log_scale', '.mirror.tanh_bias',
+                                              '.log_dvar_mod_scale', '.dvar_mod_bias',
+                                              '.log_grad_mod_scale', '.grad_mod_bias']):
+                    k = 'mirror_wd' if p.ndim >= 2 else 'mirror'
+                    groups[k]['params'].append(p)
+                else:
+                    k = 'default_wd' if p.ndim >= 2 else 'default'
+                    groups[k]['params'].append(p)
+            return [v for v in groups.values() if v['params']]
+        
+        # ─── Legacy groups (lambda_lr_hierarchy=False) ───
+        gate_lr_mult = cfg.gate_lr_mult if gate_lr_mult is None else gate_lr_mult
         decay = []
         no_decay = []
         gate_decay = []
         gate_no_decay = []
-        vsa_bias = []  # b_d, b_i: per-channel, slow LR, no weight decay
+        vsa_bias = []
         for name, p in self.named_parameters():
             if '.b_d' in name or '.b_i' in name:
                 vsa_bias.append(p)
@@ -1066,7 +1138,7 @@ class WideBindStack(nn.Module):
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
-                                                '.mirror.alpha_diag', '.mirror.w_pred_scale',
+                                               '.mirror.alpha_diag', '.mirror.w_pred_scale',
                                                '.mirror.w_gate', '.mirror.b_gate',
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
@@ -1081,7 +1153,6 @@ class WideBindStack(nn.Module):
                     no_decay.append(p)
                 else:
                     decay.append(p)
-        
         groups = [
             {'params': decay, 'lr': lr, 'weight_decay': wd},
             {'params': no_decay, 'lr': lr, 'weight_decay': 0},
