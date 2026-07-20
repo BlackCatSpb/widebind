@@ -88,6 +88,8 @@ class WideBindConfig:
     gate_l1_weight: float = 0.001   # L1 penalty on expert gates (0=disabled)
     # Expert reinforcement: align gate with usefulness prediction
     reinforce_weight: float = 0.01  # MSE(gate, usefulness) aux loss weight
+    # Load balancing: encourages uniform expert usage across tokens
+    balance_weight: float = 0.01  # CV(gate_usage) aux loss weight (0=disabled)
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

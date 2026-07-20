@@ -475,6 +475,8 @@ class GroupedCognitiveMirror(nn.Module):
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
         self._cached_gate_l1 = expert_gate.mean()
+        # Cache per-expert mean gate for load balancing loss
+        self._cached_gate_usage = expert_gate.mean(dim=(0, 1))  # (G,)
         # Cache for expert reinforcement loss (gate vs usefulness alignment)
         self._cached_usefulness = usefulness
         self._cached_gate = expert_gate.detach()
@@ -882,9 +884,25 @@ class WideBindStack(nn.Module):
         if n_reinf > 0:
             reinforce_loss = reinforce_loss / n_reinf
         
+        # Load balancing: encourage uniform expert usage across tokens
+        # CV of per-expert usage = std/mean — lower means all experts used equally
+        balance_loss = 0.0
+        n_bal = 0
+        for layer in self.layers:
+            usage = getattr(layer.mirror, '_cached_gate_usage', None)
+            if usage is not None:
+                usage_p = usage / (usage.sum() + 1e-10)
+                ue = -(usage_p * torch.log(usage_p + 1e-10)).sum()
+                logG = math.log(usage.shape[-1])
+                balance_loss = balance_loss + (logG - ue) / logG
+                n_bal = n_bal + 1
+        if n_bal > 0:
+            balance_loss = balance_loss / n_bal
+        
         l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
         reinforce_weight = getattr(self.cfg, 'reinforce_weight', 0.01)
-        return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss
+        balance_weight = getattr(self.cfg, 'balance_weight', 0.01)
+        return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss + balance_weight * balance_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
