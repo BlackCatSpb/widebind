@@ -402,18 +402,18 @@ class GroupedCognitiveMirror(nn.Module):
             dv_mean = dv.mean().clamp(min=1e-8)
             pred_scale_mod = (dv / dv_mean).clamp(0.1, 3.0)
         pred_error = (hp - pred_k) * self.w_pred_scale * pred_scale_mod.view(G, 1)
-        # Adaptive tau: alpha_diag подстраивается под статистику остатков предсказания.
-        # Только после warmup (override≈0) — в warmup alpha управляется alpha_override.
-        # sigmoid(1 - rel_var): rel_var=0.5 → α=0.62, rel_var=2.0 → α=0.27
+        # Adaptive tau: K-измерения с высокой ошибкой → короткое τ, с низкой → длинное.
+        # alpha_target = sigmoid(2.2 - log(rel_var)):
+        #   rel_var=1 (noise) → α=0.9 (init), rel_var=0.5 → α=0.95, rel_var=2 → α=0.82
         with torch.no_grad():
             override = self._alpha_override.item()
-            if override < 0.1:  # только после warmup
-                residual_var = pred_error.var(dim=(0, 1), unbiased=False)  # (G, k)
+            if override < 0.1:
+                residual_var = pred_error.var(dim=(0, 1), unbiased=False)
                 self._residual_var_ema.lerp_(residual_var, 0.01)
                 rv = self._residual_var_ema
                 rv_mean = rv.mean(dim=-1, keepdim=True)
                 relative_var = rv / (rv_mean + 1e-10)
-                alpha_target = torch.sigmoid(1.0 - relative_var)
+                alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
                 self.alpha_diag.data.lerp_(alpha_target, 0.0005)
         self._cached_pred_k = pred_k
         self._cached_hp = hp
@@ -461,9 +461,9 @@ class GroupedCognitiveMirror(nn.Module):
             override = self._alpha_override.item()
             if override < 0.1:  # только после warmup
                 u_entropy = -(usefulness * torch.log(usefulness + 1e-10)).sum(dim=-1).mean()
-                target_ent = 0.7 * math.log(G)
+                target_ent = 0.75 * math.log(G)
                 temp_err = u_entropy - target_ent
-                self._usefulness_temp.data.add_(-0.002 * temp_err * self._usefulness_temp.data)
+                self._usefulness_temp.data.add_(-0.001 * temp_err * self._usefulness_temp.data)
                 self._usefulness_temp.data.clamp_(min=0.3, max=4.0)
         
         # Per-expert modulation strengths (gated by self-assessment)
