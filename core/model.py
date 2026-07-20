@@ -403,17 +403,18 @@ class GroupedCognitiveMirror(nn.Module):
             pred_scale_mod = (dv / dv_mean).clamp(0.1, 3.0)
         pred_error = (hp - pred_k) * self.w_pred_scale * pred_scale_mod.view(G, 1)
         # Adaptive tau: alpha_diag подстраивается под статистику остатков предсказания.
-        # K-измерения с высокой ошибкой → быстрое изменение → короткое τ (низкий α).
-        # С низкой ошибкой → медленное изменение → длинное τ (высокий α).
+        # Только после warmup (override≈0) — в warmup alpha управляется alpha_override.
         # sigmoid(1 - rel_var): rel_var=0.5 → α=0.62, rel_var=2.0 → α=0.27
         with torch.no_grad():
-            residual_var = pred_error.var(dim=(0, 1), unbiased=False)  # (G, k)
-            self._residual_var_ema.lerp_(residual_var, 0.01)
-            rv = self._residual_var_ema
-            rv_mean = rv.mean(dim=-1, keepdim=True)  # (G, 1)
-            relative_var = rv / (rv_mean + 1e-10)
-            alpha_target = torch.sigmoid(1.0 - relative_var)
-            self.alpha_diag.data.lerp_(alpha_target, 0.0005)
+            override = self._alpha_override.item()
+            if override < 0.1:  # только после warmup
+                residual_var = pred_error.var(dim=(0, 1), unbiased=False)  # (G, k)
+                self._residual_var_ema.lerp_(residual_var, 0.01)
+                rv = self._residual_var_ema
+                rv_mean = rv.mean(dim=-1, keepdim=True)
+                relative_var = rv / (rv_mean + 1e-10)
+                alpha_target = torch.sigmoid(1.0 - relative_var)
+                self.alpha_diag.data.lerp_(alpha_target, 0.0005)
         self._cached_pred_k = pred_k
         self._cached_hp = hp
         
@@ -450,21 +451,20 @@ class GroupedCognitiveMirror(nn.Module):
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
         
         # ─── Self-organizing usefulness (competitive softmax) ───
-        # Предсказатель смотрит на delta + |pred_error| + градиентные сигналы.
+        # Предсказатель смотрит на delta и решает, насколько эксперт полезен.
         # Softmax по G: эксперты конкурируют — только лучшие получают вес.
-        # Enriched input: те же сигналы, что у gate, + нелинейность MLP
         usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)  # (B, L, G)
-        usefulness_logits = usefulness_logits + grad_mod.unsqueeze(0).unsqueeze(0)
-        usefulness_logits = usefulness_logits + dvar_mod.unsqueeze(0).unsqueeze(0)
         temp = self._usefulness_temp.clamp(min=0.1)
         usefulness = F.softmax(usefulness_logits / temp, dim=-1)
-        # Homeostatic temperature: энтропия usefulness управляет остротой конкуренции
+        # Homeostatic temperature (after warmup): энтропия управляет остротой конкуренции
         with torch.no_grad():
-            u_entropy = -(usefulness * torch.log(usefulness + 1e-10)).sum(dim=-1).mean()
-            target_ent = 0.6 * math.log(G)  # 60% от макс энтропии
-            temp_err = u_entropy - target_ent
-            self._usefulness_temp.data.add_(-0.005 * temp_err * self._usefulness_temp.data)
-            self._usefulness_temp.data.clamp_(min=0.3, max=4.0)
+            override = self._alpha_override.item()
+            if override < 0.1:  # только после warmup
+                u_entropy = -(usefulness * torch.log(usefulness + 1e-10)).sum(dim=-1).mean()
+                target_ent = 0.7 * math.log(G)
+                temp_err = u_entropy - target_ent
+                self._usefulness_temp.data.add_(-0.002 * temp_err * self._usefulness_temp.data)
+                self._usefulness_temp.data.clamp_(min=0.3, max=4.0)
         
         # Per-expert modulation strengths (gated by self-assessment)
         mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
@@ -1255,8 +1255,17 @@ class MirrorLRScheduler:
             else:
                 blend = (self._step - warmup_end) / blend_steps  # 0 → 1
                 override = 0.3 * max(0.0, 1.0 - blend)  # 0.3 → 0.0
+            # Temperature annealing during warmup (homeostatica接管 after warmup)
+            temp_max, temp_min = 2.0, 0.5
+            if self._step < warmup_end:
+                t = self._step / max(warmup_end, 1)
+                temp = temp_max - t * (temp_max - temp_min)
+            else:
+                blend = min(1.0, (self._step - warmup_end) / blend_steps)
+                temp = temp_min + (1.0 - blend) * (temp_max - temp_min) * 0.3
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(override)
+                layer.mirror._usefulness_temp.fill_(max(temp, 0.1))
         else:
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(0.0)
