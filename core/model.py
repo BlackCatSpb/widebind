@@ -688,6 +688,8 @@ class WideBindBlock(nn.Module):
         self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate (shared across scales)
         self.w_d = nn.Parameter(torch.randn(cfg.D) * cfg.w_d_init_std)    # content-dependent decay modulation
         self.w_q = nn.Parameter(torch.full((cfg.D,), 1.0 / math.sqrt(cfg.D)))  # warm read: mem_read ≈ mem_all at init
+        self.w_q_leaf = nn.Parameter(torch.full((cfg.D,), 1.0 / math.sqrt(cfg.D)))  # leaf-level within-chunk read
+        self.w_q_ctx = nn.Parameter(torch.full((cfg.D,), 0.5 / math.sqrt(cfg.D)))  # cross-chunk context read
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         # Per-scale per-channel combination weights (logits for softmax)
         self.scale_w = nn.Parameter(torch.zeros(self._n_scales, cfg.D))
@@ -787,45 +789,89 @@ class WideBindBlock(nn.Module):
         
         eps = 1e-10
         CHUNK = 32
-        def _scan(b, state):
-            B, L = b.shape[0], b.shape[1]
-            out = []
-            s = state.clone() if state is not None else None
-            for start in range(0, L, CHUNK):
-                end = min(start + CHUNK, L)
-                b_chunk = b[:, start:end]
-                decay_chunk = decay[:, start:end]
-                log_a_chunk = torch.log(decay_chunk.clamp(min=eps))
-                log_cum_chunk = torch.cumsum(log_a_chunk, dim=1)
-                cum_decay_chunk = torch.exp(log_cum_chunk)
-                inv_cum_decay_chunk = torch.exp(-log_cum_chunk)
-                weighted = b_chunk * inv_cum_decay_chunk
-                cum_w = torch.cumsum(weighted, dim=1)
-                if s is not None:
-                    result_chunk = cum_decay_chunk * s.unsqueeze(1) + cum_decay_chunk * cum_w
-                else:
-                    result_chunk = cum_decay_chunk * cum_w
-                out.append(result_chunk)
-                s = result_chunk[:, -1]
-            result = torch.cat(out, dim=1)
-            return result, result[:, -1]
         
+        # fp32 guard for log-space scan (critical under AMP for long memory)
+        _dtype = decay.dtype
+        decay_f32 = decay.float()
+        input_vec_f32 = input_vec.float()
         if mem_state is not None:
-            mem_state = mem_state.reshape(B, S * D)
-        mem_all_vec, mem_state_out_vec = _scan(input_vec, mem_state)
-        mem_all_vec = mem_all_vec.reshape(B, L, S, D)  # (B, L, S, D)
+            mem_state_f32 = mem_state.reshape(B, S * D).float()
+        else:
+            mem_state_f32 = None
+        
+        def _scan_chunk(b_chunk, d_chunk):
+            """Parallel chunk scan from zero state.
+            Returns intra-chunk VSA (B, chunk_len, S*D), final state (B, 1, S*D),
+            cumulative decay (B, chunk_len, S*D).
+            """
+            log_a = torch.log(d_chunk.clamp(min=eps))
+            log_cum = torch.cumsum(log_a, dim=1)
+            cum_decay = torch.exp(log_cum)
+            inv_cum = torch.exp(-log_cum)
+            weighted = b_chunk * inv_cum
+            cum_w = torch.cumsum(weighted, dim=1)
+            intra = cum_decay * cum_w
+            final = intra[:, -1:]
+            return intra, final, cum_decay
+        
+        def _combine_chunks(chunk_data, initial_state):
+            """2nd-level: cross-chunk prefix scan over K chunk states.
+            chunk_data: list of (intra, final, cum_decay) per chunk
+            Returns combined (B, L, S*D), final_state (B, S*D), leaf (B, L, S*D).
+            """
+            inter_decay = torch.cat([cd[:, -1:] for _, _, cd in chunk_data], dim=1)
+            inter_input = torch.cat([f for _, f, _ in chunk_data], dim=1)
+            s = initial_state.clone() if initial_state is not None else torch.zeros_like(inter_input[:, 0])
+            cross_states = []
+            for k in range(len(chunk_data)):
+                cross_states.append(s.unsqueeze(1))  # state at start of chunk k
+                s = inter_decay[:, k] * s + inter_input[:, k]  # state at end of chunk k
+            cross = torch.cat(cross_states, dim=1)
+            combined_pieces = []
+            leaf_pieces = []
+            for k, (intra_k, _, cum_decay_k) in enumerate(chunk_data):
+                cross_k = cross[:, k:k+1]
+                combined_pieces.append(cross_k * cum_decay_k + intra_k)
+                leaf_pieces.append(intra_k)
+            combined = torch.cat(combined_pieces, dim=1)
+            leaf = torch.cat(leaf_pieces, dim=1)
+            return combined, combined[:, -1], leaf
+        
+        # Level 1: parallel chunk scans from zero
+        chunks = []
+        for start in range(0, L, CHUNK):
+            end = min(start + CHUNK, L)
+            intra, final, cum_decay = _scan_chunk(input_vec_f32[:, start:end], decay_f32[:, start:end])
+            chunks.append((intra, final, cum_decay))
+        
+        mem_all_vec, mem_state_out_vec, mem_leaf_vec = _combine_chunks(chunks, mem_state_f32)
+        # Cast back to original dtype
+        mem_all_vec = mem_all_vec.to(_dtype)
+        mem_state_out_vec = mem_state_out_vec.to(_dtype)
+        mem_leaf_vec = mem_leaf_vec.to(_dtype)
+        
+        mem_all_vec = mem_all_vec.view(B, L, S, D)  # (B, L, S, D)
+        mem_leaf_vec = mem_leaf_vec.view(B, L, S, D)  # leaf: within-chunk only
+        
         # Weighted combination: softmax over scales per channel
         w = F.softmax(self.scale_w, dim=0)  # (S, D)
         mem_all = (mem_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, L, D)
-        mem_read = mem_all * self.w_q                    # (B, L, D)
+        mem_leaf = (mem_leaf_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, L, D) — без кросс-чанк контекста
+        # Dual read: leaf (within-chunk, 100% покрытие) + context (cross-chunk)
+        mem_read = mem_all * self.w_q + mem_leaf * self.w_q_leaf + mem_all * self.w_q_ctx
         mem_state_out = mem_state_out_vec.reshape(B, S * D)
         
         # First moment (same multi-scale decay, scaled input)
         if mu_state is not None:
             mu_state = mu_state.reshape(B, S * D)
         mu_input_vec = (mem_input * self.w_k_mu).unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
-        mu_all_vec, mu_state_out_vec = _scan(mu_input_vec, mu_state)
-        mu_all_vec = mu_all_vec.reshape(B, L, S, D)
+        mu_chunks = []
+        for start in range(0, L, CHUNK):
+            end = min(start + CHUNK, L)
+            intra, final, cum_decay = _scan_chunk(mu_input_vec[:, start:end], decay[:, start:end])
+            mu_chunks.append((intra, final, cum_decay))
+        mu_all_vec, mu_state_out_vec, _ = _combine_chunks(mu_chunks, mu_state)
+        mu_all_vec = mu_all_vec.view(B, L, S, D)
         mu_all = (mu_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
@@ -1006,14 +1052,17 @@ class WideBindStack(nn.Module):
             logits = self.lm_head(h)
             ce = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                  targets.reshape(-1), reduction='none')
+            # PAD/EOS masking: ignore special tokens (0=PAD, 2=EOS)
+            mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
+            ce = ce * mask.float()
             # Surprisal-weighted loss: w_t = (CE_t / mean(CE))^γ
             sw = getattr(self.cfg, 'surprisal_weight', 0.0)
             if self.training and sw > 0:
                 with torch.no_grad():
                     w = (ce / (ce.mean() + 1e-8)).clamp(max=10.0) ** sw
-                ce_loss = (ce * w).mean()
+                ce_loss = (ce * w).sum() / mask.sum().clamp(min=1)
             else:
-                ce_loss = ce.mean()
+                ce_loss = ce.sum() / mask.sum().clamp(min=1)
         pw = pred_weight if pred_weight is not None else getattr(self, '_pred_weight', 0.1)
         # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0
@@ -1209,7 +1258,7 @@ class WideBindStack(nn.Module):
                     k = 'mlp_wd' if p.ndim >= 2 else 'mlp'
                     groups[k]['params'].append(p)
                 elif any(g in name for g in ['.w_gate', '.b_gate', '.w_delta_gate', '.b_delta_gate',
-                                              '.w_i', '.w_d', '.w_q', '.w_mem2v',
+                                              '.w_i', '.w_d', '.w_q', '.w_q_leaf', '.w_q_ctx', '.w_mem2v',
                                               '.w_k_mu', '.w_q_mu', '.w_mu_mem',
                                               '.w_u', '.w_v']):
                     k = 'gate_wd' if p.ndim >= 2 else 'gate'
@@ -1238,7 +1287,7 @@ class WideBindStack(nn.Module):
             if '.b_d' in name or '.b_i' in name:
                 vsa_bias.append(p)
                 continue
-            is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_mem2v',
+            is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_q_leaf', '.w_q_ctx', '.w_mem2v',
                                                '.w_k_mu', '.w_q_mu', '.w_mu_mem',
                                                '.w_u', '.w_v',
                                                '.tanh_bias', '.log_scale',

@@ -115,6 +115,9 @@ class WideBindConfig:
                                     # 1.0 = instant overwrite (old behavior)
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
+    # Gradient accumulation
+    accum_steps: int = 1  # effective batch = batch_size * seq_len * accum_steps
+
     # Training
     max_steps: int = 500000
     log_interval: int = 100

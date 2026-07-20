@@ -157,15 +157,18 @@ def train(cfg, drive_path=None):
 
     # ─── Training ───
     state = None
+    accum_state = None
     stream_idx = 0
     offset = 0
     tokens_seen = 0
     t0 = time.time()
     rng = torch.Generator().manual_seed(42)
+    accum_steps = getattr(cfg, 'accum_steps', 1)
 
     print(f'Starting training from step {start_step}')
     print(f'  Steps: {start_step} → {cfg.max_steps} ({cfg.max_steps - start_step} remaining)')
     print(f'  Tokens per step: {cfg.batch_size * cfg.seq_len}')
+    print(f'  Gradient accumulation: {accum_steps} (effective batch: {cfg.batch_size * cfg.seq_len * accum_steps})')
 
     try:
         for step in range(start_step, cfg.max_steps):
@@ -184,33 +187,41 @@ def train(cfg, drive_path=None):
 
             x, y = x.to(device), y.to(device)
 
-            # EOS-aware state reset
+            # Soft EOS state reset: затухание, а не обнуление
             if (y[:, -1] == 2).any():
-                state = None
+                if state is not None:
+                    state = tuple(s * 0.1 for s in state)
+                if accum_state is not None:
+                    accum_state = tuple(s * 0.1 for s in accum_state)
 
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 h = model.embed_tokens(x)
                 out, state, _ = model(h, state)
                 loss = model.compute_loss(out, y)
+                loss = loss / accum_steps
 
             if scaler:
                 scaler.scale(loss).backward()
-                if cfg.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
-                if cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                optimizer.step()
-
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
 
             tokens_seen += cfg.batch_size * cfg.seq_len
-            current_lr = scheduler.get_last_lr()[0]
+
+            if (step + 1) % accum_steps == 0:
+                if scaler:
+                    if cfg.grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if cfg.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
+            current_lr = scheduler.get_last_lr()[0] if (step + 1) % accum_steps == 0 else 0
 
             if step % cfg.log_interval == 0:
                 dt = time.time() - t0

@@ -201,10 +201,10 @@ def train(cfg=None, resume_path=None):
             tokens_seen += cfg.batch_size * seq_len
             current_lr = scheduler.get_last_lr()[0]
             
-            # ─── EOS-aware state reset: if batch ends with EOS (token 2),
-            # reset state so next batch doesn't learn cross-document dependencies ───
+            # ─── Soft EOS-aware state reset: затухание вместо обнуления ───
             if (y[:, -1] == 2).any():
-                state = None
+                if state is not None:
+                    state = tuple(s * 0.1 for s in state)
             
             # Log
             if step % cfg.log_interval == 0:
