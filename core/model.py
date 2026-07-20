@@ -320,6 +320,8 @@ class GroupedCognitiveMirror(nn.Module):
         # Cache for alpha auxiliary loss
         self._cached_pred_k = None
         self._cached_hp = None
+        # Residual variance EMA for adaptive tau (self-organizing timescales)
+        self.register_buffer('_residual_var_ema', torch.ones(G, k) * 0.1, persistent=False)
         
         # ─── Per-expert learned modulation ───
         self.log_dvar_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
@@ -400,6 +402,17 @@ class GroupedCognitiveMirror(nn.Module):
             dv_mean = dv.mean().clamp(min=1e-8)
             pred_scale_mod = (dv / dv_mean).clamp(0.1, 3.0)
         pred_error = (hp - pred_k) * self.w_pred_scale * pred_scale_mod.view(G, 1)
+        # Adaptive tau: alpha_diag подстраивается под статистику остатков предсказания.
+        # K-измерения с высокой ошибкой → быстрое изменение → короткое τ (низкий α).
+        # С низкой ошибкой → медленное изменение → длинное τ (высокий α).
+        with torch.no_grad():
+            residual_var = pred_error.var(dim=(0, 1), unbiased=False)  # (G, k)
+            self._residual_var_ema.lerp_(residual_var, 0.01)
+            rv = self._residual_var_ema
+            rv_mean = rv.mean(dim=-1, keepdim=True)  # (G, 1) — средняя дисперсия по K-измерениям
+            relative_var = rv / (rv_mean + 1e-10)
+            alpha_target = torch.exp(-relative_var)  # high var → low α, low var → high α
+            self.alpha_diag.data.lerp_(alpha_target, 0.001)
         self._cached_pred_k = pred_k
         self._cached_hp = hp
         
