@@ -593,9 +593,14 @@ class WideBindBlock(nn.Module):
                               padding=cfg.conv_kernel - 1, groups=cfg.D, bias=False)
         nn.init.normal_(self.conv.weight, std=cfg.conv_init_std)
         
-        # ─── Spectral ───
+        # ─── Spectral (self-organizing frequency filters) ───
         self.register_buffer('V_dct', dct_basis(cfg.D))
-        lam = torch.full((cfg.D,), 0.5 + layer_idx / max(cfg.n_layers - 1, 1))
+        base = 0.5 + layer_idx / max(cfg.n_layers - 1, 1)
+        # Per-dim variation: low frequencies get slight boost, high get slight cut
+        # Creates natural 1/f-like distribution encouraging frequency band separation
+        freq_scale = torch.linspace(1.0, 0.5, cfg.D)  # DC amp=1, Nyquist=0.5
+        per_dim = freq_scale * 0.2  # 20% variation across freq spectrum
+        lam = torch.full((cfg.D,), base) + per_dim
         self.lambda_k = nn.Parameter(lam)
         
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
