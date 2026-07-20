@@ -333,19 +333,21 @@ class GroupedCognitiveMirror(nn.Module):
         # ─── Learnable signal weights (softmax-normalized) ───
         self._signal_log_weights = nn.Parameter(torch.zeros(4))
         
-        # ─── Self-organizing usefulness predictor ───
+        # ─── Self-organizing usefulness predictor (competitive) ───
         # Каждый эксперт предсказывает свою полезность по delta (K-space correction)
-        # и получает право модулировать параметры слоя пропорционально этой оценке
+        # Softmax по G: эксперты конкурируют за право модулировать слой.
+        # Только лучшие эксперты для данного токена получают высокий вес.
+        # init: без Sigmoid — raw logits для softmax-конкуренции
         self.usefulness_predictor = nn.Sequential(
             nn.Linear(k, k),
             nn.Tanh(),
             nn.Linear(k, 1),
-            nn.Sigmoid()
         )
         # Per-expert масштабы модуляции (learned log-scale)
-        # init: log(2.0) → sigmoid=0.67 (was 0.09 — dead), gives gradient room
         self.mod_scale_mlp = nn.Parameter(torch.full((G,), math.log(2.0)))
         self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
+        # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
+        self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)
     
     def _sync_W_out(self):
         with torch.no_grad():
@@ -422,9 +424,12 @@ class GroupedCognitiveMirror(nn.Module):
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
         delta = delta + self.tanh_bias * tanh_bias_mod
         
-        # ─── Self-organizing usefulness (per-token, per-expert) ───
-        # Предсказатель смотрит на delta и решает, насколько эксперт полезен
-        usefulness = self.usefulness_predictor(delta).squeeze(-1)  # (B, L, G)
+        # ─── Self-organizing usefulness (competitive softmax) ───
+        # Предсказатель смотрит на delta и решает, насколько эксперт полезен.
+        # Softmax по G: эксперты конкурируют — только лучшие получают вес.
+        usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)  # (B, L, G)
+        temp = self._usefulness_temp.clamp(min=0.1)
+        usefulness = F.softmax(usefulness_logits / temp, dim=-1)
         
         # Per-expert modulation strengths (gated by self-assessment)
         mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
@@ -1170,11 +1175,23 @@ class MirrorLRScheduler:
             else:
                 blend = (self._step - warmup_end) / blend_steps  # 0 → 1
                 override = 0.3 * max(0.0, 1.0 - blend)  # 0.3 → 0.0
+            # Temperature annealing: 2.0 → 0.5 during warmup (sigmoid cool-down)
+            # High T = uniform competition (all experts equal)
+            # Low T = sharp specialization (winner-take-all)
+            temp_max, temp_min = 2.0, 0.5
+            if self._step < warmup_end:
+                t = self._step / max(warmup_end, 1)
+                temp = temp_max - t * (temp_max - temp_min)
+            else:
+                blend = min(1.0, (self._step - warmup_end) / blend_steps)
+                temp = temp_min + (1.0 - blend) * (temp_max - temp_min) * 0.3
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(override)
+                layer.mirror._usefulness_temp.fill_(max(temp, 0.1))
         else:
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(0.0)
+                layer.mirror._usefulness_temp.fill_(0.5)
             var, mag, mean_1malpha, gate_var = self._mirror_stats()
 
             if self._init_var is None:
