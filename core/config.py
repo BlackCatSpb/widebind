@@ -86,6 +86,8 @@ class WideBindConfig:
 
     # Gate sparsity (auxiliary loss weight for expert specialization)
     gate_l1_weight: float = 0.001   # L1 penalty on expert gates (0=disabled)
+    # Expert reinforcement: align gate with usefulness prediction
+    reinforce_weight: float = 0.01  # MSE(gate, usefulness) aux loss weight
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

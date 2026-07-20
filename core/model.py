@@ -463,6 +463,9 @@ class GroupedCognitiveMirror(nn.Module):
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
         self._cached_gate_l1 = expert_gate.mean()
+        # Cache for expert reinforcement loss (gate vs usefulness alignment)
+        self._cached_usefulness = usefulness
+        self._cached_gate = expert_gate.detach()
         
         mirror = mirror * expert_gate.unsqueeze(-1)
         mirror = mirror.reshape(B, L, D)
@@ -844,7 +847,6 @@ class WideBindStack(nn.Module):
             pred_loss = pred_loss / n_pred
         
         # Gate L1 sparsity: encourages expert specialization
-        # Only experts with high gate are active; others pushed to zero
         gate_l1 = 0.0
         n_gates = 0
         for layer in self.layers:
@@ -855,8 +857,22 @@ class WideBindStack(nn.Module):
         if n_gates > 0:
             gate_l1 = gate_l1 / n_gates
         
+        # Expert reinforcement: align gate with usefulness (self-consistency)
+        # High usefulness → high gate should follow (reinforcing correct self-assessment)
+        reinforce_loss = 0.0
+        n_reinf = 0
+        for layer in self.layers:
+            u = getattr(layer.mirror, '_cached_usefulness', None)
+            g = getattr(layer.mirror, '_cached_gate', None)
+            if u is not None and g is not None:
+                reinforce_loss = reinforce_loss + F.mse_loss(u, g)
+                n_reinf = n_reinf + 1
+        if n_reinf > 0:
+            reinforce_loss = reinforce_loss / n_reinf
+        
         l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
-        return ce_loss + pw * pred_loss + l1_weight * gate_l1
+        reinforce_weight = getattr(self.cfg, 'reinforce_weight', 0.01)
+        return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
