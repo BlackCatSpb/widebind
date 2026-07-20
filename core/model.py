@@ -450,19 +450,24 @@ class GroupedCognitiveMirror(nn.Module):
             self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
         
-        # ─── Self-organizing usefulness (competitive softmax) ───
-        # Предсказатель смотрит на delta и решает, насколько эксперт полезен.
-        # Softmax по G: эксперты конкурируют — только лучшие получают вес.
+        # ─── Self-organizing usefulness (sigmoid + adaptive threshold) ───
+        # Каждый эксперт предсказывает свою полезность по delta (K-space correction).
+        # Sigmoid + median threshold: конкуренция без zero-sum (sum≠1).
+        # Эксперты выше медианы получают >0.5, ниже — <0.5.
         usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)  # (B, L, G)
         temp = self._usefulness_temp.clamp(min=0.1)
-        usefulness = F.softmax(usefulness_logits / temp, dim=-1)
-        # Homeostatic temperature (after warmup): энтропия управляет остротой конкуренции
+        with torch.no_grad():
+            threshold = usefulness_logits.median(dim=-1, keepdim=True).values  # (B, L, 1)
+        usefulness = torch.sigmoid((usefulness_logits - threshold) / temp)
+        # Homeostatic temperature (after warmup): бинарная энтропия управляет остротой
         with torch.no_grad():
             override = self._alpha_override.item()
-            if override < 0.1:  # только после warmup
-                u_entropy = -(usefulness * torch.log(usefulness + 1e-10)).sum(dim=-1).mean()
-                target_ent = 0.75 * math.log(G)
-                temp_err = u_entropy - target_ent
+            if override < 0.1:
+                u_ent = -(usefulness * torch.log(usefulness + 1e-10) +
+                          (1 - usefulness) * torch.log(1 - usefulness + 1e-10))
+                u_ent_mean = u_ent.sum(dim=-1).mean()
+                target_ent = 0.75 * G * 0.693  # ~0.75*G*log(2)
+                temp_err = u_ent_mean - target_ent
                 self._usefulness_temp.data.add_(-0.001 * temp_err * self._usefulness_temp.data)
                 self._usefulness_temp.data.clamp_(min=0.3, max=4.0)
         
