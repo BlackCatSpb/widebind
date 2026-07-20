@@ -283,9 +283,18 @@ class GroupedCognitiveMirror(nn.Module):
         
         # Predictive mirror: per-dim alpha per expert
         # pred_k = alpha_kg * hp_prev, per K-dimension timescale
-        # Alpha_diag (G, k) — k params per expert vs 1 scalar per expert
-        # Allows each K-dimension to have its own temporal dynamics
-        self.alpha_diag = nn.Parameter(torch.full((G, k), 0.98))
+        # Tau hierarchy: K-dimensions span exponential range [tau_min, tau_max]
+        #   τ_k = tau_min * (tau_max/tau_min)^(k/(K-1))
+        #   α_k = exp(-1/τ_k)
+        # Each expert inherits the same tau distribution (learnable divergence)
+        tau_min, tau_max = 2.0, 200.0
+        if k > 1:
+            frac = torch.arange(k, dtype=torch.float32) / (k - 1)
+            tau_k = tau_min * (tau_max / tau_min) ** frac
+        else:
+            tau_k = torch.tensor([(tau_min + tau_max) / 2])
+        alpha_init = torch.exp(-1.0 / tau_k).view(1, k).expand(G, -1).clone()
+        self.alpha_diag = nn.Parameter(alpha_init)
         self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)

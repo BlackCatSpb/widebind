@@ -190,13 +190,21 @@ def test_mirror_shape():
 
 
 def test_mirror_alpha_is_diag():
-    """Alpha is per-dim per-expert (G, k)."""
+    """Alpha is per-dim per-expert (G, k) with exponential tau hierarchy."""
     D, G, k = 896, 32, 8
     mirror = GroupedCognitiveMirror(D, G=G, k=k)
     assert mirror.alpha_diag.shape == (G, k), f'alpha_diag.shape={mirror.alpha_diag.shape} != ({G}, {k})'
     assert mirror.alpha_diag.requires_grad, 'alpha_diag is not trainable'
     a = mirror.alpha_diag.data
-    assert (a > 0.9).all() and (a < 1.01).all(), f'alpha_diag init out of range: min={a.min():.3f} max={a.max():.3f}'
+    # Tau hierarchy: fast k=0 (α≈0.607) to slow k=K-1 (α≈0.995)
+    assert (a > 0.6).all() and (a < 1.0).all(), f'alpha_diag init out of range: min={a.min():.3f} max={a.max():.3f}'
+    # Verify monotonic increase across K-dimensions (k=0 fastest, k=K-1 slowest)
+    assert (a[0, 1:] >= a[0, :-1]).all(), 'alpha_diag not monotonic across K-dims'
+    assert a[0, 0] < 0.7, f'fastest K-dim should be <0.7: {a[0, 0]:.4f}'
+    assert a[0, -1] > 0.99, f'slowest K-dim should be >0.99: {a[0, -1]:.4f}'
+    # All experts share the same init (will diverge through learning)
+    for g in range(G):
+        assert (a[g] == a[0]).all(), f'Expert {g} differs from expert 0 at init'
 
 
 def test_mirror_no_lo_hi_split():
