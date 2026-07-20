@@ -18,22 +18,19 @@ except ImportError:
 add_safe_globals([WideBindConfig])
 
 
-def load_token_stream(path):
-    """Load token stream from binary file (uint16 array)."""
-    data = np.fromfile(path, dtype=np.uint16)
-    return torch.from_numpy(data.astype(np.int64))
-
-
-def get_batch(stream, seq_len, batch_size, offset):
-    """Get a batch from token stream at given offset."""
-    B, L = batch_size, seq_len
-    needed = B * L + 1
-    if offset + needed > len(stream):
-        offset = 0
-    batch = stream[offset:offset + needed]
-    x = batch[:B * L].view(B, L)
-    y = batch[1:B * L + 1].view(B, L)
-    return x, y, offset + B * L
+class TokenStream:
+    """Memory-mapped uint16 token stream; converted to torch.long per batch."""
+    def __init__(self, path):
+        self.data = np.memmap(path, dtype=np.uint16, mode='r')
+        self.len = len(self.data)
+    def get_batch(self, seq_len, batch_size, offset):
+        needed = batch_size * seq_len + 1
+        if offset + needed > self.len:
+            offset = 0
+        chunk = self.data[offset:offset + needed]
+        x = torch.from_numpy(chunk[:batch_size * seq_len].reshape(batch_size, seq_len).copy())
+        y = torch.from_numpy(chunk[1:batch_size * seq_len + 1].reshape(batch_size, seq_len).copy())
+        return x.long(), y.long(), offset + batch_size * seq_len
 
 
 def create_lr_scheduler(optimizer, warmup, max_steps, lr):
@@ -65,8 +62,8 @@ def train(cfg=None, resume_path=None):
     if not stream_files:
         raise FileNotFoundError(f'No token_stream_*.bin files in {cfg.data_dir}')
     
-    streams = [load_token_stream(f) for f in stream_files]
-    total_tokens = sum(len(s) for s in streams)
+    streams = [TokenStream(f) for f in stream_files]
+    total_tokens = sum(s.len for s in streams)
     print(f'Found {len(streams)} files, {total_tokens:,} total tokens')
     
     # Model (retry once on OOM — transient CUDA context cleanup)
@@ -144,6 +141,7 @@ def train(cfg=None, resume_path=None):
     
     # State for recurrent layers
     state = None
+    rng = torch.Generator().manual_seed(42)
     
     # Training loop
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -155,28 +153,34 @@ def train(cfg=None, resume_path=None):
     t0 = time.time()
     
     print(f'Starting training from step {start_step}')
+    print(f'Streams: {len(streams)} ({", ".join(f"{s.len:,}" for s in streams)} tokens)')
     print('Press Ctrl+C to save checkpoint and exit gracefully.')
     try:
         for step in range(start_step, cfg.max_steps):
             model.train()
             
-            # Cycle through streams
-            stream = streams[stream_idx]
-            x, y, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, offset)
+            # ─── Mixed stream sampling: pick a random position in a random stream ───
+            # When offset reaches end of current stream, randomly pick next stream
+            # This keeps state continuity within a stream while mixing genres
+            # at stream boundaries (FANTASY~82%, ADVENTUR~18% of batches)
             if offset == 0:
-                stream_idx = (stream_idx + 1) % len(streams)
-                stream = streams[stream_idx]
-                _, _, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, 0)
-                state = None  # reset state on stream boundary
+                stream_idx = torch.randint(0, len(streams), (1,), generator=rng).item()
+                offset = 0
+                state = None  # reset state on stream switch (document boundary)
+            
+            stream = streams[stream_idx]
+            x, y, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, offset)
+            if offset == 0:
+                continue  # retry with new random stream
             
             x, y = x.to(device), y.to(device)
             
-            # Forward
+            # ─── Forward ───
             h = model.embed_tokens(x)
             out, state, _ = model(h, state)
             loss = model.compute_loss(out, y)
             
-            # Backward
+            # ─── Backward ───
             optimizer.zero_grad()
             loss.backward()
             
@@ -190,20 +194,26 @@ def train(cfg=None, resume_path=None):
             tokens_seen += cfg.batch_size * cfg.seq_len
             current_lr = scheduler.get_last_lr()[0]
             
+            # ─── EOS-aware state reset: if batch ends with EOS (token 2),
+            # reset state so next batch doesn't learn cross-document dependencies ───
+            if (y[:, -1] == 2).any():
+                state = None
+            
             # Log
             if step % cfg.log_interval == 0:
                 dt = time.time() - t0
                 tok_s = tokens_seen / max(dt, 1e-8)
                 print(f'  step={step:>6} loss={loss.item():.4f} lr={current_lr:.2e} '
-                      f'tok/s={tok_s:.0f} mem={stream_idx}/{len(streams)}')
+                      f'tok/s={tok_s:.0f} stream={stream_idx}')
             
             # Eval
             if step > 0 and step % cfg.eval_interval == 0:
                 val_loss = evaluate(model, streams, cfg, device)
                 print(f'  EVAL step={step}: val_loss={val_loss:.4f} val_ppl={math.exp(val_loss):.2f}')
                 if device == 'cuda':
-                    torch.cuda.empty_cache()  # defrag after eval
-                
+                    torch.cuda.empty_cache()
+                scheduler.report_val_loss(val_loss)
+
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_path = os.path.join(cfg.save_dir, f'best.pt')
@@ -261,8 +271,8 @@ def evaluate(model, streams, cfg, device):
     stream = streams[0]
     offset = max(len(stream) // 2, cfg.batch_size * cfg.seq_len + 1)
     
-    for _ in range(min(100, len(stream) // (cfg.batch_size * cfg.seq_len))):
-        x, y, offset = get_batch(stream, cfg.seq_len, cfg.batch_size, offset)
+    for _ in range(min(100, stream.len // (cfg.batch_size * cfg.seq_len))):
+        x, y, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, offset)
         if offset == 0:
             break
         x, y = x.to(device), y.to(device)

@@ -19,15 +19,19 @@ import numpy as np
 from core import WideBindConfig, WideBindStack, MirrorLRScheduler, AdaptiveController
 
 
-def get_batch(data, seq_len, batch_size, offset):
-    """Get one batch from uint16 numpy array, wrapping around."""
-    needed = batch_size * seq_len + 1
-    if offset + needed > len(data):
-        offset = 0
-    chunk = data[offset:offset + needed]
-    x = torch.from_numpy(chunk[:batch_size * seq_len].reshape(batch_size, seq_len).copy())
-    y = torch.from_numpy(chunk[1:batch_size * seq_len + 1].reshape(batch_size, seq_len).copy())
-    return x.long(), y.long(), offset + batch_size * seq_len
+class TokenStream:
+    """Memory-mapped uint16 token stream; converted to torch.long per batch."""
+    def __init__(self, path):
+        self.data = np.memmap(path, dtype=np.uint16, mode='r')
+        self.len = len(self.data)
+    def get_batch(self, seq_len, batch_size, offset):
+        needed = batch_size * seq_len + 1
+        if offset + needed > self.len:
+            offset = 0
+        chunk = self.data[offset:offset + needed]
+        x = torch.from_numpy(chunk[:batch_size * seq_len].reshape(batch_size, seq_len).copy())
+        y = torch.from_numpy(chunk[1:batch_size * seq_len + 1].reshape(batch_size, seq_len).copy())
+        return x.long(), y.long(), offset + batch_size * seq_len
 
 
 @torch.no_grad()
@@ -35,9 +39,9 @@ def eval_loss(model, streams, cfg, device, n_batches=200):
     model.eval()
     total, count = 0.0, 0
     for stream in streams:
-        off = max(len(stream) // 4, cfg.batch_size * cfg.seq_len + 1)
+        off = max(stream.len // 4, cfg.batch_size * cfg.seq_len + 1)
         for _ in range(n_batches):
-            x, y, off = get_batch(stream, cfg.seq_len, cfg.batch_size, off)
+            x, y, off = stream.get_batch(cfg.seq_len, cfg.batch_size, off)
             if off == 0: break
             h = model.embed_tokens(x.to(device))
             out, _, _ = model(h, None)
@@ -59,8 +63,8 @@ def train(cfg, data_dir, save_dir, resume_path=None):
         stream_files = sorted(glob.glob(os.path.join(data_dir, 'token_stream_*.bin')))
     if not stream_files:
         raise FileNotFoundError(f'No token_stream_*.bin in {data_dir}')
-    streams = [np.fromfile(f, dtype=np.uint16) for f in stream_files]
-    total_tokens = sum(len(s) for s in streams)
+    streams = [TokenStream(f) for f in stream_files]
+    total_tokens = sum(s.len for s in streams)
     print(f'Data: {len(streams)} files, {total_tokens:,} tokens')
 
     # ─── Model ───
@@ -127,10 +131,10 @@ def train(cfg, data_dir, save_dir, resume_path=None):
         for step in range(start_step, cfg.max_steps):
             model.train()
             stream = streams[si]
-            x, y, off = get_batch(stream, cfg.seq_len, cfg.batch_size, off)
+            x, y, off = stream.get_batch(cfg.seq_len, cfg.batch_size, off)
             if off == 0:
                 si = (si + 1) % len(streams)
-                _, _, off = get_batch(streams[si], cfg.seq_len, cfg.batch_size, 0)
+                _, _, off = streams[si].get_batch(cfg.seq_len, cfg.batch_size, 0)
                 state = None
 
             x, y = x.to(device), y.to(device)
@@ -151,7 +155,7 @@ def train(cfg, data_dir, save_dir, resume_path=None):
                 tok_s = tokens_seen / max(dt, 1e-8)
                 with torch.no_grad():
                     idiff = torch.stack([
-                        (1.0 - l.mirror.alpha.data).abs().mean()
+                        (1.0 - l.mirror.alpha_diag.data).abs().mean()
                         for l in model.layers
                     ]).mean().item()
                     gv = torch.stack([
@@ -168,6 +172,7 @@ def train(cfg, data_dir, save_dir, resume_path=None):
             if step > 0 and step % cfg.eval_interval == 0:
                 vl = eval_loss(model, streams, cfg, device)
                 print(f'  EVAL: val_loss={vl:.4f} ppl={math.exp(vl):.1f}')
+                scheduler.report_val_loss(vl)
                 if vl < best_val:
                     best_val = vl
                     torch.save({
@@ -206,7 +211,7 @@ def train(cfg, data_dir, save_dir, resume_path=None):
     with torch.no_grad():
         print('\n=== Alpha Analysis ===')
         for i, l in enumerate(model.layers):
-            a = l.mirror.alpha.data
+            a = l.mirror.alpha_diag.data
             ad = (1.0 - a).abs().mean().item()
             print(f'  L{i}: alpha={a.mean().item():.4f}+/-{a.std().item():.4f}  |1-alpha|={ad:.6f}')
 

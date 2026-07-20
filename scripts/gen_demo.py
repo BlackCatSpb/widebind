@@ -49,13 +49,18 @@ gen_len = 256
 with torch.no_grad():
     h = model.embed_tokens(prompt)
     state = None
-    out, state, _ = model(h, state)
+    out, state, _ = model(h, state, adaptive=False)
 
     tokens = prompt_ids[:]
-    x = out[:, -1:, :]
+    # First token comes from the prompt forward pass itself (not from
+    # feeding the hidden state back as an embedding — that input is OOD).
+    logits = model.lm_head(out).float()
+    next_id = logits[:, -1].argmax(dim=-1).item()
+    tokens.append(next_id)
+    x = model.embed_tokens(torch.tensor([[next_id]], device=device))
     t0 = time.time()
-    for i in range(gen_len):
-        out, state, _ = model(x, state)
+    for i in range(1, gen_len):
+        out, state, _ = model(x, state, adaptive=False)
         logits = model.lm_head(out).float()
         next_id = logits[:, -1].argmax(dim=-1).item()
         tokens.append(next_id)

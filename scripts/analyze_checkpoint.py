@@ -36,7 +36,9 @@ def analyze_single_checkpoint(ckpt_path):
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     cfg = ckpt['cfg']
     step = ckpt.get('step', 0)
-    best_val = ckpt.get('best_val_loss', 'N/A')
+    best_val = ckpt.get('best_val_loss', float('inf'))
+    if not isinstance(best_val, (int, float)):
+        best_val = float('inf')
     has_opt = 'optimizer' in ckpt
     has_sch = 'scheduler' in ckpt
     is_compressed = 'model_compressed' in ckpt
@@ -56,12 +58,12 @@ def analyze_single_checkpoint(ckpt_path):
     # ─── Weight distribution ───
     all_w = torch.cat([p.data.flatten() for p in model.parameters()])
     
-    # ─── Forward pass for activations ───
+    # ─── Forward pass for activations (adaptive=False: don't mutate b_i/b_d/EMA) ───
     torch.manual_seed(42)
     device = next(model.parameters()).device
     x = torch.randint(0, min(cfg.vocab, 1000), (1, 16)).to(device)
     h = model.embed_tokens(x)
-    out, state, _ = model(h)
+    out, state, _ = model(h, adaptive=False)
     
     # ─── Per-layer analysis ───
     layers_data = []
@@ -131,8 +133,9 @@ def analyze_single_checkpoint(ckpt_path):
         # ─── Gate / Prediction ───
         d['w_pred_scale_mean'] = m.w_pred_scale.data.mean().item()
         d['w_pred_scale_std'] = m.w_pred_scale.data.std().item()
-        # Alpha identity check (scalar per expert, pred_k = alpha_g * hp_prev)
-        alpha = m.alpha.data  # (G,)
+        d['gate_beta'] = m.b_gate.data.mean().item()  # gate bias (was 'gate_beta' in old arch)
+        # Alpha identity check (per-dim diagonal, pred_k = alpha_diag * hp_prev)
+        alpha = m.alpha_diag.data  # (G, k)
         d['alpha_mean'] = alpha.mean().item()
         d['alpha_std'] = alpha.std().item()
         d['alpha_min'] = alpha.min().item()
@@ -330,8 +333,8 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
 <th>L</th>
 <th colspan="2">Bind</th>
 <th colspan="4">Gates</th>
-<th colspan="2">Memory</th>
-<th colspan="3">Spectr.</th>
+<th colspan="2">Spectr.</th>
+<th colspan="3">Memory</th>
 <th>Conv</th>
 <th colspan="3">Mirror (log_scale)</th>
 <th colspan="2">MLP</th>

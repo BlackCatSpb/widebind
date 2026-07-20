@@ -146,7 +146,7 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
         if step % 100 == 0:
             with torch.no_grad():
                 alpha_dev = torch.stack([
-                    (1.0 - l.mirror.alpha.data).abs().mean()
+                    (1.0 - l.mirror.alpha_diag.data).abs().mean()
                     for l in model.layers
                 ]).mean().item()
                 gv = torch.stack([l.mirror._last_gates.var() for l in model.layers]).mean().item()
@@ -166,14 +166,14 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
     # Final alpha analysis
     with torch.no_grad():
         for i, l in enumerate(model.layers):
-            alpha = l.mirror.alpha.data
+            alpha = l.mirror.alpha_diag.data
             dev = (1.0 - alpha).abs().mean().item()
             print(f'  L{i}: |1-alpha|_mean={dev:.6f} alpha_mean={alpha.mean().item():.4f} gate_mean={l.mirror._last_gates.mean().item():.4f} gate_var={l.mirror._last_gates.var().item():.4f}')
 
     # Summary verdict
     with torch.no_grad():
         final_alpha_dev = torch.stack([
-            (1.0 - l.mirror.alpha.data).abs().mean()
+            (1.0 - l.mirror.alpha_diag.data).abs().mean()
             for l in model.layers
         ]).mean().item()
 

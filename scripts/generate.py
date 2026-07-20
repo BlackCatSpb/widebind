@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from core import WideBindConfig, WideBindStack
+from compression import FCF_CPR
 
 
 def load_russian_tokenizer(path=None):
@@ -48,23 +49,29 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50):
     # Generate
     state = None
     
+    recent = set()
     for _ in range(max_new_tokens):
         ctx = tokens[-L:].unsqueeze(0)
         
         h = model.embed_tokens(ctx)
-        out, state, _ = model(h, state)
+        out, state, _ = model(h, state, adaptive=False)
         
-        logits = model.lm_head(out[:, -1, :])
+        logits = model.lm_head(out[:, -1:, :])[0, 0]
         logits = logits / temperature
+        
+        # Repetition penalty: subtract fixed penalty (sign-safe)
+        for rid in list(recent)[-5:]:
+            logits[rid] -= 2.0
         
         if top_k > 0:
             vals, _ = torch.topk(logits, top_k)
-            logits[logits < vals[:, -1:]] = -float('inf')
+            logits[logits < vals[-1:]] = -float('inf')
         
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, 1)
         
-        tokens = torch.cat([tokens, next_token.squeeze(0)], dim=0)
+        recent.add(next_token.item())
+        tokens = torch.cat([tokens, next_token], dim=0)
     
     return detokenize(tokens.tolist())
 
@@ -82,10 +89,14 @@ if __name__ == '__main__':
     
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load checkpoint
+    # Load checkpoint (handle FCF_CPR compressed format)
     from torch.serialization import add_safe_globals
     add_safe_globals([WideBindConfig])
-    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if 'model_compressed' in state:
+        cfg = state.get('cfg', WideBindConfig())
+        cpr = FCF_CPR()
+        state = cpr.load_compressed(args.checkpoint, cfg=cfg)
     cfg = state.get('cfg', WideBindConfig())
     model = WideBindStack(cfg).to(device)
     model.load_state_dict(state['model'], strict=False)

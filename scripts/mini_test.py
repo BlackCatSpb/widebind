@@ -34,8 +34,8 @@ def snapshot(model, tag):
         lm = model.layers[-1].mirror
         print(f'\n=== {tag} ===')
         print(f'  expl={expl:.4f}  diff={diff:.6f}  noise={ns:.6f}')
-        print(f'  alpha.mean:       {m0.alpha.data.mean().item():.4f}   alpha.std={m0.alpha.data.std().item():.4f}   pred_scale.std={m0.w_pred_scale.data.std().item():.4f}')
-        print(f'  log_scale[L2].var:{diff:.6f}')
+        print(f'  alpha.mean:       {m0.alpha_diag.data.mean().item():.4f}   alpha.std={m0.alpha_diag.data.std().item():.4f}   pred_scale.std={m0.w_pred_scale.data.std().item():.4f}')
+        print(f'  log_scale.var (diff):{diff:.6f}')
         print(f'  log_skip_alpha:   mean={m0.log_skip_alpha.data.mean().item():.4f}')
         print(f'  dvar_mod_bias:    mean={m0.dvar_mod_bias.data.mean().item():.4f}')
         print(f'  w_q[L0].mean:     {model.layers[0].w_q.data.mean().item():.4f}')
@@ -124,7 +124,7 @@ h2 = big_model.embed_tokens(x2)
 out2, _, _ = big_model(h2, None)
 loss2 = big_model.compute_loss(out2, y2)
 loss2.backward()
-grads = [l.mirror.alpha.grad.norm().item() for l in big_model.layers]
+grads = [l.mirror.alpha_diag.grad.norm().item() for l in big_model.layers]
 check('All layers have non-zero alpha grad', all(g > 1e-6 for g in grads),
       f'min={min(grads):.6f}')
 check('Bottom layer alpha grad > 1e-4', grads[0] > 1e-4,
@@ -149,8 +149,8 @@ ce_loss = F.cross_entropy(logits.reshape(-1, chk_cfg.vocab), y3.reshape(-1))
 # With aux
 loss_with = chk_model.compute_loss(out3, y3, pred_weight=0.01)
 check('Aux loss weight=0.01 doesn\'t dominate CE',
-      0.01 * loss_with.item() < 0.1 * ce_loss.item(),
-      f'aux*0.01={(loss_with.item() - ce_loss.item()):.4f} ce={ce_loss.item():.4f}')
+      (loss_with.item() - ce_loss.item()) < 0.1 * ce_loss.item(),
+      f'aux_contrib={(loss_with.item() - ce_loss.item()):.4f} ce={ce_loss.item():.4f}')
 
 # ─── Check 3: Gate signal is |pred_error| ───
 print('\n--- Check 3: Gate behavior ---')

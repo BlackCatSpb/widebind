@@ -20,9 +20,9 @@ add_safe_globals([WideBindConfig])
 
 
 class TokenStream:
-    """Memory-efficient stream: uint16 numpy, converted to torch.long per batch."""
+    """Memory-mapped uint16 token stream; converted to torch.long per batch."""
     def __init__(self, path):
-        self.data = np.fromfile(path, dtype=np.uint16)
+        self.data = np.memmap(path, dtype=np.uint16, mode='r')
         self.len = len(self.data)
     def get_batch(self, seq_len, batch_size, offset):
         needed = batch_size * seq_len + 1
@@ -161,6 +161,7 @@ def train(cfg, drive_path=None):
     offset = 0
     tokens_seen = 0
     t0 = time.time()
+    rng = torch.Generator().manual_seed(42)
 
     print(f'Starting training from step {start_step}')
     print(f'  Steps: {start_step} → {cfg.max_steps} ({cfg.max_steps - start_step} remaining)')
@@ -170,15 +171,22 @@ def train(cfg, drive_path=None):
         for step in range(start_step, cfg.max_steps):
             model.train()
 
+            # Mixed stream sampling: random position in random stream
+            if offset == 0:
+                stream_idx = torch.randint(0, len(streams), (1,), generator=rng).item()
+                offset = 0
+                state = None
+
             stream = streams[stream_idx]
             x, y, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, offset)
             if offset == 0:
-                stream_idx = (stream_idx + 1) % len(streams)
-                stream = streams[stream_idx]
-                _, _, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, 0)
-                state = None
+                continue
 
             x, y = x.to(device), y.to(device)
+
+            # EOS-aware state reset
+            if (y[:, -1] == 2).any():
+                state = None
 
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 h = model.embed_tokens(x)
@@ -219,9 +227,9 @@ def train(cfg, drive_path=None):
                 print(f'  EVAL step={step}: val_loss={val_loss:.4f} val_ppl={math.exp(val_loss):.2f}')
                 if device == 'cuda':
                     torch.cuda.empty_cache()
+                scheduler.report_val_loss(val_loss)
 
                 if val_loss < best_val_loss:
-                    best_val_loss = val_loss
                     save_path = os.path.join(save_dir, f'best.pt')
                     torch.save({
                         'step': step, 'model': model.state_dict(),
@@ -272,7 +280,7 @@ def evaluate(model, streams, cfg, device):
             x, y = x.to(device), y.to(device)
             with torch.cuda.amp.autocast(enabled=device=='cuda'):
                 h = model.embed_tokens(x)
-                out, _, _ = model(h, None)
+                out, _, _ = model(h, None, adaptive=False)
                 loss = model.compute_loss(out, y)
             total_loss += loss.item()
             total_steps += 1
@@ -318,7 +326,7 @@ if __name__ == '__main__':
         data_dir=args.drive_path or '',
         save_dir=args.drive_path or 'checkpoints',
         log_dir=args.drive_path or 'logs',
-        grad_clip=1.0,
+        grad_clip=0.5,
         conv_kernel=48,
     )
 
