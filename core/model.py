@@ -73,12 +73,8 @@ def sparse_block_codes(vocab=50000, K=32, S=6):
 # ─── VSA Prefix Scan ───────────────────────────────────────────────────
 
 def vsa_prefix_scan(a, b, state=None):
-    """Associative parallel prefix scan for VSA memory (O(L) log-space version).
+    """Associative parallel prefix scan for VSA memory (chunked for stability).
     mem[t] = a[t] * mem[t-1] + b[t]  (element-wise)
-    
-    Log-space for numerical stability:
-      log_decay_sum[t] = sum_{r=0}^{t} log(a[r])
-      mem[t] = exp(log_decay_sum[t]) * (sum_{s=0}^{t} b[s]/exp(log_decay_sum[s]))
     
     a: (B, L, D) or (B, L) — decay factors
     b: (B, L, D) — input increments
@@ -91,20 +87,31 @@ def vsa_prefix_scan(a, b, state=None):
         a = a.unsqueeze(-1).expand(-1, -1, D)
     
     eps = 1e-10
-    log_a = torch.log(a.clamp(min=eps))
-    log_cum = torch.cumsum(log_a, dim=1)  # (B, L, D)
-    cum_decay = torch.exp(log_cum)
+    CHUNK = 32
+    out = []
+    s = state.clone() if state is not None else None
+    for start in range(0, L, CHUNK):
+        end = min(start + CHUNK, L)
+        b_chunk = b[:, start:end]
+        a_chunk = a[:, start:end]
+        
+        log_a_chunk = torch.log(a_chunk.clamp(min=eps))
+        log_cum_chunk = torch.cumsum(log_a_chunk, dim=1)
+        cum_decay_chunk = torch.exp(log_cum_chunk)
+        inv_cum_decay_chunk = torch.exp(-log_cum_chunk)
+        
+        weighted = b_chunk * inv_cum_decay_chunk
+        cum_weighted = torch.cumsum(weighted, dim=1)
+        
+        if s is not None:
+            result_chunk = cum_decay_chunk * s.unsqueeze(1) + cum_decay_chunk * cum_weighted
+        else:
+            result_chunk = cum_decay_chunk * cum_weighted
+        
+        out.append(result_chunk)
+        s = result_chunk[:, -1]
     
-    # Weighted inputs in log space: b[t] * exp(-log_cum[t])
-    weighted = b * torch.exp(-log_cum)
-    cum_weighted = torch.cumsum(weighted, dim=1)
-    
-    if state is not None:
-        state_term = state.unsqueeze(1)  # (B, 1, D)
-        result = cum_decay * (state_term + cum_weighted)
-    else:
-        result = cum_decay * cum_weighted
-    
+    result = torch.cat(out, dim=1)
     return result, result[:, -1]
 
 
@@ -260,7 +267,8 @@ class GroupedCognitiveMirror(nn.Module):
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
     def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
-                 delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False):
+                 delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
+                 layer_idx=0, n_layers=32):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -268,6 +276,9 @@ class GroupedCognitiveMirror(nn.Module):
         self.k = k
         self.d = D // G
         self.tie_mirror_proj = tie_mirror_proj
+        # φ — единая когнитивная координата глубины (логарифмическая)
+        phi = math.log(1 + layer_idx) / math.log(max(n_layers, 2))
+        self.register_buffer('phi', torch.tensor(phi))
         
         proj_std = 1.0 / (self.d * k) ** 0.25
         
@@ -308,8 +319,10 @@ class GroupedCognitiveMirror(nn.Module):
             tau_k = torch.tensor([(tau_min + tau_max) / 2])
         alpha_init = torch.exp(-1.0 / tau_k).view(1, k).expand(G, -1).clone()
         self.alpha_diag = nn.Parameter(alpha_init)
-        self.w_pred_scale = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
+        self.w_pred_scale_legacy = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
+        # EMA norms for signal normalization (Proposal V-1)
+        self.register_buffer('_signal_norm_ema', torch.ones(4, G, k) * 3.0, persistent=False)
         self.log_scale = nn.Parameter(torch.randn(G, self.d) * log_scale_init_std)
         
         # ─── K-space gate (per-token, per-expert from hp) ───
@@ -333,15 +346,22 @@ class GroupedCognitiveMirror(nn.Module):
         # Cache for alpha auxiliary loss
         self._cached_pred_k = None
         self._cached_hp = None
+        self._cached_pred_error_norm = None
         # Residual variance EMA for adaptive tau (self-organizing timescales)
         self.register_buffer('_residual_var_ema', torch.ones(G, k) * 0.1, persistent=False)
         
-        # ─── Per-expert learned modulation ───
-        self.log_dvar_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
+        # ─── Per-expert learned modulation (геометрическая init по φ) ───
+        # skip_alpha: L0≈17, L31≈0.10 (из чекпоинта step 50000)
+        # ρ=0.6: сенсорный слой L0≈17, глубокий L31≈0.10
+        rho = 0.6 ** layer_idx
+        log_skip_init = math.log(0.10) + (math.log(17.0) - math.log(0.10)) * rho
+        self.log_skip_alpha = nn.Parameter(torch.full((G,), log_skip_init))
+        # mod_scale: L0≈-0.81, L31≈-2.30 (из чекпоинта)
+        log_mod_init = -2.30 + (-0.81 - (-2.30)) * rho
+        self.log_dvar_mod_scale = nn.Parameter(torch.full((G,), log_mod_init))
+        self.log_grad_mod_scale = nn.Parameter(torch.full((G,), log_mod_init))
         self.dvar_mod_bias = nn.Parameter(torch.full((G,), -0.01))
-        self.log_grad_mod_scale = nn.Parameter(torch.full((G,), math.log(0.1)))
         self.grad_mod_bias = nn.Parameter(torch.full((G,), -0.01))
-        self.log_skip_alpha = nn.Parameter(torch.full((G,), math.log(0.1)))
         self._delta_var_ema_min = delta_var_ema_min
         self._delta_var_ema_max = delta_var_ema_max
 
@@ -426,7 +446,8 @@ class GroupedCognitiveMirror(nn.Module):
             damp = torch.sigmoid(-raw_pred_error.norm(dim=-1).mean() / self._damp_tau)
             alpha_eff = 1.0 + (alpha_eff - 1.0) * damp
             pred_k = hp_prev * alpha_eff.view(1, 1, G, k)
-        pred_error = (hp - pred_k) / hp_norm * self.w_pred_scale * pred_scale_mod.view(G, 1)
+        # Без w_pred_scale — сигнал нормируется EMA вместе с остальными
+        pred_error = (hp - pred_k) / hp_norm * pred_scale_mod.view(G, 1)
         # Adaptive tau: K-измерения с высокой ошибкой → короткое τ, с низкой → длинное.
         # alpha_target = sigmoid(2.2 - log(rel_var)):
         #   rel_var=1 (noise) → α=0.9 (init), rel_var=0.5 → α=0.95, rel_var=2 → α=0.82
@@ -442,6 +463,9 @@ class GroupedCognitiveMirror(nn.Module):
                 self.alpha_diag.data.lerp_(alpha_target, 0.0005)
         self._cached_pred_k = _pred_k_aux
         self._cached_hp = hp
+        # Cache normalized pred_error norm per token для surprisal-gated i_gate
+        pred_error_norm = (raw_pred_error / hp_norm).norm(dim=(-2, -1))  # (B, L)
+        self._cached_pred_error_norm = pred_error_norm
         
         # ─── Fast signals (hi half of K-space) ───
         # Smoothness: local coherence in K-space (CAUSAL: pad left only)
@@ -454,12 +478,23 @@ class GroupedCognitiveMirror(nn.Module):
         # Symmetry: bilinear temporal interaction
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
+        # ─── EMA-нормировка сигналов (соизмеримость перед softmax) ───
+        signals = [temp_k, pred_error, smooth_k, sym_k]
+        signals_normed = []
+        decay = 0.001  # ~1000-step EMA
+        for i, s in enumerate(signals):
+            with torch.no_grad():
+                rms = s.norm(dim=(-2, -1), keepdim=True).mean(dim=(0, 1), keepdim=True)  # (1, 1, G, k)
+                self._signal_norm_ema[i].mul_(1 - decay).add_(rms.squeeze(), alpha=decay)
+            s_norm = s / (self._signal_norm_ema[i].unsqueeze(0).unsqueeze(0) + 1e-8)
+            signals_normed.append(s_norm)
+        
         # ─── Learnable signal weights (softmax-normalized) ───
         w = torch.softmax(self._signal_log_weights, dim=0)  # 4 weights summing to 1
         
         # ─── Merge all signals (weighted sum) ───
-        delta = (w[0] * temp_k + w[1] * pred_error + 
-                 w[2] * smooth_k + w[3] * sym_k)
+        delta = (w[0] * signals_normed[0] + w[1] * signals_normed[1] + 
+                 w[2] * signals_normed[2] + w[3] * signals_normed[3])
         
         delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
         delta = delta + self.tanh_bias * tanh_bias_mod
@@ -643,7 +678,8 @@ class WideBindBlock(nn.Module):
         self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=k,
             w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
-            tie_mirror_proj=cfg.tie_mirror_proj)
+            tie_mirror_proj=cfg.tie_mirror_proj,
+            layer_idx=layer_idx, n_layers=cfg.n_layers)
         
         # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
         self._n_scales = 4
@@ -661,6 +697,12 @@ class WideBindBlock(nn.Module):
         b_d_init = 2.0 + 3.0 * layer_frac  # L0: τ≈7, L23: τ≈63, L31: τ≈150
         self.b_i = nn.Parameter(torch.full((cfg.D,), -2.5))   # i_gate ~0.08 init
         self.b_d = nn.Parameter(torch.full((cfg.D,), b_d_init))
+        # Surprisal-gated write coefficient γ_l: растёт с τ
+        # γ_l = γ_max · σ((ln τ_l - ln 32) / 1.0)
+        tau_l = math.exp(b_d_init)
+        gamma_max = 0.5
+        gamma_init = gamma_max * (1.0 / (1.0 + math.exp(-(math.log(tau_l) - math.log(32.0)))))
+        self.gamma_surprisal = nn.Parameter(torch.full((), gamma_init))
 
         # First moment
         self.w_k_mu = nn.Parameter(torch.randn(cfg.D))
@@ -696,6 +738,8 @@ class WideBindBlock(nn.Module):
         if state is not None:
             mem_state, mu_state, conv_state = state
         B, L, D = h.shape
+        # Clear stale mirror cache
+        self.mirror._cached_pred_error_norm = None
         K = self.K
         device = h.device
         
@@ -710,6 +754,7 @@ class WideBindBlock(nn.Module):
         h_conv = h_conv[..., :L].transpose(1, 2)
         conv_state_out = h_perm[:, :, -(self.conv.padding[0]):]
         h = h + h_conv
+        self._cache_conv_out = h_conv.detach()
         
         # ─── Hybrid Bind: D -> K -> bilinear -> D ───
         hp = h @ self.W_proj + self.w_bind_bias  # (B, L, K) with learnable offset
@@ -720,7 +765,13 @@ class WideBindBlock(nn.Module):
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
         S = self._n_scales
         d_s = torch.exp(-1.0 / self._tau_s.to(device))  # (S,) — fixed τ-scales
-        i_gate = F.softplus(h * self.w_i + self.b_i)        # (B, L, D)
+        # Surprisal-gated write: i_gate = softplus(linear + γ·||ê||₂)
+        igate_logit = h * self.w_i + self.b_i
+        mir = self.mirror
+        if hasattr(mir, '_cached_pred_error_norm') and mir._cached_pred_error_norm is not None:
+            pen = mir._cached_pred_error_norm  # (B, L)
+            igate_logit = igate_logit + self.gamma_surprisal * pen.unsqueeze(-1)
+        i_gate = F.softplus(igate_logit)                    # (B, L, D)
         d_mod = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D) — content mod of decay
         if noise_scale > 0 and self.training:
             noise = 1.0 + noise_scale * torch.randn_like(i_gate)
@@ -735,18 +786,28 @@ class WideBindBlock(nn.Module):
         input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
         
         eps = 1e-10
-        log_a = torch.log(decay.clamp(min=eps))
-        log_cum = torch.cumsum(log_a, dim=1)
-        cum_decay = torch.exp(log_cum)
-        inv_cum_decay = torch.exp(-log_cum)
-        
+        CHUNK = 32
         def _scan(b, state):
-            weighted = b * inv_cum_decay
-            cum_w = torch.cumsum(weighted, dim=1)
-            if state is not None:
-                result = cum_decay * (state.unsqueeze(1) + cum_w)
-            else:
-                result = cum_decay * cum_w
+            B, L = b.shape[0], b.shape[1]
+            out = []
+            s = state.clone() if state is not None else None
+            for start in range(0, L, CHUNK):
+                end = min(start + CHUNK, L)
+                b_chunk = b[:, start:end]
+                decay_chunk = decay[:, start:end]
+                log_a_chunk = torch.log(decay_chunk.clamp(min=eps))
+                log_cum_chunk = torch.cumsum(log_a_chunk, dim=1)
+                cum_decay_chunk = torch.exp(log_cum_chunk)
+                inv_cum_decay_chunk = torch.exp(-log_cum_chunk)
+                weighted = b_chunk * inv_cum_decay_chunk
+                cum_w = torch.cumsum(weighted, dim=1)
+                if s is not None:
+                    result_chunk = cum_decay_chunk * s.unsqueeze(1) + cum_decay_chunk * cum_w
+                else:
+                    result_chunk = cum_decay_chunk * cum_w
+                out.append(result_chunk)
+                s = result_chunk[:, -1]
+            result = torch.cat(out, dim=1)
             return result, result[:, -1]
         
         if mem_state is not None:
@@ -783,6 +844,8 @@ class WideBindBlock(nn.Module):
         d = self.mirror.d
         mem_modulated = (mem_read.reshape(B, L, g, d) * mm).reshape(B, L, D)
         enhanced = bind_out + mem_modulated * self.w_mem2v * mem2v_scale + mirror
+        self._cache_bind_out = (bind_out + mem_modulated * self.w_mem2v * mem2v_scale).detach()
+        self._cache_mirror_out = mirror.detach()
         h = h + enhanced
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
@@ -864,14 +927,16 @@ class WideBindStack(nn.Module):
                         layer.b_i.data.lerp_(b_i_t, 1.0 - smooth)
         
         # Global self-model: running EMA of layer memory centroids
+        # Per-layer EMA rates proportional to 1/τ (Proposal V)
+        n_layers = len(self.layers)
         if global_state is None:
-            global_state = torch.zeros(1, 1, D, device=h.device, dtype=h.dtype)
-        if adaptive:
-            ema_alpha = AdaptiveController.ema_alpha(self.layers,
-                min_val=self.cfg.ema_alpha_min, max_val=self.cfg.ema_alpha_max)
-        else:
-            ema_alpha = 0.99
-        
+            global_state = torch.zeros(n_layers, 1, D, device=h.device, dtype=h.dtype)
+        if global_state.dim() == 2:
+            global_state = global_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
+        elif global_state.shape[0] != n_layers:
+            global_state = global_state[0:1].expand(n_layers, -1, -1).clone()
+        # Calibrate c so L31 (τ≈149) matches current α≈0.976
+        c_ema = (1.0 - 0.976) * 149.0  # ≈3.576
         new_state = []
         self._pred_cache = []
         for i, (layer, s) in enumerate(zip(self.layers, state)):
@@ -896,7 +961,8 @@ class WideBindStack(nn.Module):
                 spectral_mod = 1.0
                 pred_scale_mod = None
             
-            h, s_out = layer(h, s, global_state=global_state,
+            gs_i = global_state[i:i+1].clone()  # (1, 1, D)
+            h, s_out = layer(h, s, global_state=gs_i,
                              mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod)
@@ -904,12 +970,16 @@ class WideBindStack(nn.Module):
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
                 S = layer._n_scales
+                # Per-layer EMA alpha from τ
+                lf = i / max(n_layers - 1, 1)
+                tau_l = math.exp(2.0 + 3.0 * lf)
+                alpha_l = 1.0 - c_ema / (tau_l + 1e-8)
+                alpha_l = max(0.85, min(0.999, alpha_l))
                 # Weighted combination of scales для global state
                 w = F.softmax(layer.scale_w, dim=0)  # (S, D)
                 mem_combined = (mem_state_out.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
                 mem_avg = mem_combined.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
-                global_state = (ema_alpha * global_state +
-                                (1.0 - ema_alpha) * mem_avg)
+                global_state[i:i+1] = alpha_l * global_state[i:i+1] + (1.0 - alpha_l) * mem_avg
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
             if adaptive:
@@ -917,7 +987,7 @@ class WideBindStack(nn.Module):
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
                     self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
         
-        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state.detach()
+        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state
     
     def embed_tokens(self, tokens):
         """Token indices -> D-space vectors."""
@@ -1041,6 +1111,41 @@ class WideBindStack(nn.Module):
         if n_orth > 0:
             orth_loss = orth_loss / n_orth
         
+        # w_m2v hierarchy by τ (Proposal IV): push w_m2v toward target ∝ σ(ln τ)
+        w_m2v_loss = 0.0
+        n_m2v = 0
+        w_m2v_weight = getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.0)
+        if w_m2v_weight > 0:
+            for i, layer in enumerate(self.layers):
+                wm = getattr(layer, 'w_mem2v', None)
+                if wm is not None:
+                    lf = i / max(len(self.layers) - 1, 1)
+                    tau_l = math.exp(2.0 + 3.0 * lf)
+                    target = getattr(self.cfg, 'w_m2v_hierarchy_target', 1.0)
+                    target_m2v = target / (1.0 + math.exp(-(math.log(tau_l) - math.log(32.0))))
+                    w_m2v_loss = w_m2v_loss + F.mse_loss(wm.mean(), torch.tensor(target_m2v, device=wm.device))
+                    n_m2v = n_m2v + 1
+            if n_m2v > 0:
+                w_m2v_loss = w_m2v_loss / n_m2v
+        # Branch balance: equalize log-variance of conv/bind/mirror branches
+        branch_loss = 0.0
+        n_branch = 0
+        branch_weight = getattr(self.cfg, 'branch_balance_weight', 0.0)
+        if branch_weight > 0:
+            for layer in self.layers:
+                conv = getattr(layer, '_cache_conv_out', None)
+                bnd = getattr(layer, '_cache_bind_out', None)
+                mir = getattr(layer, '_cache_mirror_out', None)
+                if conv is not None and bnd is not None and mir is not None:
+                    vc = conv.norm(dim=-1).var() + 1e-10
+                    vb = bnd.norm(dim=-1).var() + 1e-10
+                    vm = mir.norm(dim=-1).var() + 1e-10
+                    branch_loss = branch_loss + (torch.log(vc) - torch.log(vb)).pow(2)
+                    branch_loss = branch_loss + (torch.log(vc) - torch.log(vm)).pow(2)
+                    branch_loss = branch_loss + (torch.log(vb) - torch.log(vm)).pow(2)
+                    n_branch = n_branch + 3
+            if n_branch > 0:
+                branch_loss = branch_loss / n_branch
         l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
         reinforce_weight = getattr(self.cfg, 'reinforce_weight', 0.01)
         balance_weight = getattr(self.cfg, 'balance_weight', 0.01)
@@ -1049,7 +1154,8 @@ class WideBindStack(nn.Module):
         orth_weight = getattr(self.cfg, 'orth_weight', 1e-4)
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
-            + nuc_weight * nuc_loss + orth_weight * orth_loss
+            + nuc_weight * nuc_loss + orth_weight * orth_loss \
+            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -1108,7 +1214,7 @@ class WideBindStack(nn.Module):
                                               '.w_u', '.w_v']):
                     k = 'gate_wd' if p.ndim >= 2 else 'gate'
                     groups[k]['params'].append(p)
-                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale',
+                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
                                               '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
                                               '.mirror.w_temp', '.mirror.w_global',
                                               '.mirror.log_scale', '.mirror.tanh_bias',
@@ -1138,13 +1244,13 @@ class WideBindStack(nn.Module):
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
-                                               '.mirror.alpha_diag', '.mirror.w_pred_scale',
+                                                '.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
                                                '.mirror.w_gate', '.mirror.b_gate',
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
                                                '.log_skip_alpha'])
             if is_gate:
-                if p.ndim < 2 or 'w_pred_scale' in name:
+                if p.ndim < 2 or 'w_pred_scale_legacy' in name:
                     gate_no_decay.append(p)
                 else:
                     gate_decay.append(p)

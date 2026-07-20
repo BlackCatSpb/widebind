@@ -69,6 +69,10 @@ class WideBindConfig:
     gate_lr_mult: float = 5.0
     lambda_lr_hierarchy: bool = True  # True = LR mult по степеням λ_d^p
 
+    # w_m2v hierarchy by τ (Proposal IV)
+    w_m2v_hierarchy_target: float = 1.0  # m — max target for deep layers
+    w_m2v_hierarchy_weight: float = 0.001  # λ_weight for w_m2v regularisation
+
     # Init stds
     w_d_init_std: float = 0.1
     conv_init_std: float = 0.01
@@ -100,6 +104,9 @@ class WideBindConfig:
     orth_weight: float = 1e-4  # ||Ŵ^TŴ - I||² weight (0=disabled)
     # Surprisal-weighted loss: focus on informative tokens
     surprisal_weight: float = 0.0  # γ, 0=disabled, 0.5=mild, 1.0=aggressive
+
+    # Branch balance: equalize log-variance of conv/bind/mirror (Proposal V-3)
+    branch_balance_weight: float = 0.0  # λ_B, 0=disabled
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

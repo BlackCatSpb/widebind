@@ -82,7 +82,7 @@ class MirrorMonitor:
         self.history['tau'].append(taus)
         self.history['exploration'].append(expl_val)
         self.history['global_state_norm'].append(
-            global_state.norm().item() if global_state is not None else 0.0
+            global_state.norm(dim=(-2, -1)).mean().item() if global_state is not None else 0.0
         )
 
         # Trim if over max_history

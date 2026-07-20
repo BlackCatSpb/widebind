@@ -323,7 +323,7 @@ def test_stack_forward():
     out, state, global_state = model(h)
     assert out.shape == h.shape, f'Output shape: {out.shape} vs input {h.shape}'
     assert len(state) == cfg.n_layers, f'State len: {len(state)} vs {cfg.n_layers}'
-    assert global_state.shape == (1, 1, cfg.D), f'Global state shape: {global_state.shape}'
+    assert global_state.shape == (cfg.n_layers, 1, cfg.D), f'Global state shape: {global_state.shape}'
 
 
 def test_stack_forward_twice_with_state():
@@ -463,8 +463,8 @@ def test_config_init_values():
 
     # alpha_diag shape (G, k) — per-dim per-expert
     assert m0.alpha_diag.shape == (8, k), f'alpha_diag.shape={m0.alpha_diag.shape} != (8,{k})'
-    assert m0.w_pred_scale.shape == (8, k), f'w_pred_scale.shape={m0.w_pred_scale.shape} != (8,{k})'
-    assert m0.w_pred_scale.data[0, 0].item() == 0.5
+    assert m0.w_pred_scale_legacy.shape == (8, k), f'w_pred_scale_legacy.shape={m0.w_pred_scale_legacy.shape} != (8,{k})'
+    assert m0.w_pred_scale_legacy.data[0, 0].item() == 0.5
 
     # w_d std respects config
     w_d_std = model.layers[0].w_d.data.std().item()
@@ -780,7 +780,9 @@ def test_no_lo_hi_split_grad_to_all_k():
     # Grad should exist for all parameters (no dims blocked)
     assert mirror.W_proj.grad is not None
     assert mirror.W_out.grad is not None
-    assert mirror.w_pred_scale.grad is not None
+    assert mirror.log_skip_alpha.grad is not None
+    assert mirror.log_dvar_mod_scale.grad is not None
+    assert mirror.log_grad_mod_scale.grad is not None
 
 
 def test_D4096_G32_forward():
