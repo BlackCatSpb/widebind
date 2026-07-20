@@ -804,7 +804,10 @@ def test_partitioned_embed_fewer_params():
 
 
 def test_gradient_grouping_demonstrable():
-    """Gradient to w_k is exactly zero when bit k is inactive across the batch."""
+    """Gradient to M[k,:] is exactly zero when bit k is inactive across the batch.
+    С mixing matrix все basis-векторы получают градиент от любого активного бита
+    (через M·codes → sigmoid → broadcast), но M[k,:] — только от бита k.
+    """
     cfg = WideBindConfig(D=896, code_dim=32, code_sparsity=6)
     emb = PartitionedEmbedding(cfg)
     tokens = torch.tensor([[0, 1, 2, 42, 100, 500, 1000, 5000]])
@@ -813,12 +816,11 @@ def test_gradient_grouping_demonstrable():
     loss.backward()
     for k in range(emb.K):
         is_active_anywhere = emb.codes[tokens][:, :, k].any().item()
-        grad = emb.basis.grad[k].norm().item()
+        grad = emb.embed_mix.grad[k].norm().item()
         if not is_active_anywhere:
-            assert grad == 0.0, f'w_{k} has grad {grad} but bit inactive for all tokens'
-        # if active, grad is > 0
+            assert grad == 0.0, f'M[{k},:] has grad {grad} but bit inactive for all tokens'
         if is_active_anywhere:
-            assert grad > 0, f'w_{k} has zero grad but bit is active'
+            assert grad > 0, f'M[{k},:] has zero grad but bit is active'
 
 
 # ─── Run all ────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ from .model import (
 from .zeckendorf_readout import ZeckendorfReadout, fibonacci_bases, zeckendorf_code
 
 from .live_inference import LiveInference, MirrorMonitor
+from .curriculum import CurriculumTracker
 
 # Backward compat
 CognitiveMirror = GroupedCognitiveMirror

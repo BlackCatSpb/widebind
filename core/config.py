@@ -90,6 +90,14 @@ class WideBindConfig:
     reinforce_weight: float = 0.01  # MSE(gate, usefulness) aux loss weight
     # Load balancing: encourages uniform expert usage across tokens
     balance_weight: float = 0.01  # CV(gate_usage) aux loss weight (0=disabled)
+    # Diversity loss: decorrelate per-group MLP outputs
+    diversity_weight: float = 0.001  # ||cov - I||² weight (0=disabled)
+    # Nuclear norm regularization for bind W_proj
+    nuclear_weight: float = 1e-5  # stochastic ||W||_* weight (0=disabled)
+    # Orthogonality regularization for bottleneck bind
+    orth_weight: float = 1e-4  # ||Ŵ^TŴ - I||² weight (0=disabled)
+    # Surprisal-weighted loss: focus on informative tokens
+    surprisal_weight: float = 0.0  # γ, 0=disabled, 0.5=mild, 1.0=aggressive
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

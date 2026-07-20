@@ -152,11 +152,19 @@ class PartitionedEmbedding(nn.Module):
         assert D % self.K == 0, f'D={D} must be divisible by K={self.K}'
         d = D // self.K
         
+        # Rank expansion: mixing matrix M (K×K) с ортогональной инициализацией
+        # codes → sigmoid(M·codes) даёт плотные коэффициенты, каждый бит влияет на все сегменты
+        self.embed_mix = nn.Parameter(torch.zeros(self.K, self.K))
+        nn.init.orthogonal_(self.embed_mix)
+        self.register_buffer('_mix_scale', torch.tensor(0.1), persistent=False)
+        
         self.basis = nn.Parameter(torch.randn(self.K, d))
         nn.init.normal_(self.basis, std=0.02)
     
     def forward(self, tokens):
-        codes = self.codes[tokens]
+        codes = self.codes[tokens]  # (B, L, K), sparse binary
+        # Dense mixing: sigmoid(scale · M · codes) → каждый бит влияет на все сегменты
+        codes = torch.sigmoid(torch.einsum('blk,kj->blj', codes, self.embed_mix) * self._mix_scale)
         B, L = tokens.shape
         return torch.einsum('blk,kd->blkd', codes, self.basis).reshape(B, L, -1)
 
@@ -184,8 +192,11 @@ class PartitionedHead(nn.Module):
     
     b_v — learnable per-token bias (token frequency prior).
     K=32: каждый сегмент выровнен с mirror group (1:1).
+    
+    Если embed_basis передан (PartitionedEmbedding.basis), readout делится с ним
+    (weight tying encode/decode). Иначе — собственный readout.
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg, embed_basis=None):
         super().__init__()
         codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
         self.K = codes.shape[1]
@@ -195,9 +206,11 @@ class PartitionedHead(nn.Module):
         assert D % self.K == 0
         d = D // self.K
         
-        self.readout = nn.Parameter(torch.randn(self.K, d))
-        nn.init.normal_(self.readout, std=0.02)
-        # Per-token bias: token frequency prior (V params, negligible)
+        if embed_basis is not None:
+            self.readout = embed_basis  # shared reference
+        else:
+            self.readout = nn.Parameter(torch.randn(self.K, d))
+            nn.init.normal_(self.readout, std=0.02)
         self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
     
     def forward(self, h):
@@ -350,6 +363,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
         # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
         self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)
+        # Error-gated damping: порог резонансного демпфирования α на инференсе
+        self.register_buffer('_damp_tau', torch.tensor(0.1), persistent=False)
     
     def _sync_W_out(self):
         with torch.no_grad():
@@ -397,11 +412,21 @@ class GroupedCognitiveMirror(nn.Module):
         if override > 0:
             alpha_eff = (1 - override) * alpha_eff + override * 1.0
         pred_k = hp_prev * alpha_eff.view(1, 1, G, k)  # (B, L, G, k)
+        _pred_k_aux = pred_k  # undamped — для aux loss, чтобы damping не боролся с ним
         if pred_scale_mod is None:
             dv = self._delta_var
             dv_mean = dv.mean().clamp(min=1e-8)
             pred_scale_mod = (dv / dv_mean).clamp(0.1, 3.0)
-        pred_error = (hp - pred_k) * self.w_pred_scale * pred_scale_mod.view(G, 1)
+        # Нормализованная ошибка предсказания: relative к ||hp||, а не абсолютная
+        hp_norm = hp.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        raw_pred_error = hp - pred_k
+        # Error-gated damping (только инференс): α → 1 когда ||pred_error|| велика
+        # На тренировке (teacher forcing) δ_{t-1}=0, резонанс безвреден.
+        if not self.training:
+            damp = torch.sigmoid(-raw_pred_error.norm(dim=-1).mean() / self._damp_tau)
+            alpha_eff = 1.0 + (alpha_eff - 1.0) * damp
+            pred_k = hp_prev * alpha_eff.view(1, 1, G, k)
+        pred_error = (hp - pred_k) / hp_norm * self.w_pred_scale * pred_scale_mod.view(G, 1)
         # Adaptive tau: K-измерения с высокой ошибкой → короткое τ, с низкой → длинное.
         # alpha_target = sigmoid(2.2 - log(rel_var)):
         #   rel_var=1 (noise) → α=0.9 (init), rel_var=0.5 → α=0.95, rel_var=2 → α=0.82
@@ -415,7 +440,7 @@ class GroupedCognitiveMirror(nn.Module):
                 relative_var = rv / (rv_mean + 1e-10)
                 alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
                 self.alpha_diag.data.lerp_(alpha_target, 0.0005)
-        self._cached_pred_k = pred_k
+        self._cached_pred_k = _pred_k_aux
         self._cached_hp = hp
         
         # ─── Fast signals (hi half of K-space) ───
@@ -554,6 +579,8 @@ class GroupedMLP(nn.Module):
         h = h.reshape(B, L, self.G, self.d)
         h = F.silu(torch.einsum('blgd,gdf->blgf', h, self.W_up))
         h = torch.einsum('blgf,gfd->blgd', h, self.W_down)
+        # Cache per-group outputs for diversity loss (до усреднения)
+        self._cached_group_out = h  # (B, L, G, d)
         return h.reshape(B, L, D)
 
 
@@ -606,11 +633,16 @@ class WideBindBlock(nn.Module):
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
             tie_mirror_proj=cfg.tie_mirror_proj)
         
-        # ─── VSA Memory (gates) ───
-        self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate
-        self.w_d = nn.Parameter(torch.randn(cfg.D) * cfg.w_d_init_std)    # content-dependent decay
+        # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
+        self._n_scales = 4
+        tau_s = torch.tensor([8, 32, 128, 512], dtype=torch.float32)
+        self.register_buffer('_tau_s', tau_s)
+        self.w_i = nn.Parameter(torch.randn(cfg.D))          # content-dependent write gate (shared across scales)
+        self.w_d = nn.Parameter(torch.randn(cfg.D) * cfg.w_d_init_std)    # content-dependent decay modulation
         self.w_q = nn.Parameter(torch.full((cfg.D,), 1.0 / math.sqrt(cfg.D)))  # warm read: mem_read ≈ mem_all at init
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
+        # Per-scale per-channel combination weights (logits for softmax)
+        self.scale_w = nn.Parameter(torch.zeros(self._n_scales, cfg.D))
         # Linear decay across layers: shallow → short memory, deep → long
         # Per-channel (D,) — can differentiate via gradient when vsa_b_d_smooth < 1.0
         layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
@@ -673,14 +705,23 @@ class WideBindBlock(nn.Module):
         v = hp * self.w_v             # (B, L, K)
         bind_out = (u * v) @ self.W_out  # (B, L, D)
         
-        # ─── VSA Memory (adaptive gates) ───
-        i_gate = F.softplus(h * self.w_i + self.b_i)        # (B, L, D) bounded [0, ∞)
-        decay = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D)
+        # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
+        S = self._n_scales
+        d_s = torch.exp(-1.0 / self._tau_s.to(device))  # (S,) — fixed τ-scales
+        i_gate = F.softplus(h * self.w_i + self.b_i)        # (B, L, D)
+        d_mod = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D) — content mod of decay
         if noise_scale > 0 and self.training:
             noise = 1.0 + noise_scale * torch.randn_like(i_gate)
             i_gate = i_gate * noise
         
-        # Shared prefix scan intermediates for mem + mu (same decay)
+        # Vectorize over S scales: (B, L, D) → (B, L, S*D)
+        d_s_vec = d_s.view(1, 1, S, 1).expand(B, L, S, D).reshape(B, L, S * D)
+        d_mod_vec = d_mod.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
+        decay = d_s_vec * d_mod_vec  # each scale: d_s · content_mod
+        
+        mem_input = h * i_gate  # (B, L, D)
+        input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
+        
         eps = 1e-10
         log_a = torch.log(decay.clamp(min=eps))
         log_cum = torch.cumsum(log_a, dim=1)
@@ -696,14 +737,26 @@ class WideBindBlock(nn.Module):
                 result = cum_decay * cum_w
             return result, result[:, -1]
         
-        mem_input = h * i_gate
-        mem_all, mem_state_out = _scan(mem_input, mem_state)
+        if mem_state is not None:
+            mem_state = mem_state.reshape(B, S * D)
+        mem_all_vec, mem_state_out_vec = _scan(input_vec, mem_state)
+        mem_all_vec = mem_all_vec.reshape(B, L, S, D)  # (B, L, S, D)
+        # Weighted combination: softmax over scales per channel
+        w = F.softmax(self.scale_w, dim=0)  # (S, D)
+        mem_all = (mem_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, L, D)
         mem_read = mem_all * self.w_q                    # (B, L, D)
+        mem_state_out = mem_state_out_vec.reshape(B, S * D)
         
-        # First moment (same decay, scaled input)
-        mu_all, mu_state_out = _scan(mem_input * self.w_k_mu, mu_state)
+        # First moment (same multi-scale decay, scaled input)
+        if mu_state is not None:
+            mu_state = mu_state.reshape(B, S * D)
+        mu_input_vec = (mem_input * self.w_k_mu).unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
+        mu_all_vec, mu_state_out_vec = _scan(mu_input_vec, mu_state)
+        mu_all_vec = mu_all_vec.reshape(B, L, S, D)
+        mu_all = (mu_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
+        mu_state_out = mu_state_out_vec.reshape(B, S * D)
         
         # ─── Mirror (self-consistency: local + global) ───
         mirror, mlp_mod, mem_mod = self.mirror(
@@ -745,7 +798,7 @@ class WideBindStack(nn.Module):
         if getattr(cfg, 'zeckendorf_readout', False):
             self.lm_head = ZeckendorfReadout(cfg)
         else:
-            self.lm_head = PartitionedHead(cfg)
+            self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
         
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
@@ -836,9 +889,13 @@ class WideBindStack(nn.Module):
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod)
             if s_out is not None:
-                mem_out = s_out[0]  # (B, D) — layer's final memory state
-                # Update global state: adaptive EMA aggregation
-                mem_avg = mem_out.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
+                mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
+                B = h.shape[0]
+                S = layer._n_scales
+                # Weighted combination of scales для global state
+                w = F.softmax(layer.scale_w, dim=0)  # (S, D)
+                mem_combined = (mem_state_out.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
+                mem_avg = mem_combined.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
                 global_state = (ema_alpha * global_state +
                                 (1.0 - ema_alpha) * mem_avg)
                 s_out = tuple(t.detach() for t in s_out)
@@ -865,8 +922,16 @@ class WideBindStack(nn.Module):
             ce_loss = -log_probs.mean()
         else:
             logits = self.lm_head(h)
-            ce_loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
-                                      targets.reshape(-1), reduction='mean')
+            ce = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
+                                 targets.reshape(-1), reduction='none')
+            # Surprisal-weighted loss: w_t = (CE_t / mean(CE))^γ
+            sw = getattr(self.cfg, 'surprisal_weight', 0.0)
+            if self.training and sw > 0:
+                with torch.no_grad():
+                    w = (ce / (ce.mean() + 1e-8)).clamp(max=10.0) ** sw
+                ce_loss = (ce * w).mean()
+            else:
+                ce_loss = ce.mean()
         pw = pred_weight if pred_weight is not None else getattr(self, '_pred_weight', 0.1)
         # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0
@@ -917,10 +982,62 @@ class WideBindStack(nn.Module):
         if n_bal > 0:
             balance_loss = balance_loss / n_bal
         
+        # Diversity loss: decorrelate per-group MLP outputs
+        # ||cov(||group_out||_g) - I||_F² → каждая группа ортогональна другим
+        diversity_loss = 0.0
+        n_div = 0
+        for layer in self.layers:
+            group_out = getattr(layer.mlp, '_cached_group_out', None)
+            if group_out is not None:
+                B, L, G, d = group_out.shape
+                y = group_out.norm(dim=-1).reshape(-1, G)  # (B*L, G)
+                y = y - y.mean(dim=0, keepdim=True)
+                cov = y.T @ y / (y.shape[0] - 1 + 1e-10)
+                div = F.mse_loss(cov, torch.eye(G, device=cov.device))
+                diversity_loss = diversity_loss + div
+                n_div = n_div + 1
+        if n_div > 0:
+            diversity_loss = diversity_loss / n_div
+        
+        # Nuclear norm regularization for bind W_proj
+        # stochastic estimate: ||W||_* ≈ mean(||Wv||₂) · sqrt(K)
+        nuc_loss = 0.0
+        n_nuc = 0
+        nuc_iters = 5
+        for layer in self.layers:
+            W = getattr(layer, 'W_proj', None)
+            if W is not None:
+                v = torch.randn(W.shape[1], nuc_iters, device=W.device)
+                Wv = W @ v
+                nuc = Wv.norm(dim=0).mean() * math.sqrt(W.shape[1])
+                nuc_loss = nuc_loss + nuc
+                n_nuc = n_nuc + 1
+        if n_nuc > 0:
+            nuc_loss = nuc_loss / n_nuc
+        
+        # Orthogonality regularization for bottleneck bind: ||Ŵ^T Ŵ - I||_F²
+        orth_loss = 0.0
+        n_orth = 0
+        for layer in self.layers:
+            W = getattr(layer, 'W_proj', None)
+            if W is not None:
+                W_hat = W / W.norm(dim=0, keepdim=True).clamp(min=1e-8)
+                gram = W_hat.T @ W_hat  # (K, K)
+                orth = F.mse_loss(gram, torch.eye(gram.shape[0], device=gram.device))
+                orth_loss = orth_loss + orth
+                n_orth = n_orth + 1
+        if n_orth > 0:
+            orth_loss = orth_loss / n_orth
+        
         l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
         reinforce_weight = getattr(self.cfg, 'reinforce_weight', 0.01)
         balance_weight = getattr(self.cfg, 'balance_weight', 0.01)
-        return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss + balance_weight * balance_loss
+        diversity_weight = getattr(self.cfg, 'diversity_weight', 0.001)
+        nuc_weight = getattr(self.cfg, 'nuclear_weight', 1e-5)
+        orth_weight = getattr(self.cfg, 'orth_weight', 1e-4)
+        return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
+            + balance_weight * balance_loss + diversity_weight * diversity_loss \
+            + nuc_weight * nuc_loss + orth_weight * orth_loss
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -1065,10 +1182,30 @@ class AdaptiveController:
 
     @staticmethod
     def layer_b_i(layer, expl=None):
-        """Per-layer write gate bias."""
+        """Per-layer write gate bias. Нормировка: i_gate ∝ 1/τ.
+        
+        i_gate = softplus(b_i_l). Равновесная норма памяти:
+            ‖M_l‖ = i_gate · ‖h‖ · τ_l
+        Для ‖M_l‖ = const по слоям: i_gate ∝ 1/τ_l.
+        
+        Базовое значение: i_gate_ref = 0.182 при τ_ref ≈ 32.
+        c = 0.182 · 32 ≈ 5.83.
+        i_gate_l = c / τ_l  →  b_i_l = softplus⁻¹(c / τ_l)
+        """
         if expl is None:
             expl, _ = AdaptiveController.layer_stats(layer)
-        return -3.0 + expl * 1.5
+        # Базовый b_i от exploration
+        b_i_base = -3.0 + expl * 1.5
+        # c = 0.182 · 32 ≈ 5.83
+        c = 5.83
+        lf = getattr(layer, 'layer_idx', 0) / max(getattr(layer, 'total_layers', 32) - 1, 1)
+        # τ_l ≈ 8 · (1 + 3.5 · lf)  (аппроксимация линейного роста 8→149 по слоям)
+        tau_l = 8.0 + 141.0 * lf
+        i_target = min(1.0, c / tau_l)  # насыщение на 1.0 для L0
+        # softplus⁻¹(x) = log(exp(x)-1), но для численной стабильности:
+        # b_i = log(exp(i_target) - 1) ≈ log(i_target) для малых i_target
+        b_i_tau = math.log(max(i_target, 1e-6))
+        return b_i_base + b_i_tau
 
     @staticmethod
     def layer_w_mem2v_scale(layer, min_val=0.544, max_val=1.0, diff=None):
