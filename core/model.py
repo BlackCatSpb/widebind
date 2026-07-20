@@ -461,6 +461,8 @@ class GroupedCognitiveMirror(nn.Module):
         gate_logits = gate_logits + dvar_mod.unsqueeze(0).unsqueeze(0)
         
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
+        # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
+        self._cached_gate_l1 = expert_gate.mean()
         
         mirror = mirror * expert_gate.unsqueeze(-1)
         mirror = mirror.reshape(B, L, D)
@@ -835,7 +837,21 @@ class WideBindStack(nn.Module):
             n_pred = n_pred + 1
         if n_pred > 0:
             pred_loss = pred_loss / n_pred
-        return ce_loss + pw * pred_loss
+        
+        # Gate L1 sparsity: encourages expert specialization
+        # Only experts with high gate are active; others pushed to zero
+        gate_l1 = 0.0
+        n_gates = 0
+        for layer in self.layers:
+            g = getattr(layer.mirror, '_cached_gate_l1', None)
+            if g is not None:
+                gate_l1 = gate_l1 + g
+                n_gates = n_gates + 1
+        if n_gates > 0:
+            gate_l1 = gate_l1 / n_gates
+        
+        l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
+        return ce_loss + pw * pred_loss + l1_weight * gate_l1
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())

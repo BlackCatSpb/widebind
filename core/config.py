@@ -84,6 +84,9 @@ class WideBindConfig:
     cov_tau_lo: int = 3
     cov_tau_hi: int = 200
 
+    # Gate sparsity (auxiliary loss weight for expert specialization)
+    gate_l1_weight: float = 0.001   # L1 penalty on expert gates (0=disabled)
+
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
     vsa_b_d_smooth: float = 0.999   # per-step lerp rate towards controller target
