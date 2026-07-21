@@ -5,8 +5,8 @@ call conda activate base 2>nul || echo [WideBind] No conda, using system Python
 
 echo [WideBind] Starting training...
 echo   Data: C:\Users\black\OneDrive\Desktop\fcp
-echo   Model: 41M params, 24 layers, B=2, L=128
-echo   VRAM: ~1.9 GB peak
+echo   Model: 152M params, 32 layers, B=2, L=128
+echo   VRAM: ~2-3 GB peak
 echo.
 
 echo   TRAINING ON CLEAN DATA (PAD REMOVED) - STARTING FRESH
@@ -19,7 +19,7 @@ start /b /wait "" python train.py ^
     --seq-len 128 ^
     --n-layers 24 ^
     --bottleneck 896 ^
-    --bind-K 16 ^
+    --bind-K 64 ^
     --mlp-groups 8 ^
     --mlp-expand 8 ^
     --lr 3e-4 ^
