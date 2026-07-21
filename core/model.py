@@ -1622,6 +1622,7 @@ class MirrorLRScheduler:
                 override = max(0.0, 1.0 - mult * 0.7)  # 1.0 → 0.3
             else:
                 blend = (self._step - warmup_end) / blend_steps  # 0 → 1
+                mult = 1.0 - blend * 0.3  # плавно 1.0 → 0.7
                 override = 0.3 * max(0.0, 1.0 - blend)  # 0.3 → 0.0
             # Temperature annealing during warmup (homeostatica接管 after warmup)
             temp_max, temp_min = 2.0, 0.5
