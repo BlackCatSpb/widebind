@@ -98,7 +98,7 @@ def vsa_prefix_scan(a, b, state=None):
         log_a_chunk = torch.log(a_chunk.clamp(min=eps))
         log_cum_chunk = torch.cumsum(log_a_chunk, dim=1)
         cum_decay_chunk = torch.exp(log_cum_chunk)
-        inv_cum_decay_chunk = torch.exp(-log_cum_chunk)
+        inv_cum_decay_chunk = 1.0 / cum_decay_chunk.clamp(min=eps)
         
         weighted = b_chunk * inv_cum_decay_chunk
         cum_weighted = torch.cumsum(weighted, dim=1)
@@ -807,7 +807,7 @@ class WideBindBlock(nn.Module):
             log_a = torch.log(d_chunk.clamp(min=eps))
             log_cum = torch.cumsum(log_a, dim=1)
             cum_decay = torch.exp(log_cum)
-            inv_cum = torch.exp(-log_cum)
+            inv_cum = 1.0 / cum_decay.clamp(min=eps)
             weighted = b_chunk * inv_cum
             cum_w = torch.cumsum(weighted, dim=1)
             intra = cum_decay * cum_w
