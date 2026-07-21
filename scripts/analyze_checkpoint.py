@@ -23,6 +23,20 @@ def svd_eff_rank(w):
     s = torch.linalg.svdvals(w.float())
     return (s.sum() ** 2 / (s ** 2).sum()).item()
 
+def bind_output_eff_rank(layer, x):
+    """Effective rank of bind OUTPUT over the batch axis via covariance SVD.
+    This is what the Fibonacci twist actually raises (r_p won't move in tied mode)."""
+    layer.eval()
+    with torch.no_grad():
+        bind_out = layer.bind(x)
+        flat = bind_out.reshape(-1, bind_out.shape[-1]).float()
+        flat = flat - flat.mean(dim=0, keepdim=True)
+        cov = flat.t() @ flat / max(flat.shape[0] - 1, 1)
+        s = torch.linalg.svdvals(cov)
+        s = s[s > 1e-12]
+    return (s.sum().pow(2) / s.pow(2).sum()).item() if s.numel() > 0 else 0.0
+
+
 def top_singular_values(w, n=5):
     s = torch.linalg.svdvals(w.float())
     return [f'{s[i]:.3f}' for i in range(min(n, len(s)))]
@@ -64,6 +78,8 @@ def analyze_single_checkpoint(ckpt_path):
     x = torch.randint(0, min(cfg.vocab, 1000), (1, 16)).to(device)
     h = model.embed_tokens(x)
     out, state, _ = model(h, adaptive=False)
+    # Sample batch for bind output rank measurement (fresh random, not the same as forward)
+    sample_batch = model.embed_tokens(torch.randint(0, min(cfg.vocab, 1000), (1, 32)).to(device))
     
     # ─── Per-layer analysis ───
     layers_data = []
@@ -71,13 +87,21 @@ def analyze_single_checkpoint(ckpt_path):
         d = {'idx': i}
         
         # Bind
-        wp = layer.W_proj.data
-        wo = layer.W_out.data
+        bnd = layer.bind
+        wp = bnd.W_proj.weight.data   # (D, K)
+        wo = bnd.W_out.data           # (K, D) or (S, K, D)
         d['bind_proj_norm'] = wp.norm().item()
         d['bind_out_norm'] = wo.norm().item()
         d['bind_proj_svd'] = top_singular_values(wp)
-        d['bind_out_svd'] = top_singular_values(wo)
+        d['bind_out_svd'] = top_singular_values(wo if wo.dim() == 2 else wo.reshape(-1, wo.shape[-1]))
         d['bind_proj_rank'] = svd_eff_rank(wp)
+        d['bind_mode'] = bnd.mode
+        d['bind_S'] = bnd.S
+        # bind output effective rank (requires a real batch)
+        if 'sample_batch' in locals() and sample_batch is not None and i == 0:
+            d['bind_out_rank'] = bind_output_eff_rank(layer, sample_batch)
+        else:
+            d['bind_out_rank'] = 0.0
         
         # Gates
         for gate in ['w_i', 'w_d', 'w_q', 'w_mem2v', 'w_k_mu', 'w_q_mu', 'w_mu_mem']:
@@ -93,10 +117,10 @@ def analyze_single_checkpoint(ckpt_path):
         d['i_gate'] = torch.sigmoid(layer.b_i.data).mean().item()
         d['tau'] = -1.0 / math.log(max(torch.sigmoid(layer.b_d.data).mean().item(), 1e-10))
         
-        # VSA vectors
+        # Bind bilinear weights
         for vec in ['w_u', 'w_v']:
-            d[f'{vec}_mean'] = getattr(layer, vec).data.mean().item()
-            d[f'{vec}_std'] = getattr(layer, vec).data.std().item()
+            d[f'bind_{vec}_mean'] = getattr(bnd, vec).data.mean().item()
+            d[f'bind_{vec}_std'] = getattr(bnd, vec).data.std().item()
         
         # Spectral
         d['lambda_k_mean'] = layer.lambda_k.data.mean().item()
@@ -225,7 +249,9 @@ def append_to_log(ckpt_path, layers_data, model, cfg, step, best_val, all_w, out
 | var(log_scale) mean | {sum(s**2 for s in ls_stds)/len(ls_stds):.6f} |
 | log_scale sigma mean | {sum(ls_stds)/len(ls_stds):.4f} |
 | MLP eff_rank mean | {sum(d['mlp_eff_rank'] for d in layers_data)/len(layers_data):.1f} |
-| Bind rank mean | {sum(d['bind_proj_rank'] for d in layers_data)/len(layers_data):.1f} |
+| Bind proj rank mean (r_p) | {sum(d['bind_proj_rank'] for d in layers_data)/len(layers_data):.1f} |
+| Bind out rank mean (r_out) | {sum(d['bind_out_rank'] for d in layers_data)/len(layers_data):.1f} |
+| Bind mode | {d0['bind_mode']} S={d0['bind_S']} |
 | tau range | [{min(d['tau'] for d in layers_data):.0f}, {max(d['tau'] for d in layers_data):.0f}] |
 | i_gate | {d0['i_gate']:.3f} |
 | w_pred_scale mu | {d0['w_pred_scale_mean']:.3f} |
@@ -358,6 +384,7 @@ pre {{ background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; 
         # Bind
         html += f'<td class="num">{d["bind_proj_norm"]:.2f}</td>'
         html += f'<td class="num">{d["bind_proj_rank"]:.1f}</td>'
+        html += f'<td class="num">{d["bind_out_rank"]:.1f}</td>'
         # Gates
         html += f'<td class="num">{d["b_i_val"]:.2f}</td>'
         html += f'<td class="num">{d["i_gate"]:.3f}</td>'

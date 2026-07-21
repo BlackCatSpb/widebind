@@ -115,6 +115,13 @@ class WideBindConfig:
                                     # 1.0 = instant overwrite (old behavior)
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
+    # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
+    bind_twist_mode: str = "off"         # "off" | "shift" | "cascade"
+    bind_twist_S: int = 4                # number of shifts (1 when mode=off)
+    bind_twist_ocular: str = "tied"      # "tied" | "multi" — per-shift W_out
+    bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
+    bind_twist_gate: bool = False        # per-token adaptive aperture via hp
+
     # Gradient accumulation
     accum_steps: int = 1  # effective batch = batch_size * seq_len * accum_steps
 
