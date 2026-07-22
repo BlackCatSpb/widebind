@@ -543,7 +543,9 @@ class GroupedCognitiveMirror(nn.Module):
                 self._cached_isolation = isolation
         
         # ─── Private Memory: write confident K-space states (contradiction-aware) ───
-        if _write:
+        # Delay private memory writes until after warmup (alpha_override == 0)
+        _write_ok = _write and self._alpha_override.item() < 0.01
+        if _write_ok:
             with torch.no_grad():
                 conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
                 contra_u = contra.unsqueeze(-1)
