@@ -44,6 +44,7 @@ class WideBindConfig:
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
     mlp_expand: int = 4
+    private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
 
     # Scheduler (values below will be overridden by λ_d when lambda_d_enabled=True)
     scheduler: str = 'mirror'

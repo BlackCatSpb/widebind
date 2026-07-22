@@ -317,6 +317,8 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=1000)
     parser.add_argument('--save-interval', type=int, default=5000)
     parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
+    parser.add_argument('--private-mem', action='store_true',
+                        help='Enable private memory bank, contradiction gate & concept graph')
     args = parser.parse_args()
 
     cfg = WideBindConfig(
@@ -334,6 +336,7 @@ if __name__ == '__main__':
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         scheduler=args.scheduler,
+        private_mem=args.private_mem,
         data_dir=args.drive_path or '',
         save_dir=args.drive_path or 'checkpoints',
         log_dir=args.drive_path or 'logs',

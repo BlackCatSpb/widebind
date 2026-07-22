@@ -232,6 +232,8 @@ if __name__ == '__main__':
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--eval-interval', type=int, default=2000)
     parser.add_argument('--save-interval', type=int, default=5000)
+    parser.add_argument('--private-mem', action='store_true',
+                        help='Enable private memory bank, contradiction gate & concept graph')
     args = parser.parse_args()
 
     cfg = WideBindConfig(
@@ -240,6 +242,7 @@ if __name__ == '__main__':
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
+        private_mem=args.private_mem,
         grad_clip=1.0, conv_kernel=48,
         data_dir=args.data_dir,
         save_dir=args.save_dir,
