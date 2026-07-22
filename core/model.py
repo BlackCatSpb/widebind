@@ -812,7 +812,9 @@ class BottleneckBind(nn.Module):
         super().__init__()
         self.D, self.K = D, K
         self.mode = getattr(cfg, "bind_twist_mode", "off")
-        self.S = 1 if self.mode == "off" else int(getattr(cfg, "bind_twist_S", 4))
+        self.S = int(getattr(cfg, "bind_twist_S", 4))
+        if self.mode == "off":
+            self.S = 1
         self.ocular = getattr(cfg, "bind_twist_ocular", "tied")
         self.gated = bool(getattr(cfg, "bind_twist_gate", False)) and self.mode != "off"
         scheme = getattr(cfg, "bind_twist_scheme", "golden")
@@ -833,6 +835,10 @@ class BottleneckBind(nn.Module):
         self.w_v = nn.Parameter(torch.empty(self.S, K))
         nn.init.normal_(self.w_u, 0.0, 1.0)
         nn.init.normal_(self.w_v, 0.0, 1.0)
+
+        # For shift mode with tie_bind, separate W_out per shift is needed for full rank S*K
+        if self.mode == "shift" and tie_bind and self.S > 1:
+            self.ocular = "multi"
 
         # --- ocular(s) ---
         if self.mode != "off" and self.ocular == "multi" and self.S > 1:

@@ -45,6 +45,7 @@ class WideBindConfig:
     mlp_groups: int = 32
     mlp_expand: int = 4
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
+    signal_entropy_weight: float = 0.001  # entropy regularization on 5 signal weights (0=disabled)
 
     # Scheduler (values below will be overridden by λ_d when lambda_d_enabled=True)
     scheduler: str = 'mirror'
