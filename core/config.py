@@ -47,6 +47,7 @@ class WideBindConfig:
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on 5 signal weights (0=disabled)
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
+    div_weight: float = 0.5  # expert diversity (var(log_scale) bonus)
 
     # Scheduler (values below will be overridden by λ_d when lambda_d_enabled=True)
     scheduler: str = 'mirror'
