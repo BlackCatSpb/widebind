@@ -47,7 +47,7 @@ class WideBindConfig:
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     signal_entropy_weight: float = 0.001  # entropy regularization on 5 signal weights (0=disabled)
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
-    div_weight: float = 0.01  # expert diversity: sum-of-squares push, no /N (0=disabled)
+    div_weight: float = 0.0001  # expert diversity: var-based push, no /N (0=disabled)
     ranking_weight: float = 0.1  # pairwise order ls_mean by gate_usage (0=disabled)
 
     # Scheduler (values below will be overridden by λ_d when lambda_d_enabled=True)
@@ -98,9 +98,9 @@ class WideBindConfig:
     # Gate sparsity (auxiliary loss weight for expert specialization)
     gate_l1_weight: float = 0.001   # L1 penalty on expert gates (0=disabled)
     # Expert reinforcement: align gate with usefulness prediction
-    reinforce_weight: float = 0.01  # MSE(gate, usefulness) aux loss weight
+    reinforce_weight: float = 0.001  # MSE(gate, usefulness) aux loss weight
     # Load balancing: encourages uniform expert usage across tokens
-    balance_weight: float = 0.01  # CV(gate_usage) aux loss weight (0=disabled)
+    balance_weight: float = 0.001  # CV(gate_usage) aux loss weight (0=disabled)
     # Diversity loss: decorrelate per-group MLP outputs
     diversity_weight: float = 0.001  # ||cov - I||² weight (0=disabled)
     # Nuclear norm regularization for bind W_proj

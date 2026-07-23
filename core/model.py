@@ -652,7 +652,7 @@ class GroupedCognitiveMirror(nn.Module):
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
         skip_alpha = torch.exp(self.log_skip_alpha).view(1, 1, G, 1)
         mirror = torch.tanh(linear) + skip_alpha * linear
-        mirror = mirror * torch.exp(self.log_scale * self._gate_ema.unsqueeze(-1))
+        mirror = mirror * torch.exp(self.log_scale * self._gate_ema.clone().detach().unsqueeze(-1))
         
         # ─── K-Space Gate (per-token, per-expert) ───
         gate_signal = torch.abs(pred_error)  # (B, L, G, k)
@@ -669,6 +669,13 @@ class GroupedCognitiveMirror(nn.Module):
             if self._cached_contra_expert is not None:
                 ce = self._cached_contra_expert.to(gate_logits.device).unsqueeze(0).unsqueeze(0)
                 gate_logits = gate_logits + ce  # collective contradiction raises gate
+            # Soft routing overlay: specialization + consensus modulate gate via w_contra
+            spec = self._behavior_div_ema.mean(dim=-1)            # (G,) — avg divergence per expert
+            spec = spec / (spec.max() + 1e-10)                    # norm to [0, 1]
+            cons = self._concept_sim_ema.mean(dim=-1)             # (G,) — avg similarity per expert
+            cons = cons / (cons.max() + 1e-10)                    # norm to [0, 1]
+            gate_bonus = (spec * 0.5 + cons * 0.5) * self.w_contra * 0.1
+            gate_logits = gate_logits + gate_bonus.unsqueeze(0).unsqueeze(0)
         
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
@@ -1560,7 +1567,7 @@ class WideBindStack(nn.Module):
         div_loss = 0.0
         if div_w > 0:
             all_ls = torch.cat([layer.mirror.log_scale.reshape(-1) for layer in self.layers])
-            div_loss = -div_w * ((all_ls - all_ls.mean()) ** 2).sum()
+            div_loss = -div_w * all_ls.var()
         # Ranking loss: order ls_mean by gate_usage (contrastive, no /N dilution)
         ranking_weight = getattr(self.cfg, 'ranking_weight', 0.0)
         ranking_loss = 0.0
@@ -1574,13 +1581,25 @@ class WideBindStack(nn.Module):
                     ls_diff = ls_mean.unsqueeze(1) - ls_mean.unsqueeze(0)
                     margin = 0.1
                     ranking_loss = ranking_loss + (F.relu(margin - ls_diff) * (gate_diff > 0).float()).sum()
-        return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
+        total = ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
             + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss \
             + ranking_weight * ranking_loss \
             - signal_entropy_weight * signal_entropy \
             + log_scale_l2_weight * log_scale_reg
+        self._cached_losses = {
+            'ce': ce_loss.item() if hasattr(ce_loss, 'item') else ce_loss,
+            'pred': pred_loss.item() if hasattr(pred_loss, 'item') else pred_loss,
+            'gate_l1': gate_l1.item() if hasattr(gate_l1, 'item') else gate_l1,
+            'reinforce': reinforce_loss.item() if hasattr(reinforce_loss, 'item') else reinforce_loss,
+            'balance': balance_loss.item() if hasattr(balance_loss, 'item') else balance_loss,
+            'div': div_loss.item() if hasattr(div_loss, 'item') else div_loss,
+            'ranking': ranking_loss.item() if hasattr(ranking_loss, 'item') else ranking_loss,
+            'signal_ent': signal_entropy.item() if hasattr(signal_entropy, 'item') else signal_entropy,
+            'ls_reg': log_scale_reg.item() if hasattr(log_scale_reg, 'item') else log_scale_reg,
+        }
+        return total, div_loss, ranking_loss, div_w, ranking_weight
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -1924,30 +1943,21 @@ class MirrorLRScheduler:
         if cfg is not None:
             base_lr = base_lr or cfg.lr
             warmup = getattr(cfg, 'warmup_steps', warmup)
-            target_var = getattr(cfg, 'target_var', target_var)
-            mag_threshold = getattr(cfg, 'mag_threshold', mag_threshold)
-            lr_min_ratio = getattr(cfg, 'lr_min_ratio', lr_min_ratio)
-            max_decay_steps = getattr(cfg, 'max_decay_steps', max_decay_steps)
-            var_min_for_lr_decay = getattr(cfg, 'var_min_for_lr_decay', var_min_for_lr_decay)
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
         self.warmup = warmup
-        self.target_var = target_var
-        self.mag_threshold = mag_threshold
-        self.lr_min_ratio = lr_min_ratio
-        self.max_decay_steps = max_decay_steps
-        self.var_min_for_lr_decay = var_min_for_lr_decay
         self._step = 0
         self._last_log = 0
-        self._init_var = None
-        self._init_1malpha = None
-        self._init_gate_var = None
+        # Adaptive thresholds: EMA of mirror stats (replaces fixed init/reference values)
+        self._tau_var = None
+        self._tau_mag = None
+        self._tau_1malpha = None
+        self._tau_gate_var = None
+        self._tau_ema = 0.99
         self._best_val_loss = float('inf')
         self._loss_lr_factor = 1.0  # persistent damping factor (1.0 = no damping)
         self._pending_val_loss = None
-        self._train_loss_tracker = []  # rolling training loss window for trend detection
-        self._train_loss_lr_factor = 1.0
 
     def _mirror_stats(self):
         var_sum = 0.0
@@ -1966,19 +1976,7 @@ class MirrorLRScheduler:
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
     def report_train_loss(self, train_loss):
-        """Report training loss for LR damping. Accumulates rolling window, detects
-        sustained increase and reduces LR multiplicatively."""
-        self._train_loss_tracker.append(train_loss)
-        if len(self._train_loss_tracker) > 500:
-            self._train_loss_tracker.pop(0)
-        # Detect sustained increase: last 100 steps higher than 300-200 steps ago
-        if len(self._train_loss_tracker) >= 300:
-            old = sum(self._train_loss_tracker[-300:-200]) / 100
-            recent = sum(self._train_loss_tracker[-100:]) / 100
-            if recent > old * 1.05 and self._train_loss_lr_factor > 0.1:
-                self._train_loss_lr_factor = max(0.1, self._train_loss_lr_factor * 0.7)
-                print(f'  TRAIN LR DAMPED: recent={recent:.4f} > old={old:.4f}, '
-                      f'factor {self._train_loss_lr_factor:.3f}')
+        pass
 
     def report_val_loss(self, val_loss):
         """Report validation loss for LR damping. Called from training code after eval."""
@@ -1997,7 +1995,7 @@ class MirrorLRScheduler:
             self._loss_lr_factor = 1.0
         elif vl > self._best_val_loss * 1.02:
             old = self._loss_lr_factor
-            self._loss_lr_factor = max(0.1, self._loss_lr_factor * 0.5)
+            self._loss_lr_factor = max(0.3, self._loss_lr_factor * 0.85)
             if self._loss_lr_factor < old:
                 print(f'  LR DAMPED: val_loss={vl:.4f} > best={self._best_val_loss:.4f}, '
                       f'factor {old:.3f} -> {self._loss_lr_factor:.3f}')
@@ -2033,45 +2031,47 @@ class MirrorLRScheduler:
                 layer.mirror._alpha_override.fill_(0.0)
             var, mag, mean_1malpha, gate_var = self._mirror_stats()
 
-            if self._init_var is None:
-                self._init_var = var + 1e-10
-                self._init_1malpha = mean_1malpha + 1e-10
-                self._init_gate_var = gate_var + 1e-10
+            # Initialize adaptive taus on first post-warmup step
+            if self._tau_var is None:
+                self._tau_var = var + 1e-10
+                self._tau_mag = mag + 1e-10
+                self._tau_1malpha = mean_1malpha + 1e-10
+                self._tau_gate_var = gate_var + 1e-10
 
-            # EMA smoothing to reduce noise (τ~100 steps at 0.99)
-            if not hasattr(self, '_var_ema'):
-                self._var_ema = var
-                self._1malpha_ema = mean_1malpha
-                self._gate_var_ema = gate_var
-            ema = 0.99
-            self._var_ema = ema * self._var_ema + (1 - ema) * var
-            self._1malpha_ema = ema * self._1malpha_ema + (1 - ema) * mean_1malpha
-            self._gate_var_ema = ema * self._gate_var_ema + (1 - ema) * gate_var
-            var, mean_1malpha, gate_var = self._var_ema, self._1malpha_ema, self._gate_var_ema
+            # Update adaptive taus via EMA (reference point follows moving statistics)
+            te = self._tau_ema
+            self._tau_var = te * self._tau_var + (1 - te) * var
+            self._tau_mag = te * self._tau_mag + (1 - te) * mag
+            self._tau_1malpha = te * self._tau_1malpha + (1 - te) * mean_1malpha
+            self._tau_gate_var = te * self._tau_gate_var + (1 - te) * gate_var
 
-            # Counter-cyclical multipliers: LR down when volatility grows, up when stagnant
-            var_growth = var / self._init_var
-            var_mult = min(2.0, max(0.5, 1.0 / max(var_growth, 1e-10)))
+            # Deviation-based multipliers: LR down only when stats deviate from steady-state
+            # Ratio to adaptive tau (stays near 1.0 when stats move slowly)
+            var_ratio = var / self._tau_var
+            var_mult = min(2.0, max(0.5, 1.0 / max(var_ratio, 1e-10)))
 
-            alpha_growth = mean_1malpha / self._init_1malpha
-            alpha_mult = min(2.0, max(0.5, 1.0 / max(alpha_growth, 1e-10)))
+            alpha_ratio = mean_1malpha / self._tau_1malpha
+            alpha_mult = min(2.0, max(0.5, 1.0 / max(alpha_ratio, 1e-10)))
 
-            gate_growth = gate_var / self._init_gate_var
-            gate_mult = min(2.0, max(0.5, 1.0 / max(gate_growth, 1e-10)))
+            gate_ratio = gate_var / self._tau_gate_var
+            gate_mult = min(2.0, max(0.5, 1.0 / max(gate_ratio, 1e-10)))
 
-            # Magnitude cap: |mirror| above threshold reduces LR (counter-cyclical)
-            mag_factor = min(1.0, max(0.2, self.mag_threshold / max(mag, 1e-10)))
+            # Mag factor: |mirror| deviation from tau (adaptive reference)
+            mag_ratio = mag / self._tau_mag
+            mag_factor = min(1.0, max(0.2, 1.0 / max(mag_ratio, 1e-10)))
 
             mirror_mult = min(var_mult, alpha_mult, gate_mult) * mag_factor
             mult = max(0.05, min(1.0, mirror_mult))
 
-            # Persistent loss damping applied every step
-            mult *= self._loss_lr_factor * self._train_loss_lr_factor
+            # Persistent loss damping (gentler: 0.85 decay, 0.3 floor)
+            mult *= self._loss_lr_factor
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
+                tau_var = self._tau_var.item() if hasattr(self._tau_var, 'item') else self._tau_var
                 print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
                       f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
+                      f'tau_var={tau_var:.6f} '
                       f'mult={mult:.4f} damp={self._loss_lr_factor:.3f} lr={self.base_lr*mult:.2e}')
 
         for pg in self.optimizer.param_groups:
@@ -2085,25 +2085,23 @@ class MirrorLRScheduler:
             'step': self._step,
             'last_log': self._last_log,
             'type': 'MirrorLRScheduler',
-            'init_var': self._init_var,
-            'init_1malpha': self._init_1malpha,
-            'init_gate_var': self._init_gate_var,
+            'tau_var': self._tau_var,
+            'tau_mag': self._tau_mag,
+            'tau_1malpha': self._tau_1malpha,
+            'tau_gate_var': self._tau_gate_var,
             'best_val_loss': self._best_val_loss,
             'loss_lr_factor': self._loss_lr_factor,
-            'train_loss_lr_factor': self._train_loss_lr_factor,
-            'train_loss_tracker': self._train_loss_tracker,
         }
 
     def load_state_dict(self, sd):
         self._step = sd.get('step', 0)
         self._last_log = sd.get('last_log', 0)
-        self._init_var = sd.get('init_var')
-        self._init_1malpha = sd.get('init_1malpha')
-        self._init_gate_var = sd.get('init_gate_var')
+        self._tau_var = sd.get('tau_var')
+        self._tau_mag = sd.get('tau_mag')
+        self._tau_1malpha = sd.get('tau_1malpha')
+        self._tau_gate_var = sd.get('tau_gate_var')
         self._best_val_loss = sd.get('best_val_loss', float('inf'))
         self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
-        self._train_loss_lr_factor = sd.get('train_loss_lr_factor', 1.0)
-        self._train_loss_tracker = sd.get('train_loss_tracker', [])
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
         """Call when dataset changes (e.g. switching from ADVENTUR to FANTASY).
@@ -2111,13 +2109,10 @@ class MirrorLRScheduler:
         self._best_val_loss = float('inf')
         self._loss_lr_factor = 1.0
         self._pending_val_loss = None
-        self._init_var = None
-        self._init_1malpha = None
-        self._init_gate_var = None
-        if hasattr(self, '_var_ema'):
-            del self._var_ema
-            del self._1malpha_ema
-            del self._gate_var_ema
+        self._tau_var = None
+        self._tau_mag = None
+        self._tau_1malpha = None
+        self._tau_gate_var = None
 
 
 # ─── Verify ────────────────────────────────────────────────────────────
@@ -2138,7 +2133,7 @@ if __name__ == '__main__':
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)
     h = model.embed_tokens(x)
     out, state, _ = model(h)
-    loss = model.compute_loss(out[:, :-1], x[:, 1:])
+    loss, _, _, _, _ = model.compute_loss(out[:, :-1], x[:, 1:])
     loss.backward()
     
     total_grad = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
