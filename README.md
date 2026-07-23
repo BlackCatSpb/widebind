@@ -1,72 +1,87 @@
 # WideBind
 
-**161M параметров, 32 слоя, D=4096.** Без единого transformer-слоя. Ни softmax, ни attention, ни QKV-проекций.
+Гибридная LM без transformer-слоёв: ни softmax, ни attention, ни QKV-проекций.
+Два варианта на одном коде:
+
+| | Mini | Main |
+|---|---|---|
+| D | 896 | 4096 |
+| G (групп) | 8 | 32 |
+| Параметров | 12.23M | ~161M |
+| VRAM/токен | 2.1 GB | 11-16 GB |
+| Устройство | MX550 | T4/A100 |
+| Accum | 8 | 8 |
 
 ## Архитектура
 
 ```
-token IDs → PartitionedEmbedding (32×128, sparse 6/32) → [WideBindBlock × 32] → Final RMS Norm → PartitionedHead → logits
+token_ids → PartitionedEmbedding → [WideBindBlock × G] → RMS Norm → PartitionedHead → logits
 ```
 
 Каждый блок:
 
 ```
-h → RMSNorm → Conv1d(groups=D, k=48) → BottleneckBind(D→K=64→D) → VSA Memory (chunked scan) → GroupedCognitiveMirror (32 эксперта) → DCT Spectral → GroupedMLP (32 группы, ×4)
+h → RMSNorm → Conv1d → BottleneckBind(D→K↔D) → VSA Memory → GroupedCognitiveMirror → DCT Spectral → GroupedMLP
 ```
 
-**BottleneckBind** — скрещивание размерностей через K=64 с Фибоначчи-твистом. Три режима:
-- `off` — `(h·w_u) ⊙ (h·w_v) @ W_out`, классическая регрессия
-- `shift` — сумма S штук shifted bilinear произведений (golden-ratio roll)
-- `cascade` — Фибоначчи-вложенные моночлены: `a[n] = cross(a[n-1], a[n-2])`
+**BottleneckBind** — скрещивание размерностей через K=32/64. Три режима:
+- `off` — `(h·w_u) ⊙ (h·w_v) @ W_out`
+- `shift` — сумма S shifted bilinear произведений (golden-ratio roll, multi-ocular)
+- `cascade` — Фибоначчи-вложенные моночлены
 
-tie_bind: W_out = W_proj^T (автоэнкодер).
+**VSA Memory** — векторная суперпозиция с chunked prefix scan, fp32 guard, τ per-channel до ~160K.
 
-**VSA Memory** — векторная суперпозиция с chunked prefix scan (CHUNK=32), surprisal-gated i_gate, dual readout + first moment. fp32 guard для численной стабильности. τ per-channel до ~163K (b_d=12.0).
+**GroupedCognitiveMirror** — G экспертов, 3-слойная метакогнитивная архитектура:
+- **L0** (weights): 5 сигналов коррекции (temp/pred/smooth/sym/help), learnable softmax-веса
+- **L1** (private memory): EMA уверенных K-space состояний, cross-expert recall через attention, contradiction gate, expert Knowledge Graph
+- **L2** (meta-gate): α-самонастройка, gradient-adaptive gate, MirrorLR scheduler
 
-**GroupedCognitiveMirror** — 32 эксперта, каждый в своём d=128, с 4 EMA-нормированными сигналами (temp/pred/smooth/sym), learnable softmax-весами, K-space gate. α — скаляр per expert, не W_pred.
+Подробно: `docs/ARCHITECTURE.md`
 
-**GroupedMLP** — 32 группы × (128→512→128, SiLU). 87.9% параметров.
+## Параметры (main, D=4096, G=32, tied)
 
-**PartitionedEmbedding/Head** — 32 сегмента × 128, sparse 6-out-of-32 коды (combinadic). Никакого cross-talk между сегментами. 8192 параметра на весь эмбеддинг + голову.
-
-**AdaptiveController** — 5 гиперпараметров VSA-памяти (b_d, b_i, mem2v_scale, EMA α, noise_scale) управляются двумя сигналами из Mirror: exploration и differentiation.
-
-**MirrorLRScheduler** — LR растёт с var(log_scale), |1-α|, gate_var. Без forced cosine decay.
-
-## Параметры (tied)
-
-| Компонент | Параметров |
-|---|---|
-| Embed + LM Head | 8,192 |
-| Bind (K=64) | 262K |
-| GroupedCognitiveMirror | 714K |
-| Conv1d | 6.3M |
-| DCT Spectral | 131K |
-| VSA gates | 1.2M |
-| GroupedMLP | 134.3M |
-| **Total** | **~161M** |
+| Компонент | Параметров | % |
+|---|---|---|
+| Embed + LM Head | 8,192 | 0.01 |
+| Bind (K=64) | 262K | 0.17 |
+| GroupedCognitiveMirror | 714K | 0.47 |
+| Private Memory | 1K | <0.01 |
+| Conv1d | 6.3M | 4.12 |
+| VSA gates | 1.2M | 0.77 |
+| GroupedMLP | 134.3M | 87.99 |
+| **Total** | **~161M** | **100** |
 
 ## Тренировка
 
-- Данные: 3 потока ADVENTUR/DRAMA/FANTASY, ~6.3B токенов, uint16 memmap
-- AdamW (0.9, 0.95), weight_decay=0.01, LR=3e-4
-- Gradient accumulation (удвоение effective batch)
-- Soft EOS reset: state *= 0.3 при EOS
-- Chunked VSA scan (CHUNK=32) — никаких NaN
-- Чекпоинты: step_{N}.pt + eval_{N}.pt на каждом eval
-- CTRL+C → сохраняет step_{N}.pt для resume
+- Данные: 3 потока (ADVENTUR/DRAMA/FANTASY), ~6.3B токенов
+- AdamW (0.9, 0.95), LR=3e-4, accum=8 (effective batch = B×L×accum)
+- Gradient clipping 0.5, FP32 (без AMP)
+- MirrorLRScheduler: var(log_scale) + gate_var + |1-α| + training-loss trend damping
+- log_scale L2 (ls > 2.3) + signal entropy + gate L1 + diversity + nuclear + orth
+- Private memory writes: delayed 5000 forward steps, EMA decay, soft-competition T=0.5
 - HTML-отчёты: `scripts/analyze_checkpoint.py`
 
-## Mасштабирование
+## Варианты
 
-`D = G·128`, `L = G`, `bind_K = 64`, `k = 32`. Все размеры выведены из числа групп G.
+```
+# Mini (MX550, 2.1 GB)
+D=896, G=8,  bind_K=32, k=32, accum=8, private_mem=True
+11.20M params (default) / 12.23M (multi-ocular S=4), 0.10 GB VRAM
+
+# Main (T4/Colab, 16 GB)
+D=4096, G=32, bind_K=64, k=32, accum=8, private_mem=True
+~161M params, ~11.5 GB VRAM
+```
 
 ## Структура
 
 ```
-core/            — config, model, live_inference
-compression/     — FCF-CPR (8-bit, ~3.8× сжатие)
-scripts/         — train, colab_train, analyze_checkpoint, generate
-tests/           — 59 тестов
-docs/            — документация
+core/            — config, model
+compression/     — FCF-CPR (8-bit, ~3.8×)
+scripts/         — train, colab_train, analyze, generate
+notebooks/       — colab.ipynb
+tests/           — unit tests
+docs/            — архитектура, обзоры, логи
 ```
+
+Генерация с метакогнитивным readout: `--show-mind`, `--context-mem`, `--continuous-learn`

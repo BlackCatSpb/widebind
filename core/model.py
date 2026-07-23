@@ -338,8 +338,13 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
         # Private memory bank: expert confident K-space states (cross-expert recall)
         self._has_private_mem = has_private_mem
+        # Minimum training forward steps before private memory writes activate.
+        # 5000 ≈ 640K tokens at accum=8 (main) or 640K at accum=1 (Mini).
+        # G=32 needs more delay than G=8 due to higher echo chamber risk.
+        self._pm_write_delay = 5000
         if has_private_mem:
             self.register_buffer('_private_mem', torch.randn(G, self.k) * 0.01)
+            self.register_buffer('_pm_step', torch.zeros(1, dtype=torch.long), persistent=False)
             # w_help init = log(3.0) -> sigmoid ~0.75: strong initial presence, prevents cold-start suppression
             self.w_help = nn.Parameter(torch.full((G, 1), math.log(3.0)))  # per-expert scale for recalled help
             self.w_contra = nn.Parameter(torch.full((G,), 0.01))  # small positive: disagreement opens gate by default
@@ -543,8 +548,11 @@ class GroupedCognitiveMirror(nn.Module):
                 self._cached_isolation = isolation
         
         # ─── Private Memory: write confident K-space states (contradiction-aware) ───
-        # Delay private memory writes until after warmup (alpha_override == 0)
-        _write_ok = _write and self._alpha_override.item() < 0.01
+        # Delay until _pm_write_delay forward passes to avoid random-state echo chamber
+        _write_ok = _write
+        if _write_ok:
+            self._pm_step += 1
+            _write_ok = self._pm_step.item() >= self._pm_write_delay
         if _write_ok:
             with torch.no_grad():
                 conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
@@ -1522,6 +1530,17 @@ class WideBindStack(nn.Module):
             n_sig = n_sig + 1
         if n_sig > 0:
             signal_entropy = signal_entropy / n_sig
+        # log_scale L2: prevent exp(log_scale) growth that causes gradient explosion (III.1)
+        log_scale_reg = 0.0
+        n_ls = 0
+        for layer in self.layers:
+            ls = layer.mirror.log_scale
+            # Penalize dimensions where exp(ls) > 10 (i.e., ls > log(10) ≈ 2.3)
+            excess = (ls - 2.3).clamp(min=0)
+            log_scale_reg = log_scale_reg + excess.pow(2).mean()
+            n_ls = n_ls + 1
+        if n_ls > 0:
+            log_scale_reg = log_scale_reg / n_ls
         signal_entropy_weight = getattr(self.cfg, 'signal_entropy_weight', 0.001)
         l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
         reinforce_weight = getattr(self.cfg, 'reinforce_weight', 0.01)
@@ -1529,11 +1548,13 @@ class WideBindStack(nn.Module):
         diversity_weight = getattr(self.cfg, 'diversity_weight', 0.001)
         nuc_weight = getattr(self.cfg, 'nuclear_weight', 1e-5)
         orth_weight = getattr(self.cfg, 'orth_weight', 1e-4)
+        log_scale_l2_weight = getattr(self.cfg, 'log_scale_l2_weight', 0.01)
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
             + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss \
-            - signal_entropy_weight * signal_entropy
+            - signal_entropy_weight * signal_entropy \
+            + log_scale_l2_weight * log_scale_reg
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -1899,6 +1920,8 @@ class MirrorLRScheduler:
         self._best_val_loss = float('inf')
         self._loss_lr_factor = 1.0  # persistent damping factor (1.0 = no damping)
         self._pending_val_loss = None
+        self._train_loss_tracker = []  # rolling training loss window for trend detection
+        self._train_loss_lr_factor = 1.0
 
     def _mirror_stats(self):
         var_sum = 0.0
@@ -1915,6 +1938,21 @@ class MirrorLRScheduler:
             alpha_sum += (1.0 - alpha).abs().mean().item()
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
+
+    def report_train_loss(self, train_loss):
+        """Report training loss for LR damping. Accumulates rolling window, detects
+        sustained increase and reduces LR multiplicatively."""
+        self._train_loss_tracker.append(train_loss)
+        if len(self._train_loss_tracker) > 500:
+            self._train_loss_tracker.pop(0)
+        # Detect sustained increase: last 100 steps higher than 300-200 steps ago
+        if len(self._train_loss_tracker) >= 300:
+            old = sum(self._train_loss_tracker[-300:-200]) / 100
+            recent = sum(self._train_loss_tracker[-100:]) / 100
+            if recent > old * 1.05 and self._train_loss_lr_factor > 0.1:
+                self._train_loss_lr_factor = max(0.1, self._train_loss_lr_factor * 0.7)
+                print(f'  TRAIN LR DAMPED: recent={recent:.4f} > old={old:.4f}, '
+                      f'factor {self._train_loss_lr_factor:.3f}')
 
     def report_val_loss(self, val_loss):
         """Report validation loss for LR damping. Called from training code after eval."""
@@ -2002,7 +2040,7 @@ class MirrorLRScheduler:
             mult = max(0.05, min(1.0, mirror_mult))
 
             # Persistent loss damping applied every step
-            mult *= self._loss_lr_factor
+            mult *= self._loss_lr_factor * self._train_loss_lr_factor
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
@@ -2026,6 +2064,8 @@ class MirrorLRScheduler:
             'init_gate_var': self._init_gate_var,
             'best_val_loss': self._best_val_loss,
             'loss_lr_factor': self._loss_lr_factor,
+            'train_loss_lr_factor': self._train_loss_lr_factor,
+            'train_loss_tracker': self._train_loss_tracker,
         }
 
     def load_state_dict(self, sd):
@@ -2036,6 +2076,8 @@ class MirrorLRScheduler:
         self._init_gate_var = sd.get('init_gate_var')
         self._best_val_loss = sd.get('best_val_loss', float('inf'))
         self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
+        self._train_loss_lr_factor = sd.get('train_loss_lr_factor', 1.0)
+        self._train_loss_tracker = sd.get('train_loss_tracker', [])
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
         """Call when dataset changes (e.g. switching from ADVENTUR to FANTASY).
