@@ -13,7 +13,7 @@ token → PartitionedEmbedding (sparse 6/32 код)
          → RMSNorm → Conv1d (k=48)
          → BottleneckBind (D→K↔D, билинейное скрещивание)
          → VSA Memory (4-масштабная суперпозиция, τ=8..512)
-         → GroupedCognitiveMirror (32 эксперта, staircase k=4/8/16)
+         → GroupedCognitiveMirror (32 эксперта×32 слоя, k=4/8/16 staircase)
          → DCT Spectral (частотная фильтрация)
          → GroupedMLP (32 группы × expand=4)
       → Final RMSNorm → PartitionedHead → logits
