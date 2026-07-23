@@ -786,4 +786,13 @@ VSA O(L · log(CHUNK)) — длина последовательности не 
 
 ---
 
+## 21. Статус (July 2026)
+
+Синхронизирован с Mini после аудита:
+
+- **Soft routing overlay**: gate_bonus через `_behavior_div_ema` + `_concept_sim_ema` × `w_contra × 0.1`
+- **Gate EMA fix**: `.data` bypass autograd in-place mutation bug
+- **Aux weights**: `div_weight=0.0001`, `balance=0.001`, `reinforce=0.001`. `div_loss` → `.var()`.
+- **Loss monitoring**: `_cached_losses` в compute_loss для каждого aux loss
+
 *WideBind Main — C. BlackCatSpb, July 2026*
