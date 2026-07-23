@@ -1566,7 +1566,6 @@ class WideBindStack(nn.Module):
         # Benefit loss: anchor log_scale to gate-implied expert utility
         benefit_weight = getattr(self.cfg, 'benefit_weight', 1.0)
         benefit_loss = 0.0
-        n_bn = 0
         if benefit_weight > 0:
             for layer in self.layers:
                 bn = getattr(layer.mirror, '_cached_benefit', None)
@@ -1577,9 +1576,6 @@ class WideBindStack(nn.Module):
                         span = ls_mean.std().clamp(min=0.01)
                     target = bn * span * 2
                     benefit_loss = benefit_loss + (ls_mean - target).pow(2).sum()
-                    n_bn = n_bn + 1
-            if n_bn > 0:
-                benefit_loss = benefit_loss / n_bn
         return ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
             + balance_weight * balance_loss + diversity_weight * diversity_loss \
             + nuc_weight * nuc_loss + orth_weight * orth_loss \
