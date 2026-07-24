@@ -45,7 +45,7 @@ def eval_loss(model, streams, cfg, device, n_batches=200):
             if off == 0: break
             h = model.embed_tokens(x.to(device))
             out, _, _ = model(h, None)
-            total += model.compute_loss(out, y.to(device)).item()
+            total += model.compute_loss(out, y.to(device))[0].item()
             count += 1
     model.train()
     return total / max(count, 1)
@@ -140,7 +140,7 @@ def train(cfg, data_dir, save_dir, resume_path=None):
             x, y = x.to(device), y.to(device)
             h = model.embed_tokens(x)
             out, state, _ = model(h, state)
-            loss = model.compute_loss(out, y, pred_weight=1.0)
+            loss, _, _, _, _ = model.compute_loss(out, y, pred_weight=1.0)
             loss.backward()
 
             if cfg.grad_clip > 0:

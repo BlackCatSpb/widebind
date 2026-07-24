@@ -122,7 +122,7 @@ def run(data_dir='/content/drive/MyDrive/widebind_data'):
 
         h = model.embed_tokens(x)
         out, state, gs = model(h, state, global_state=gs)
-        loss = model.compute_loss(out, y, pred_weight=1.0)
+        loss, _, _, _, _ = model.compute_loss(out, y, pred_weight=1.0)
         del x, y, h, out
 
         if torch.isnan(loss) or torch.isinf(loss):

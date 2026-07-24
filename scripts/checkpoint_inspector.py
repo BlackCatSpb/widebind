@@ -45,7 +45,7 @@ def inspect(cfg, model, ckpt):
     h = model.embed_tokens(x)
     out, _, _ = model(h)
     info['out_std'] = round(out.std().item(), 4)
-    ls = model.compute_loss(out[:, :-1], x[:, 1:])
+    ls, _, _, _, _ = model.compute_loss(out[:, :-1], x[:, 1:])
     info['loss'] = round(ls.item(), 4)
 
     info['mirror'] = []

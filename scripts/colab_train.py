@@ -197,7 +197,7 @@ def train(cfg, drive_path=None):
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 h = model.embed_tokens(x)
                 out, state, _ = model(h, state)
-                loss = model.compute_loss(out, y)
+                loss, _, _, _, _ = model.compute_loss(out, y)
                 loss = loss / accum_steps
 
             if scaler:
@@ -292,7 +292,7 @@ def evaluate(model, streams, cfg, device):
             with torch.cuda.amp.autocast(enabled=device=='cuda'):
                 h = model.embed_tokens(x)
                 out, _, _ = model(h, None, adaptive=False)
-                loss = model.compute_loss(out, y)
+                loss, _, _, _, _ = model.compute_loss(out, y)
             total_loss += loss.item()
             total_steps += 1
 

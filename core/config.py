@@ -39,7 +39,7 @@ class WideBindConfig:
 
     # Mirror
     mirror_k: int = 32
-    mirror_k_staircase: bool = True  # True = k_l∈{4,8,16} по третям глубины
+    mirror_k_staircase: bool = True  # True = k_l∈{8,16,32} по третям глубины
     w_pred_scale_init: float = 3.0
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
@@ -48,7 +48,7 @@ class WideBindConfig:
     signal_entropy_weight: float = 0.001  # entropy regularization on 5 signal weights (0=disabled)
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
     div_weight: float = 0.0001  # expert diversity: var-based push, no /N (0=disabled)
-    ranking_weight: float = 0.1  # pairwise order ls_mean by gate_usage (0=disabled)
+    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (0=disabled)
 
     # Scheduler (values below will be overridden by λ_d when lambda_d_enabled=True)
     scheduler: str = 'mirror'
@@ -121,7 +121,7 @@ class WideBindConfig:
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
     # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
-    bind_twist_mode: str = "off"         # "off" | "shift" | "cascade"
+    bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"
     bind_twist_S: int = 4                # number of shifts (1 when mode=off)
     bind_twist_ocular: str = "tied"      # "tied" | "multi" — per-shift W_out
     bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
