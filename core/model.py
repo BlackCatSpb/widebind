@@ -1289,7 +1289,7 @@ class WideBindStack(nn.Module):
                 
                 self._pred_weight = (pred_weight if pred_weight is not None
                     else AdaptiveController.pred_weight(self.layers,
-                        min_val=0.05, max_val=1.0))
+                        min_val=0.05, max_val=0.3))
                 
                 for i, layer in enumerate(self.layers):
                     l_expl, l_diff = AdaptiveController.layer_stats(layer,
