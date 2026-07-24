@@ -333,7 +333,7 @@ class GroupedCognitiveMirror(nn.Module):
         self.w_gate = nn.Parameter(torch.randn(G, self.k) * gate_std)
         self.b_gate = nn.Parameter(torch.zeros(G))
         # w_delta_gate: (G, k) — maps delta (correction) to gate logit
-        self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) * 0.01)
+        self.w_delta_gate = nn.Parameter(torch.randn(G, self.k) / math.sqrt(self.k))
         
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -1976,7 +1976,8 @@ class MirrorLRScheduler:
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
-    def report_train_loss(self, train_loss):
+    def report_train_loss(self, train_loss, ce_loss=None):
+        """Report training loss for LR damping. Uses CE (not total) to avoid pred_loss false dampings."""
         pass
 
     def report_val_loss(self, val_loss):
