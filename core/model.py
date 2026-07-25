@@ -166,7 +166,7 @@ class PartitionedEmbedding(nn.Module):
         self.register_buffer('_mix_scale', torch.tensor(2.0), persistent=False)
         
         self.basis = nn.Parameter(torch.randn(self.K, d))
-        nn.init.normal_(self.basis, std=0.02)
+        nn.init.xavier_uniform_(self.basis, gain=0.5)
     
     def forward(self, tokens):
         codes = self.codes[tokens]  # (B, L, K), sparse binary
@@ -217,7 +217,7 @@ class PartitionedHead(nn.Module):
             self.readout = embed_basis  # shared reference
         else:
             self.readout = nn.Parameter(torch.randn(self.K, d))
-            nn.init.normal_(self.readout, std=0.02)
+            nn.init.xavier_uniform_(self.readout, gain=0.5)
         self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
     
     def forward(self, h):
@@ -319,7 +319,7 @@ class GroupedCognitiveMirror(nn.Module):
             tau_k = torch.tensor([(tau_min + tau_max) / 2])
         alpha_init = torch.exp(-1.0 / tau_k).view(1, k).expand(G, -1).clone()
         self.alpha_diag = nn.Parameter(alpha_init)
-        self.w_pred_scale_legacy = nn.Parameter(torch.ones(G, k) * w_pred_scale_init)
+        self.w_pred_scale_legacy = nn.Parameter(torch.ones(G, k))
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         # EMA norms for signal normalization (Proposal V-1)
         n_signals = 5 if has_private_mem else 4
@@ -489,7 +489,7 @@ class GroupedCognitiveMirror(nn.Module):
                 rv_mean = rv.mean(dim=-1, keepdim=True)
                 relative_var = rv / (rv_mean + 1e-10)
                 alpha_target = torch.sigmoid(2.2 - torch.log(relative_var))
-                self.alpha_diag.data.lerp_(alpha_target, 0.0005)
+                self.alpha_diag.data.lerp_(alpha_target, 0.01)
         self._cached_pred_k = _pred_k_aux
         self._cached_hp = hp
         # Cache normalized pred_error norm per token для surprisal-gated i_gate
@@ -530,14 +530,14 @@ class GroupedCognitiveMirror(nn.Module):
                 pm_norm = pm.norm(dim=-1, keepdim=True).clamp(min=1e-10)
                 pm_n = pm / pm_norm  # safe normalize (no NaN on zero vectors)
                 concept_sim = pm_n @ pm_n.T
-                self._concept_sim_ema.mul_(0.999).add_(concept_sim, alpha=0.001)
+                self._concept_sim_ema.mul_(0.99).add_(concept_sim, alpha=0.01)
                 hp_avg = hp.mean(dim=(0, 1))
                 hp_n = F.normalize(hp_avg, dim=-1)
                 behavior_sim = hp_n @ hp_n.T
                 behavior_div = 1.0 - behavior_sim
-                self._behavior_div_ema.mul_(0.999).add_(behavior_div, alpha=0.001)
+                self._behavior_div_ema.mul_(0.99).add_(behavior_div, alpha=0.01)
                 trust_weights = attn.mean(dim=(0, 1))
-                self._trust_matrix.mul_(0.999).add_(trust_weights, alpha=0.001)
+                self._trust_matrix.mul_(0.99).add_(trust_weights, alpha=0.01)
                 contra_g = concept_sim * behavior_div
                 self._cached_contra_graph = contra_g
                 contra_expert = contra_g.mean(dim=-1)
@@ -594,7 +594,7 @@ class GroupedCognitiveMirror(nn.Module):
         else:
             signals = [temp_k, pred_error, smooth_k, sym_k]
         signals_normed = []
-        decay = 0.001  # ~1000-step EMA
+        decay = 0.01  # ~100-step EMA
         for i, s in enumerate(signals):
             with torch.no_grad():
                 rms = s.norm(dim=(-2, -1), keepdim=True).mean(dim=(0, 1), keepdim=True)  # (1, 1, G, k)
@@ -683,7 +683,7 @@ class GroupedCognitiveMirror(nn.Module):
         # Cache per-expert mean gate for load balancing loss
         self._cached_gate_usage = expert_gate.mean(dim=(0, 1))  # (G,)
         # Gate EMA: self-adaptive per-expert warmup for mirror (cold → full over ~5000 steps)
-        self._gate_ema.mul_(0.999).add_(self._cached_gate_usage.detach(), alpha=0.001)
+        self._gate_ema.mul_(0.99).add_(self._cached_gate_usage.detach(), alpha=0.01)
         # Cache for expert reinforcement loss (gate vs usefulness alignment)
         self._cached_usefulness = usefulness
         self._cached_gate = expert_gate.detach()
@@ -866,11 +866,11 @@ class BottleneckBind(nn.Module):
         # --- ocular(s) ---
         if self.mode != "off" and self.ocular == "multi" and self.S > 1:
             self.W_out = nn.Parameter(torch.empty(self.S, K, D))
-            nn.init.normal_(self.W_out, 0.0, 0.02)
+            nn.init.xavier_uniform_(self.W_out, gain=0.5)
             self._tied = False
         else:
             self.W_out = nn.Parameter(torch.empty(K, D))
-            nn.init.normal_(self.W_out, 0.0, 0.02)
+            nn.init.xavier_uniform_(self.W_out, gain=0.5)
             self._tied = tie_bind
             if self._tied:
                 self.W_proj.register_forward_pre_hook(self._tie_hook)
@@ -878,7 +878,7 @@ class BottleneckBind(nn.Module):
         # --- gated aperture ---
         if self.gated:
             self.w_gate_proj = nn.Linear(K, self.S, bias=True)
-            nn.init.normal_(self.w_gate_proj.weight, 0.0, 0.02)
+            nn.init.xavier_uniform_(self.w_gate_proj.weight, gain=0.5)
             nn.init.zeros_(self.w_gate_proj.bias)
 
         # --- cascade mix ---
@@ -1056,7 +1056,7 @@ class WideBindBlock(nn.Module):
         # ─── Conv ───
         self.conv = nn.Conv1d(cfg.D, cfg.D, kernel_size=cfg.conv_kernel,
                               padding=cfg.conv_kernel - 1, groups=cfg.D, bias=False)
-        nn.init.normal_(self.conv.weight, std=cfg.conv_init_std)
+        nn.init.kaiming_normal_(self.conv.weight, mode='fan_in', nonlinearity='linear')
         
         # ─── Spectral (self-organizing frequency filters) ───
         self.register_buffer('V_dct', dct_basis(cfg.D))
@@ -1074,7 +1074,7 @@ class WideBindBlock(nn.Module):
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
-                context_mem=None, allow_write=None):
+                context_mem=None, allow_write=None, tau_s=None):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -1102,7 +1102,8 @@ class WideBindBlock(nn.Module):
         
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
         S = self._n_scales
-        d_s = torch.exp(-1.0 / self._tau_s.to(device))  # (S,) — fixed τ-scales
+        tau_s = self._tau_s if tau_s is None else tau_s
+        d_s = torch.exp(-1.0 / tau_s.to(device))  # (S,) — τ-scales from learnable param
         # Surprisal-gated write: i_gate = softplus(linear + γ·||ê||₂)
         igate_logit = h * self.w_i + self.b_i
         mir = self.mirror
@@ -1226,8 +1227,9 @@ class WideBindBlock(nn.Module):
         g = self.mirror.G
         d = self.mirror.d
         mem_modulated = (mem_read.reshape(B, L, g, d) * mm).reshape(B, L, D)
-        enhanced = bind_out + mem_modulated * self.w_mem2v * mem2v_scale + mirror
-        self._cache_bind_out = (bind_out + mem_modulated * self.w_mem2v * mem2v_scale).detach()
+        enhanced_base = bind_out + mem_modulated * self.w_mem2v * mem2v_scale
+        enhanced = enhanced_base + mirror
+        self._cache_bind_out = enhanced_base.detach()
         self._cache_mirror_out = mirror.detach()
         h = h + enhanced
         
@@ -1242,6 +1244,16 @@ class WideBindBlock(nn.Module):
         h = h + h_mlp
         
         return h, (mem_state_out, mu_state_out, conv_state_out)
+    
+    @property
+    def base_parameters(self):
+        """All params except mirror: pre_ln, conv, bind, VSA, spectral, MLP."""
+        return [p for n, p in self.named_parameters() if not n.startswith('mirror.')]
+    
+    @property
+    def mirror_parameters(self):
+        """All params inside GroupedCognitiveMirror."""
+        return [p for n, p in self.named_parameters() if n.startswith('mirror.')]
 
 
 # ─── WideBind Stack ────────────────────────────────────────────────────
@@ -1263,11 +1275,23 @@ class WideBindStack(nn.Module):
         ])
         
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
+        # ─── Idea 1: Learnable VSA timescales ───
+        self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
+        # ─── Idea 4: Per-layer τ_l deviation ───
+        self._tau_l_dev = nn.Parameter(torch.zeros(cfg.n_layers))
+        # c_ema: global state EMA rate = write_rate * tau_mid
+        tau_s = self.layers[0]._tau_s
+        tau_mid = math.sqrt(tau_s[0].item() * tau_s[-1].item())
+        write_rate = 1.0 / math.sqrt(cfg.D)
+        self._c_ema_value = write_rate * tau_mid
+        self._tau_min_value = tau_s[0].item()
+        self._tau_max_value = tau_s[-1].item()
+        self._tau_mid_value = tau_mid
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
-                context_mem=None, allow_write=None):
+                context_mem=None, allow_write=None, step=None):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
@@ -1300,7 +1324,7 @@ class WideBindStack(nn.Module):
                     b_d_max = getattr(self.cfg, 'vsa_b_d_max', 12.0)
                     b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
                         b_d_max=b_d_max)
-                    smooth = getattr(self.cfg, 'vsa_b_d_smooth', 0.999)
+                    smooth = getattr(self.cfg, 'vsa_b_d_smooth', 0.99)
                     if smooth >= 1.0:
                         layer.b_i.fill_(b_i_val)
                         layer.b_d.fill_(b_d_val)
@@ -1319,8 +1343,21 @@ class WideBindStack(nn.Module):
             global_state = global_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
         elif global_state.shape[0] != n_layers:
             global_state = global_state[0:1].expand(n_layers, -1, -1).clone()
-        # Calibrate c so L31 (τ≈149) matches current α≈0.976
-        c_ema = (1.0 - 0.976) * 149.0  # ≈3.576
+        # ─── Learnable VSA scales (Idea 1) ───
+        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
+        tau_min = vsa_tau[0].item()
+        tau_max = vsa_tau[-1].item()
+        tau_mid = math.sqrt(tau_min * tau_max)
+        c_ema = (1.0 / math.sqrt(self.cfg.D)) * tau_mid
+        # ─── Momentum warmup for global_state oscillation (Idea 3) ───
+        momentum_beta = 0.0
+        if adaptive and step is not None and step >= 5000:
+            momentum_beta = 0.8 * min(1.0, (step - 5000) / 5000)
+        if momentum_beta > 0:
+            if not hasattr(self, '_gs_velocity') or self._gs_velocity.shape != global_state.shape:
+                self._gs_velocity = torch.zeros_like(global_state)
+            else:
+                self._gs_velocity = self._gs_velocity.to(global_state.device)
         new_state = []
         self._pred_cache = []
         for i, (layer, s) in enumerate(zip(self.layers, state)):
@@ -1345,26 +1382,32 @@ class WideBindStack(nn.Module):
                 spectral_mod = 1.0
                 pred_scale_mod = None
             
-            gs_i = global_state[i:i+1].clone()  # (1, 1, D)
+            gs_i = global_state[i:i+1].detach().clone()  # (1, 1, D), no grad through global_state (EMA-only)
             h, s_out = layer(h, s, global_state=gs_i,
                              mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod,
-                             context_mem=context_mem, allow_write=allow_write)
+                             context_mem=context_mem, allow_write=allow_write,
+                             tau_s=vsa_tau)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
                 S = layer._n_scales
-                # Per-layer EMA alpha from τ
+                # Per-layer tau from VSA timescales + per-layer deviation (Idea 4)
                 lf = i / max(n_layers - 1, 1)
-                tau_l = math.exp(2.0 + 3.0 * lf)
-                alpha_l = 1.0 - c_ema / (tau_l + 1e-8)
-                alpha_l = max(0.85, min(0.999, alpha_l))
+                dev = torch.tanh(self._tau_l_dev[i])
+                tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
+                alpha_l = max(0.0, 1.0 - c_ema / tau_l)
                 # Weighted combination of scales для global state
                 w = F.softmax(layer.scale_w, dim=0)  # (S, D)
                 mem_combined = (mem_state_out.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
                 mem_avg = mem_combined.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
-                global_state[i:i+1] = alpha_l * global_state[i:i+1] + (1.0 - alpha_l) * mem_avg
+                if momentum_beta > 0:
+                    vel_update = momentum_beta * self._gs_velocity[i:i+1].detach() + (1.0 - momentum_beta) * (mem_avg - gs_i)
+                    self._gs_velocity[i:i+1] = vel_update.detach()
+                    global_state[i:i+1] = gs_i + self._gs_velocity[i:i+1]
+                else:
+                    global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
                 s_out = tuple(t.detach() for t in s_out)
             new_state.append(s_out)
             if adaptive:
@@ -1379,8 +1422,16 @@ class WideBindStack(nn.Module):
         return self.embed(tokens)
     
     def compute_loss(self, h, targets, pred_weight=None):
-        """h: (B, L, D) -> logits -> cross-entropy + alpha auxiliary loss
-        pred_weight: if None, uses adaptive value from forward pass.
+        """Returns CE only (aux losses applied via gradient scaling in training step)."""
+        ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight)
+        return ce_loss
+    
+    def compute_losses(self, h, targets, pred_weight=None):
+        """Compute CE and auxiliary losses separately. Returns raw (unweighted) values.
+        
+        Returns:
+            ce_loss: scalar, cross-entropy loss
+            aux_dict: dict of named auxiliary losses (raw, unweighted).
         """
         if isinstance(self.lm_head, ZeckendorfReadout):
             B, L, D = h.shape
@@ -1391,19 +1442,16 @@ class WideBindStack(nn.Module):
             logits = self.lm_head(h)
             ce = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                  targets.reshape(-1), reduction='none')
-            # PAD/EOS masking: ignore special tokens (0=PAD, 2=EOS)
             mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
             ce = ce * mask.float()
-            # Surprisal-weighted loss: w_t = (CE_t / mean(CE))^γ
             sw = getattr(self.cfg, 'surprisal_weight', 0.0)
             if self.training and sw > 0:
                 with torch.no_grad():
-                    w = (ce / (ce.mean() + 1e-8)).clamp(max=10.0) ** sw
+                    ce_ratio = ce / (ce.mean() + 1e-8)
+                    w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
                 ce_loss = (ce * w).sum() / mask.sum().clamp(min=1)
             else:
                 ce_loss = ce.sum() / mask.sum().clamp(min=1)
-        pw = pred_weight if pred_weight is not None else getattr(self, '_pred_weight', 0.1)
-        # alpha auxiliary loss: predict K-space state directly
         pred_loss = 0.0
         n_pred = 0
         cache = getattr(self, '_pred_cache', [])
@@ -1413,7 +1461,6 @@ class WideBindStack(nn.Module):
         if n_pred > 0:
             pred_loss = pred_loss / n_pred
         
-        # Gate L1 sparsity: encourages expert specialization
         gate_l1 = 0.0
         n_gates = 0
         for layer in self.layers:
@@ -1424,8 +1471,6 @@ class WideBindStack(nn.Module):
         if n_gates > 0:
             gate_l1 = gate_l1 / n_gates
         
-        # Expert reinforcement: align gate with usefulness (self-consistency)
-        # High usefulness → high gate should follow (reinforcing correct self-assessment)
         reinforce_loss = 0.0
         n_reinf = 0
         for layer in self.layers:
@@ -1437,30 +1482,26 @@ class WideBindStack(nn.Module):
         if n_reinf > 0:
             reinforce_loss = reinforce_loss / n_reinf
         
-        # Load balancing: encourage uniform expert usage across tokens
-        # CV of per-expert usage = std/mean — lower means all experts used equally
         balance_loss = 0.0
         n_bal = 0
         for layer in self.layers:
             usage = getattr(layer.mirror, '_cached_gate_usage', None)
             if usage is not None:
                 usage_p = usage / (usage.sum() + 1e-10)
-                ue = -(usage_p * torch.log(usage_p + 1e-10)).sum()
-                logG = math.log(usage.shape[-1])
-                balance_loss = balance_loss + (logG - ue) / logG
+                hhi = (usage_p ** 2).sum()
+                norm = (hhi - 1.0 / usage.shape[-1]) / (1.0 - 1.0 / usage.shape[-1])
+                balance_loss = balance_loss + norm.clamp(min=0)
                 n_bal = n_bal + 1
         if n_bal > 0:
             balance_loss = balance_loss / n_bal
         
-        # Diversity loss: decorrelate per-group MLP outputs
-        # ||cov(||group_out||_g) - I||_F² → каждая группа ортогональна другим
         diversity_loss = 0.0
         n_div = 0
         for layer in self.layers:
             group_out = getattr(layer.mlp, '_cached_group_out', None)
             if group_out is not None:
                 B, L, G, d = group_out.shape
-                y = group_out.norm(dim=-1).reshape(-1, G)  # (B*L, G)
+                y = group_out.norm(dim=-1).reshape(-1, G)
                 y = y - y.mean(dim=0, keepdim=True)
                 cov = y.T @ y / (y.shape[0] - 1 + 1e-10)
                 div = F.mse_loss(cov, torch.eye(G, device=cov.device))
@@ -1469,14 +1510,13 @@ class WideBindStack(nn.Module):
         if n_div > 0:
             diversity_loss = diversity_loss / n_div
         
-        # Nuclear norm regularization for bind W_proj
-        # stochastic estimate: ||W||_* ≈ mean(||Wv||₂) · sqrt(K)
         nuc_loss = 0.0
         n_nuc = 0
-        nuc_iters = 5
         for layer in self.layers:
             W = getattr(layer, 'W_proj', None)
             if W is not None:
+                rank_ub = min(W.shape[0], W.shape[1])
+                nuc_iters = max(1, int(math.sqrt(rank_ub)))
                 v = torch.randn(W.shape[1], nuc_iters, device=W.device)
                 Wv = W @ v
                 nuc = Wv.norm(dim=0).mean() * math.sqrt(W.shape[1])
@@ -1485,41 +1525,41 @@ class WideBindStack(nn.Module):
         if n_nuc > 0:
             nuc_loss = nuc_loss / n_nuc
         
-        # Orthogonality regularization for bottleneck bind: ||Ŵ^T Ŵ - I||_F²
         orth_loss = 0.0
         n_orth = 0
         for layer in self.layers:
             W = getattr(layer, 'W_proj', None)
             if W is not None:
                 W_hat = W / W.norm(dim=0, keepdim=True).clamp(min=1e-8)
-                gram = W_hat.T @ W_hat  # (K, K)
+                gram = W_hat.T @ W_hat
                 orth = F.mse_loss(gram, torch.eye(gram.shape[0], device=gram.device))
                 orth_loss = orth_loss + orth
                 n_orth = n_orth + 1
         if n_orth > 0:
             orth_loss = orth_loss / n_orth
         
-        # w_m2v hierarchy by τ (Proposal IV): push w_m2v toward target ∝ σ(ln τ)
         w_m2v_loss = 0.0
         n_m2v = 0
-        w_m2v_weight = getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.0)
-        if w_m2v_weight > 0:
+        if getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.0) > 0:
             for i, layer in enumerate(self.layers):
                 wm = getattr(layer, 'w_mem2v', None)
                 if wm is not None:
                     lf = i / max(len(self.layers) - 1, 1)
-                    tau_l = math.exp(2.0 + 3.0 * lf)
+                    vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
+                    tau_min = vsa_tau[0].item()
+                    tau_max = vsa_tau[-1].item()
+                    tau_mid = math.sqrt(tau_min * tau_max)
+                    dev = torch.tanh(self._tau_l_dev[i])
+                    tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
                     target = getattr(self.cfg, 'w_m2v_hierarchy_target', 1.0)
-                    target_m2v = target / (1.0 + math.exp(-(math.log(tau_l) - math.log(32.0))))
+                    target_m2v = target / (1.0 + math.exp(-(math.log(tau_l.item()) - math.log(tau_mid))))
                     w_m2v_loss = w_m2v_loss + F.mse_loss(wm.mean(), torch.tensor(target_m2v, device=wm.device))
                     n_m2v = n_m2v + 1
             if n_m2v > 0:
                 w_m2v_loss = w_m2v_loss / n_m2v
-        # Branch balance: equalize log-variance of conv/bind/mirror branches
         branch_loss = 0.0
         n_branch = 0
-        branch_weight = getattr(self.cfg, 'branch_balance_weight', 0.0)
-        if branch_weight > 0:
+        if getattr(self.cfg, 'branch_balance_weight', 0.0) > 0:
             for layer in self.layers:
                 conv = getattr(layer, '_cache_conv_out', None)
                 bnd = getattr(layer, '_cache_bind_out', None)
@@ -1534,7 +1574,18 @@ class WideBindStack(nn.Module):
                     n_branch = n_branch + 3
             if n_branch > 0:
                 branch_loss = branch_loss / n_branch
-        # Signal entropy regularization: encourage uniform signal usage across layers
+        
+        ranking_loss = 0.0
+        if getattr(self.cfg, 'ranking_weight', 0.0) > 0:
+            for layer in self.layers:
+                gu = getattr(layer.mirror, '_cached_gate_usage', None)
+                if gu is not None:
+                    ls = layer.mirror.log_scale
+                    ls_mean = ls.mean(dim=-1)
+                    gate_diff = gu.unsqueeze(1) - gu.unsqueeze(0)
+                    ls_diff = ls_mean.unsqueeze(1) - ls_mean.unsqueeze(0)
+                    ranking_loss = ranking_loss + (F.relu(-ls_diff) * (gate_diff > 0).float()).sum()
+        
         signal_entropy = 0.0
         n_sig = 0
         for layer in self.layers:
@@ -1543,63 +1594,68 @@ class WideBindStack(nn.Module):
             n_sig = n_sig + 1
         if n_sig > 0:
             signal_entropy = signal_entropy / n_sig
-        # log_scale L2: prevent exp(log_scale) growth that causes gradient explosion (III.1)
+        
         log_scale_reg = 0.0
         n_ls = 0
         for layer in self.layers:
             ls = layer.mirror.log_scale
-            # Penalize dimensions where exp(ls) > 10 (i.e., ls > log(10) ≈ 2.3)
             excess = (ls - 2.3).clamp(min=0)
             log_scale_reg = log_scale_reg + excess.pow(2).mean()
             n_ls = n_ls + 1
         if n_ls > 0:
             log_scale_reg = log_scale_reg / n_ls
-        signal_entropy_weight = getattr(self.cfg, 'signal_entropy_weight', 0.001)
-        l1_weight = getattr(self.cfg, 'gate_l1_weight', 0.001)
-        reinforce_weight = getattr(self.cfg, 'reinforce_weight', 0.01)
-        balance_weight = getattr(self.cfg, 'balance_weight', 0.01)
-        diversity_weight = getattr(self.cfg, 'diversity_weight', 0.001)
-        nuc_weight = getattr(self.cfg, 'nuclear_weight', 1e-5)
-        orth_weight = getattr(self.cfg, 'orth_weight', 1e-4)
-        log_scale_l2_weight = getattr(self.cfg, 'log_scale_l2_weight', 0.01)
-        # Mirror diversity: push log_scale variance (sum-of-squares, no /N dilution)
+        
+        # Diversity: per-layer log_scale variance (inter-expert + intra-expert)
+        div_loss_raw = 0.0
         div_w = getattr(self.cfg, 'div_weight', 0.0)
-        div_loss = 0.0
         if div_w > 0:
-            all_ls = torch.cat([layer.mirror.log_scale.reshape(-1) for layer in self.layers])
-            div_loss = -div_w * all_ls.var()
-        # Ranking loss: order ls_mean by gate_usage (contrastive, no /N dilution)
-        ranking_weight = getattr(self.cfg, 'ranking_weight', 0.0)
-        ranking_loss = 0.0
-        if ranking_weight > 0:
             for layer in self.layers:
-                gu = getattr(layer.mirror, '_cached_gate_usage', None)
-                if gu is not None:
-                    ls = layer.mirror.log_scale
-                    ls_mean = ls.mean(dim=-1)
-                    gate_diff = gu.unsqueeze(1) - gu.unsqueeze(0)  # (G, G)
-                    ls_diff = ls_mean.unsqueeze(1) - ls_mean.unsqueeze(0)
-                    margin = 0.01
-                    ranking_loss = ranking_loss + (F.relu(margin - ls_diff) * (gate_diff > 0).float()).sum()
-        total = ce_loss + pw * pred_loss + l1_weight * gate_l1 + reinforce_weight * reinforce_loss \
-            + balance_weight * balance_loss + diversity_weight * diversity_loss \
-            + nuc_weight * nuc_loss + orth_weight * orth_loss \
-            + w_m2v_weight * w_m2v_loss + branch_weight * branch_loss + div_loss \
-            + ranking_weight * ranking_loss \
-            - signal_entropy_weight * signal_entropy \
-            + log_scale_l2_weight * log_scale_reg
+                ls = layer.mirror.log_scale
+                d = ls.shape[-1]
+                G = ls.shape[0]
+                intra_weight = math.sqrt(d / G)
+                div_loss_raw = div_loss_raw - (ls.var(dim=0).mean() + intra_weight * ls.var(dim=-1).mean())
+            div_loss_raw = div_loss_raw / max(len(self.layers), 1)
+        
         self._cached_losses = {
-            'ce': ce_loss.item() if hasattr(ce_loss, 'item') else ce_loss,
-            'pred': pred_loss.item() if hasattr(pred_loss, 'item') else pred_loss,
-            'gate_l1': gate_l1.item() if hasattr(gate_l1, 'item') else gate_l1,
-            'reinforce': reinforce_loss.item() if hasattr(reinforce_loss, 'item') else reinforce_loss,
-            'balance': balance_loss.item() if hasattr(balance_loss, 'item') else balance_loss,
-            'div': div_loss.item() if hasattr(div_loss, 'item') else div_loss,
-            'ranking': ranking_loss.item() if hasattr(ranking_loss, 'item') else ranking_loss,
-            'signal_ent': signal_entropy.item() if hasattr(signal_entropy, 'item') else signal_entropy,
-            'ls_reg': log_scale_reg.item() if hasattr(log_scale_reg, 'item') else log_scale_reg,
+            'ce': ce_loss.item(),
+            'pred': pred_loss.item() if isinstance(pred_loss, torch.Tensor) else pred_loss,
+            'gate_l1': gate_l1.item() if isinstance(gate_l1, torch.Tensor) else gate_l1,
+            'reinforce': reinforce_loss.item() if isinstance(reinforce_loss, torch.Tensor) else reinforce_loss,
+            'balance': balance_loss.item() if isinstance(balance_loss, torch.Tensor) else balance_loss,
+            'div': div_loss_raw.item() if isinstance(div_loss_raw, torch.Tensor) else div_loss_raw,
+            'ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
+            'signal_ent': signal_entropy.item() if isinstance(signal_entropy, torch.Tensor) else signal_entropy,
+            'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
         }
-        return total, div_loss, ranking_loss, div_w, ranking_weight
+        aux_dict = {}
+        if pred_loss != 0:
+            aux_dict['pred'] = pred_loss
+        if gate_l1 != 0:
+            aux_dict['gate_l1'] = gate_l1
+        if reinforce_loss != 0:
+            aux_dict['reinforce'] = reinforce_loss
+        if balance_loss != 0:
+            aux_dict['balance'] = balance_loss
+        if diversity_loss != 0:
+            aux_dict['diversity'] = diversity_loss
+        if nuc_loss != 0:
+            aux_dict['nuc'] = nuc_loss
+        if orth_loss != 0:
+            aux_dict['orth'] = orth_loss
+        if w_m2v_loss != 0:
+            aux_dict['w_m2v'] = w_m2v_loss
+        if branch_loss != 0:
+            aux_dict['branch'] = branch_loss
+        if div_loss_raw != 0:
+            aux_dict['div'] = div_loss_raw
+        if ranking_loss != 0:
+            aux_dict['ranking'] = ranking_loss
+        if signal_entropy != 0:
+            aux_dict['signal_ent'] = -signal_entropy
+        if log_scale_reg != 0:
+            aux_dict['ls_reg'] = log_scale_reg
+        return ce_loss, aux_dict
     
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -1947,18 +2003,16 @@ class MirrorLRScheduler:
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
+        self._orig_lrs = [pg['lr'] for pg in optimizer.param_groups]
         self.warmup = warmup
         self._step = 0
         self._last_log = 0
-        # Adaptive thresholds: EMA of mirror stats (replaces fixed init/reference values)
+        # Adaptive thresholds: EMA of mirror stats
         self._tau_var = None
         self._tau_mag = None
         self._tau_1malpha = None
         self._tau_gate_var = None
         self._tau_ema = 0.99
-        self._best_val_loss = float('inf')
-        self._loss_lr_factor = 1.0  # persistent damping factor (1.0 = no damping)
-        self._pending_val_loss = None
 
     def _mirror_stats(self):
         var_sum = 0.0
@@ -1981,43 +2035,21 @@ class MirrorLRScheduler:
         pass
 
     def report_val_loss(self, val_loss):
-        """Report validation loss for LR damping. Called from training code after eval."""
-        self._pending_val_loss = val_loss
-
-    def _consume_pending_val_loss(self):
-        """Update persistent damping factor from reported val_loss."""
-        if self._pending_val_loss is None:
-            return
-        vl = self._pending_val_loss
-        self._pending_val_loss = None
-        if vl < self._best_val_loss:
-            if self._loss_lr_factor < 1.0:
-                print(f'  LR RESTORED: val_loss={vl:.4f} new best, factor 1.0')
-            self._best_val_loss = vl
-            self._loss_lr_factor = 1.0
-        elif vl > self._best_val_loss * 1.02:
-            old = self._loss_lr_factor
-            self._loss_lr_factor = max(0.3, self._loss_lr_factor * 0.85)
-            if self._loss_lr_factor < old:
-                print(f'  LR DAMPED: val_loss={vl:.4f} > best={self._best_val_loss:.4f}, '
-                      f'factor {old:.3f} -> {self._loss_lr_factor:.3f}')
+        """Report validation loss (kept for interface compatibility, no LR damping)."""
+        pass
 
     def step(self):
         self._step += 1
-        self._consume_pending_val_loss()
-        # Alpha override: smoothly blended into learned alpha_diag by forward()
-        # override=1.0 → 0.0 provides smooth transition from identity to learned
         warmup_end = self.warmup
         blend_steps = 50
         if self._step < warmup_end + blend_steps:
             if self._step < warmup_end:
                 mult = self._step / max(warmup_end, 1)
-                override = max(0.0, 1.0 - mult * 0.7)  # 1.0 → 0.3
+                override = max(0.0, 1.0 - mult * 0.7)
             else:
-                blend = (self._step - warmup_end) / blend_steps  # 0 → 1
-                mult = 1.0 - blend * 0.3  # плавно 1.0 → 0.7
-                override = 0.3 * max(0.0, 1.0 - blend)  # 0.3 → 0.0
-            # Temperature annealing during warmup (homeostatica接管 after warmup)
+                blend = (self._step - warmup_end) / blend_steps
+                mult = 1.0 - blend * 0.3
+                override = 0.3 * max(0.0, 1.0 - blend)
             temp_max, temp_min = 2.0, 0.5
             if self._step < warmup_end:
                 t = self._step / max(warmup_end, 1)
@@ -2033,22 +2065,18 @@ class MirrorLRScheduler:
                 layer.mirror._alpha_override.fill_(0.0)
             var, mag, mean_1malpha, gate_var = self._mirror_stats()
 
-            # Initialize adaptive taus on first post-warmup step
             if self._tau_var is None:
                 self._tau_var = var + 1e-10
                 self._tau_mag = mag + 1e-10
                 self._tau_1malpha = mean_1malpha + 1e-10
                 self._tau_gate_var = gate_var + 1e-10
 
-            # Update adaptive taus via EMA (reference point follows moving statistics)
             te = self._tau_ema
             self._tau_var = te * self._tau_var + (1 - te) * var
             self._tau_mag = te * self._tau_mag + (1 - te) * mag
             self._tau_1malpha = te * self._tau_1malpha + (1 - te) * mean_1malpha
             self._tau_gate_var = te * self._tau_gate_var + (1 - te) * gate_var
 
-            # Deviation-based multipliers: LR down only when stats deviate from steady-state
-            # Ratio to adaptive tau (stays near 1.0 when stats move slowly)
             var_ratio = var / self._tau_var
             var_mult = min(2.0, max(0.5, 1.0 / max(var_ratio, 1e-10)))
 
@@ -2058,15 +2086,11 @@ class MirrorLRScheduler:
             gate_ratio = gate_var / self._tau_gate_var
             gate_mult = min(2.0, max(0.5, 1.0 / max(gate_ratio, 1e-10)))
 
-            # Mag factor: |mirror| deviation from tau (adaptive reference)
             mag_ratio = mag / self._tau_mag
             mag_factor = min(1.0, max(0.2, 1.0 / max(mag_ratio, 1e-10)))
 
             mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
             mult = max(0.05, min(1.0, mirror_mult))
-
-            # Persistent loss damping (gentler: 0.85 decay, 0.3 floor)
-            mult *= self._loss_lr_factor
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
@@ -2074,10 +2098,10 @@ class MirrorLRScheduler:
                 print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
                       f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
                       f'tau_var={tau_var:.6f} '
-                      f'mult={mult:.4f} damp={self._loss_lr_factor:.3f} lr={self.base_lr*mult:.2e}')
+                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
 
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = self.base_lr * mult
+        for i, pg in enumerate(self.optimizer.param_groups):
+            pg['lr'] = self._orig_lrs[i] * mult
 
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
@@ -2091,8 +2115,7 @@ class MirrorLRScheduler:
             'tau_mag': self._tau_mag,
             'tau_1malpha': self._tau_1malpha,
             'tau_gate_var': self._tau_gate_var,
-            'best_val_loss': self._best_val_loss,
-            'loss_lr_factor': self._loss_lr_factor,
+            'orig_lrs': self._orig_lrs,
         }
 
     def load_state_dict(self, sd):
@@ -2102,15 +2125,10 @@ class MirrorLRScheduler:
         self._tau_mag = sd.get('tau_mag')
         self._tau_1malpha = sd.get('tau_1malpha')
         self._tau_gate_var = sd.get('tau_gate_var')
-        self._best_val_loss = sd.get('best_val_loss', float('inf'))
-        self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
+        if 'orig_lrs' in sd:
+            self._orig_lrs = sd['orig_lrs']
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
-        """Call when dataset changes (e.g. switching from ADVENTUR to FANTASY).
-        Resets loss damping and reruns warmup to prevent spurious LR damping."""
-        self._best_val_loss = float('inf')
-        self._loss_lr_factor = 1.0
-        self._pending_val_loss = None
         self._tau_var = None
         self._tau_mag = None
         self._tau_1malpha = None
@@ -2135,7 +2153,7 @@ if __name__ == '__main__':
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)
     h = model.embed_tokens(x)
     out, state, _ = model(h)
-    loss, _, _, _, _ = model.compute_loss(out[:, :-1], x[:, 1:])
+    loss = model.compute_loss(out[:, :-1], x[:, 1:])
     loss.backward()
     
     total_grad = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)

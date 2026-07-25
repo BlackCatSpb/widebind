@@ -80,6 +80,12 @@ def train(cfg=None, resume_path=None):
             raise
     n_params = model.param_count()
     print(f'Model: {n_params:,} params ({n_params/1e6:.2f}M)')
+    if device == 'cuda':
+        print(f'  VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB')
+    
+    # Phase tracking state (EMA-based adaptive threshold)
+    model._phase_ratio_ema = [0.0] * cfg.n_layers
+    model._phase_ratio_std = [1.0] * cfg.n_layers
     
     # Optimizer
     param_groups = model.param_groups()
@@ -141,6 +147,7 @@ def train(cfg=None, resume_path=None):
     
     # State for recurrent layers
     state = None
+    gs = None
     rng = torch.Generator().manual_seed(42)
     
     # Training loop
@@ -167,6 +174,7 @@ def train(cfg=None, resume_path=None):
                 stream_idx = torch.randint(0, len(streams), (1,), generator=rng).item()
                 offset = 0
                 state = None  # reset state on stream switch (document boundary)
+                gs = None
             
             # ─── Multi-scale seq curriculum: чередование длины батча по октавам τ ───
             # L=64 (τ≤32, октавы 0–13): 7/9 шагов
@@ -184,34 +192,112 @@ def train(cfg=None, resume_path=None):
             
             # ─── Forward ───
             h = model.embed_tokens(x)
-            out, state, _ = model(h, state)
-            loss, _, _, _, _ = model.compute_loss(out, y)
+            out, state, gs = model(h, state, global_state=gs, step=step)
             
-            # ─── Backward ───
-            optimizer.zero_grad()
-            loss.backward()
+            # Compute losses (raw, unweighted)
+            ce_loss, aux_dict = model.compute_losses(out, y)
+            
+            # NaN guard
+            if torch.isnan(ce_loss) or torch.isinf(ce_loss):
+                raise RuntimeError(f'NaN/Inf CE loss at step {step}')
+            
+            state = tuple(s.detach() for s in state) if state is not None else None
+            if gs is not None:
+                gs = gs.detach()
+            
+            # CE gradients (retain graph for aux backward)
+            ce_grads = torch.autograd.grad(ce_loss, model.parameters(),
+                                           retain_graph=bool(aux_dict), allow_unused=True)
+
+            # Spectral gradient alignment: scale aux by cos(g_CE, g_aux)
+            if aux_dict:
+                aux_total = sum(
+                    v for v in aux_dict.values()
+                    if isinstance(v, torch.Tensor) and v.requires_grad
+                )
+                aux_grads = torch.autograd.grad(aux_total, model.parameters(), allow_unused=True)
+                ce_list, aux_list = [], []
+                for gce, gaux in zip(ce_grads, aux_grads):
+                    if gce is not None and gaux is not None:
+                        ce_list.append(gce.flatten())
+                        aux_list.append(gaux.flatten())
+                if ce_list:
+                    ce_flat = torch.cat(ce_list)
+                    aux_flat = torch.cat(aux_list)
+                    cos_sim = F.cosine_similarity(ce_flat.unsqueeze(0), aux_flat.unsqueeze(0))
+                    scale = max(0, cos_sim.item()) * ce_flat.norm() / (aux_flat.norm() + 1e-8)
+                else:
+                    scale = 0.0
+            else:
+                scale = 0.0
+
+            # Combine: g = g_CE + scale * g_aux (scale > 0 only when aux aligns with CE)
+            with torch.no_grad():
+                for p, cg in zip(model.parameters(), ce_grads):
+                    if cg is not None:
+                        p.grad = cg.clone()
+                    else:
+                        p.grad = None
+                if aux_dict and scale > 0:
+                    for p, ag in zip(model.parameters(), aux_grads):
+                        if p.grad is not None and ag is not None:
+                            p.grad.add_(ag, alpha=scale)
+                        elif ag is not None:
+                            p.grad = ag * scale
+            
+            # Adaptive phase scaling: EMA-based mirror/base gradient balance
+            phase_scales = []
+            for i, layer in enumerate(model.layers):
+                mirror_norm = 0.0
+                base_norm = 0.0
+                for p in layer.mirror_parameters:
+                    if p.grad is not None:
+                        mirror_norm += p.grad.norm().item() ** 2
+                for p in layer.base_parameters:
+                    if p.grad is not None:
+                        base_norm += p.grad.norm().item() ** 2
+                mirror_norm = mirror_norm ** 0.5
+                base_norm = base_norm ** 0.5
+                ratio = mirror_norm / (base_norm + 1e-8)
+                ema = model._phase_ratio_ema[i]
+                std = model._phase_ratio_std[i]
+                model._phase_ratio_ema[i] = 0.99 * ema + 0.01 * ratio
+                model._phase_ratio_std[i] = 0.99 * std + 0.01 * abs(ratio - ema)
+                mir_s = 1.0 / (1.0 + math.exp(-(ratio - ema) / (std + 1e-8)))
+                phase_scales.append((mir_s, ratio))
+                for p in layer.mirror_parameters:
+                    if p.grad is not None:
+                        p.grad *= mir_s
+            mean_mirror_scale = sum(s[0] for s in phase_scales) / len(phase_scales)
+            mean_ratio = sum(s[1] for s in phase_scales) / len(phase_scales)
+            tokens_seen += cfg.batch_size * seq_len
             
             # Clip gradients
             if cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             
-            tokens_seen += cfg.batch_size * seq_len
             current_lr = scheduler.get_last_lr()[0]
             
             # ─── Soft EOS-aware state reset: затухание вместо обнуления ───
             if (y[:, -1] == 2).any():
                 if state is not None:
                     state = tuple(s * 0.1 for s in state)
+                if gs is not None:
+                    gs = gs * 0.1
             
             # Log
             if step % cfg.log_interval == 0:
                 dt = time.time() - t0
                 tok_s = tokens_seen / max(dt, 1e-8)
-                print(f'  step={step:>6} loss={loss.item():.4f} lr={current_lr:.2e} '
-                      f'tok/s={tok_s:.0f} stream={stream_idx}')
+                lc = getattr(model, '_cached_losses', {})
+                aux_str = ' '.join(f'{k}={v:.4f}' for k, v in lc.items())
+                print(f'  step={step:>6} loss={ce_loss.item():.4f} lr={current_lr:.2e} '
+                      f'tok/s={tok_s:.0f} stream={stream_idx} '
+                      f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} | {aux_str}')
             
             # Eval
             if step > 0 and step % cfg.eval_interval == 0:
@@ -285,7 +371,7 @@ def evaluate(model, streams, cfg, device):
         x, y = x.to(device), y.to(device)
         h = model.embed_tokens(x)
         out, state, _ = model(h, state)
-        loss, _, _, _, _ = model.compute_loss(out, y)
+        loss = model.compute_loss(out, y)
         total_loss += loss.item()
         total_steps += 1
     
