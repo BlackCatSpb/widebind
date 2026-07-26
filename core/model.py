@@ -40,6 +40,23 @@ def zeckendorf_codes(vocab=50000):
     return codes
 
 
+def fib_sigmoid_init(n, fib_vals=None):
+    """Fibonacci-based sigmoid bias initialization.
+    
+    Returns bias tensor such that sigmoid(b_i) = fib_vals[i] / sum(fib_vals).
+    Если fib_vals=None, используется ряд Фибоначчи длины n: [1,1,2,3,5,...].
+    """
+    if fib_vals is None:
+        f = [1, 1]
+        while len(f) < n:
+            f.append(f[-1] + f[-2])
+        fib_vals = f[:n]
+    fib = torch.tensor(fib_vals, dtype=torch.float32)
+    p = fib / fib.sum()
+    bias = torch.log(p / (1 - p + 1e-10))
+    return bias
+
+
 def sparse_block_codes(vocab=50000, K=32, S=6):
     """Sparse block codes: ровно S единиц из K на каждый токен.
     
@@ -392,8 +409,8 @@ class GroupedCognitiveMirror(nn.Module):
         self._delta_var_ema_min = delta_var_ema_min
         self._delta_var_ema_max = delta_var_ema_max
 
-        # ─── Learnable signal weights (softmax-normalized) ───
-        self._signal_log_weights = nn.Parameter(torch.zeros(n_signals))
+        # ─── Learnable signal weights (sigmoid + Fibonacci self-organization) ───
+        self._signal_log_weights = nn.Parameter(fib_sigmoid_init(n_signals))
 
         
         # ─── Self-organizing usefulness predictor (competitive) ───
@@ -602,8 +619,8 @@ class GroupedCognitiveMirror(nn.Module):
             s_norm = s / (self._signal_norm_ema[i].unsqueeze(0).unsqueeze(0) + 1e-8)
             signals_normed.append(s_norm)
         
-        # ─── Learnable signal weights (softmax-normalized) — moved before decorr ───
-        w = torch.softmax(self._signal_log_weights, dim=0)  # {n_sig} weights summing to 1
+        # ─── Learnable signal weights (sigmoid + Fibonacci self-organization) ───
+        w = torch.sigmoid(self._signal_log_weights)  # (n_sig,), no sum-to-1 constraint
         
         # ─── Decorrelation: orthogonalize WEIGHTED signals (gradient flows to _signal_log_weights) ───
         n_sig = len(signals)
@@ -732,7 +749,7 @@ class GroupedCognitiveMirror(nn.Module):
         info['private_mem_norm'] = self._private_mem.norm(dim=-1).mean().item()
         info['w_help'] = torch.sigmoid(self.w_help).mean().item()
         info['w_contra'] = self.w_contra.mean().item()
-        w = torch.softmax(self._signal_log_weights, dim=0)
+        w = torch.sigmoid(self._signal_log_weights)
         for i, label in enumerate(['temp','pred','smooth','sym','help'][:len(w)]):
             info[f'signal_w_{label}'] = w[i].item()
         if self._cached_contra_expert is not None:
@@ -1050,7 +1067,7 @@ class WideBindBlock(nn.Module):
         self.w_q_ctx = nn.Parameter(torch.full((cfg.D,), 0.5 / math.sqrt(cfg.D)))  # cross-chunk context read
         self.w_mem2v = nn.Parameter(torch.randn(cfg.D))
         # Per-scale per-channel combination weights (logits for softmax)
-        self.scale_w = nn.Parameter(torch.zeros(self._n_scales, cfg.D))
+        self.scale_w = nn.Parameter(fib_sigmoid_init(self._n_scales).unsqueeze(1).expand(-1, cfg.D).clone())
         # Linear decay across layers: shallow → short memory, deep → long
         # Per-channel (D,) — can differentiate via gradient when vsa_b_d_smooth < 1.0
         layer_frac = layer_idx / max(cfg.n_layers - 1, 1)
@@ -1206,8 +1223,8 @@ class WideBindBlock(nn.Module):
         mem_all_vec = mem_all_vec.view(B, L, S, D)  # (B, L, S, D)
         mem_leaf_vec = mem_leaf_vec.view(B, L, S, D)  # leaf: within-chunk only
         
-        # Weighted combination: softmax over scales per channel
-        w = F.softmax(self.scale_w, dim=0)  # (S, D)
+        # Weighted combination: sigmoid per scale per channel (no sum-to-1)
+        w = torch.sigmoid(self.scale_w)  # (S, D)
         mem_all = (mem_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, L, D)
         mem_leaf = (mem_leaf_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, L, D) — без кросс-чанк контекста
         # Dual read: leaf (within-chunk, 100% покрытие) + context (cross-chunk)
@@ -1418,7 +1435,7 @@ class WideBindStack(nn.Module):
                 tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
                 alpha_l = torch.clamp(1.0 - c_ema / tau_l, min=0.0)
                 # Weighted combination of scales для global state
-                w = F.softmax(layer.scale_w, dim=0)  # (S, D)
+                w = torch.sigmoid(layer.scale_w)  # (S, D), per-channel independent
                 mem_combined = (mem_state_out.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
                 mem_avg = mem_combined.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
                 if momentum_beta > 0:
@@ -1609,8 +1626,9 @@ class WideBindStack(nn.Module):
         signal_entropy = 0.0
         n_sig = 0
         for layer in self.layers:
-            w = torch.softmax(layer.mirror._signal_log_weights, dim=0)
-            signal_entropy = signal_entropy - (w * torch.log(w + 1e-10)).sum()
+            w = torch.sigmoid(layer.mirror._signal_log_weights)
+            p = w / (w.sum() + 1e-10)  # normalize for entropy
+            signal_entropy = signal_entropy - (p * torch.log(p + 1e-10)).sum()
             n_sig = n_sig + 1
         if n_sig > 0:
             signal_entropy = signal_entropy / n_sig
