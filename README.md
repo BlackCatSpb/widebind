@@ -267,7 +267,8 @@ Multi-ocular (S=4, shift):
 1. Проецирует h[g] (d=128) → hp[g] (k) через W_proj (d×k)
 2. Вычисляет 4-5 сигналов коррекции в K-space
 3. EMA-нормирует сигналы
-4. Смешивает через learnable softmax
+4. Смешивает через learnable sigmoid + Fibonacci init (диагональный Jacobian,
+   полный ранг, независимые градиенты)
 5. delta = Σ w_i · signal_i
 6. delta @ W_out (k→d) → tanh + skip_alpha · linear → gate → exp(log_scale)
 
@@ -317,12 +318,15 @@ signal_normed = signal / (ema[n] + 1e-8)
 ### 8.5 Learnable signal weights
 
 ```python
-w = softmax(signal_log_weights)  # n_signals весов, sum=1
+w = torch.sigmoid(self._signal_log_weights)  # n_signals весов, без sum-to-1
 delta = Σ w[i] · signals_normed[i]
 ```
 
-Энтропийная регуляризация: `-signal_entropy_weight · H(w)` в loss.
-Вес 0.001 — мягкое поощрение равномерного использования.
+Инициализация Фибоначчи [1,1,2,3,5]: bias = log(p/(1-p)), где p = Fib/sum(Fib).
+Медленные сигналы получают больший init вес и больший градиент.
+
+Энтропийная регуляризация: `-0.001 · H(p)` в loss, где p = w / sum(w) — нормализация
+для энтропии (sigmoid не гарантирует sum=1).
 
 ### 8.6 Predictive mirror (alpha)
 
@@ -464,7 +468,8 @@ help_k = help_k · sigmoid(w_help) · trust
 ### 9.5 help_k как 5-й сигнал
 
 help_k добавляется к 4 базовым сигналам (temp, pred_error, smooth, sym):
-все 5 смешиваются через learnable softmax.
+все 5 смешиваются через learnable sigmoid + Fibonacci init [1,1,2,3,5].
+Decorrelation на взвешенных сигналах — прямой градиент в веса.
 
 ---
 
@@ -686,7 +691,7 @@ lr = base_lr * mult
 | reinforce | 0.01 | Gate должен совпадать с usefulness |
 | balance | 0.01 | Load balancing (энтропия использования → logG) |
 | diversity | 0.001 | ||cov(MLP_groups) - I||² |
-| signal_entropy | 0.001 | -H(omega) — равномерность сигналов |
+| signal_entropy | 0.001 | |H(p)| — равномерность sigmoid-весов, p = w / sum(w) |
 | nuclear | 1e-5 | Ядерная норма W_proj (стохастическая) |
 | orth | 1e-4 | Ортогональность W_proj ||Ŵ^TŴ - I||² |
 | w_m2v_hierarchy | 0.001 | Push w_m2v к target ∝ σ(ln τ) |
@@ -788,11 +793,14 @@ VSA O(L · log(CHUNK)) — длина последовательности не 
 
 ## 21. Статус (July 2026)
 
-Синхронизирован с Mini после аудита:
+Синхронизирован с Mini. Актуальные архитектурные изменения:
 
-- **Soft routing overlay**: gate_bonus через `_behavior_div_ema` + `_concept_sim_ema` × `w_contra × 0.1`
-- **Gate EMA fix**: `.data` bypass autograd in-place mutation bug
-- **Aux weights**: `div_weight=0.0001`, `balance=0.001`, `reinforce=0.001`. `div_loss` → `.var()`.
-- **Loss monitoring**: `_cached_losses` в compute_loss для каждого aux loss
+- **Signal weights: softmax→sigmoid+Fib**: `_signal_log_weights` — sigmoid + Fibonacci [1,1,2,3,5].
+  Диагональный Jacobian, полный ранг, нет перекрёстного влияния весов.
+- **scale_w: softmax→sigmoid+Fib**: 4 масштаба VSA — sigmoid + Fibonacci [1,1,2,3].
+  weight_decay=0 (группа vsa).
+- **Decorrelaton на взвешенных сигналах**: прямой градиент в `_signal_log_weights`.
+- **signal_entropy**: нормализация p = w / sum(w) для sigmoid.
+- **VSA-aware tau_l**: `layer_b_i()` с `tau_l`, tau -4.0 → -6.0.
 
 *WideBind Main — C. BlackCatSpb, July 2026*
