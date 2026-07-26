@@ -602,6 +602,23 @@ class GroupedCognitiveMirror(nn.Module):
             s_norm = s / (self._signal_norm_ema[i].unsqueeze(0).unsqueeze(0) + 1e-8)
             signals_normed.append(s_norm)
         
+        # ─── Decorrelation: orthogonalize signals (standing wave modes) ───
+        n_sig = len(signals)
+        decorr = 0.0
+        npairs = 0
+        for i in range(n_sig):
+            for j in range(i + 1, n_sig):
+                si = signals_normed[i].reshape(-1, signals_normed[i].shape[-2] * signals_normed[i].shape[-1])
+                sj = signals_normed[j].reshape(-1, signals_normed[j].shape[-2] * signals_normed[j].shape[-1])
+                si_c = si - si.mean(dim=0, keepdim=True)
+                sj_c = sj - sj.mean(dim=0, keepdim=True)
+                cos_ij = (si_c * sj_c).sum(dim=-1) / (si_c.norm(dim=-1) * sj_c.norm(dim=-1) + 1e-8)
+                decorr = decorr + cos_ij.pow(2).mean()
+                npairs = npairs + 1
+        if npairs > 0:
+            decorr = decorr / npairs
+        self._cached_decorr = decorr
+        
         # ─── Learnable signal weights (softmax-normalized) ───
         n_sig = len(signals)
         w = torch.softmax(self._signal_log_weights, dim=0)  # {n_sig} weights summing to 1
@@ -1302,6 +1319,14 @@ class WideBindStack(nn.Module):
             state = [None] * len(self.layers)
         B, L, D = h.shape
         
+        # ─── Learnable VSA scales (Idea 1) — moved before AdaptiveController loop ───
+        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
+        tau_min = vsa_tau[0]
+        tau_max = vsa_tau[-1]
+        tau_mid = (tau_min * tau_max).sqrt()
+        c_ema = (1.0 / math.sqrt(self.cfg.D)) * tau_mid
+        n_layers = len(self.layers)
+        
         # ─── Adaptive gate biases from mirror stats (per-layer) ───
         if adaptive:
             with torch.no_grad():
@@ -1319,8 +1344,10 @@ class WideBindStack(nn.Module):
                     l_expl, l_diff = AdaptiveController.layer_stats(layer,
                         expl_thresh=self.cfg.exploration_threshold,
                         diff_thresh=self.cfg.differentiation_threshold)
-                    
-                    b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl)
+                    lf = i / max(len(self.layers) - 1, 1)
+                    dev = torch.tanh(self._tau_l_dev[i])
+                    tau_l_val = (tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))).item()
+                    b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl, tau_l=tau_l_val)
                     b_d_max = getattr(self.cfg, 'vsa_b_d_max', 12.0)
                     b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
                         b_d_max=b_d_max)
@@ -1336,19 +1363,12 @@ class WideBindStack(nn.Module):
         
         # Global self-model: running EMA of layer memory centroids
         # Per-layer EMA rates proportional to 1/τ (Proposal V)
-        n_layers = len(self.layers)
         if global_state is None:
             global_state = torch.zeros(n_layers, 1, D, device=h.device, dtype=h.dtype)
         if global_state.dim() == 2:
             global_state = global_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
         elif global_state.shape[0] != n_layers:
             global_state = global_state[0:1].expand(n_layers, -1, -1).clone()
-        # ─── Learnable VSA scales (Idea 1) ───
-        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
-        tau_min = vsa_tau[0].item()
-        tau_max = vsa_tau[-1].item()
-        tau_mid = math.sqrt(tau_min * tau_max)
-        c_ema = (1.0 / math.sqrt(self.cfg.D)) * tau_mid
         # ─── Momentum warmup for global_state oscillation (Idea 3) ───
         momentum_beta = 0.0
         if adaptive and step is not None and step >= 5000:
@@ -1397,7 +1417,7 @@ class WideBindStack(nn.Module):
                 lf = i / max(n_layers - 1, 1)
                 dev = torch.tanh(self._tau_l_dev[i])
                 tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
-                alpha_l = max(0.0, 1.0 - c_ema / tau_l)
+                alpha_l = torch.clamp(1.0 - c_ema / tau_l, min=0.0)
                 # Weighted combination of scales для global state
                 w = F.softmax(layer.scale_w, dim=0)  # (S, D)
                 mem_combined = (mem_state_out.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
@@ -1405,7 +1425,7 @@ class WideBindStack(nn.Module):
                 if momentum_beta > 0:
                     vel_update = momentum_beta * self._gs_velocity[i:i+1].detach() + (1.0 - momentum_beta) * (mem_avg - gs_i)
                     self._gs_velocity[i:i+1] = vel_update.detach()
-                    global_state[i:i+1] = gs_i + self._gs_velocity[i:i+1]
+                    global_state[i:i+1] = gs_i + (1.0 - alpha_l.detach()) * self._gs_velocity[i:i+1]
                 else:
                     global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
                 s_out = tuple(t.detach() for t in s_out)
@@ -1546,14 +1566,15 @@ class WideBindStack(nn.Module):
                 if wm is not None:
                     lf = i / max(len(self.layers) - 1, 1)
                     vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
-                    tau_min = vsa_tau[0].item()
-                    tau_max = vsa_tau[-1].item()
-                    tau_mid = math.sqrt(tau_min * tau_max)
+                    tau_min_t = vsa_tau[0]
+                    tau_max_t = vsa_tau[-1]
+                    tau_mid_t = (tau_min_t * tau_max_t).sqrt()
                     dev = torch.tanh(self._tau_l_dev[i])
-                    tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
+                    tau_l_t = tau_min_t * (tau_max_t / tau_min_t) ** (lf * (1.0 + 0.1 * dev))
                     target = getattr(self.cfg, 'w_m2v_hierarchy_target', 1.0)
-                    target_m2v = target / (1.0 + math.exp(-(math.log(tau_l.item()) - math.log(tau_mid))))
-                    w_m2v_loss = w_m2v_loss + F.mse_loss(wm.mean(), torch.tensor(target_m2v, device=wm.device))
+                    target_m2v = target / (1.0 + torch.exp(-(tau_l_t.log() - tau_mid_t.log())))
+                    w_m2v_loss = w_m2v_loss + (wm.mean() - target_m2v).pow(2)
+                    n_m2v = n_m2v + 1
                     n_m2v = n_m2v + 1
             if n_m2v > 0:
                 w_m2v_loss = w_m2v_loss / n_m2v
@@ -1617,6 +1638,16 @@ class WideBindStack(nn.Module):
                 div_loss_raw = div_loss_raw - (ls.var(dim=0).mean() + intra_weight * ls.var(dim=-1).mean())
             div_loss_raw = div_loss_raw / max(len(self.layers), 1)
         
+        decorr_loss = 0.0
+        n_decorr = 0
+        for layer in self.layers:
+            d = getattr(layer.mirror, '_cached_decorr', None)
+            if d is not None:
+                decorr_loss = decorr_loss + d
+                n_decorr = n_decorr + 1
+        if n_decorr > 0:
+            decorr_loss = decorr_loss / n_decorr
+        
         self._cached_losses = {
             'ce': ce_loss.item(),
             'pred': pred_loss.item() if isinstance(pred_loss, torch.Tensor) else pred_loss,
@@ -1627,6 +1658,7 @@ class WideBindStack(nn.Module):
             'ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
             'signal_ent': signal_entropy.item() if isinstance(signal_entropy, torch.Tensor) else signal_entropy,
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
+            'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
         aux_dict = {}
         if pred_loss != 0:
@@ -1651,8 +1683,10 @@ class WideBindStack(nn.Module):
             aux_dict['div'] = div_loss_raw
         if ranking_loss != 0:
             aux_dict['ranking'] = ranking_loss
-        if signal_entropy != 0:
-            aux_dict['signal_ent'] = -signal_entropy
+        if n_decorr > 0:
+            aux_dict['decorr'] = decorr_loss
+        if n_sig > 0:
+            aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
             aux_dict['ls_reg'] = log_scale_reg
         return ce_loss, aux_dict
@@ -1858,7 +1892,7 @@ class AdaptiveController:
         return max(2.0, min(b_d_max, b_d_val))
 
     @staticmethod
-    def layer_b_i(layer, expl=None):
+    def layer_b_i(layer, expl=None, tau_l=None):
         """Per-layer write gate bias. Нормировка: i_gate ∝ 1/τ.
         
         i_gate = softplus(b_i_l). Равновесная норма памяти:
@@ -1871,19 +1905,17 @@ class AdaptiveController:
         """
         if expl is None:
             expl, _ = AdaptiveController.layer_stats(layer)
-        # Базовый b_i от exploration
         b_i_base = -3.0 + expl * 1.5
-        # c = 0.182 · 32 ≈ 5.83
         c = 5.83
-        lf = getattr(layer, 'layer_idx', 0) / max(getattr(layer, 'total_layers', 32) - 1, 1)
-        # τ_l ≈ 8 · (1 + 3.5 · lf)  (аппроксимация линейного роста 8→149 по слоям)
-        tau_l = 8.0 + 141.0 * lf
-        i_target = min(1.0, c / tau_l)  # насыщение на 1.0 для L0
-        # softplus⁻¹(x) = log(exp(x)-1), но для численной стабильности:
-        # b_i = log(exp(i_target) - 1) ≈ log(i_target) для малых i_target
+        if tau_l is not None:
+            i_target = min(1.0, c / tau_l)
+        else:
+            lf = getattr(layer, 'layer_idx', 0) / max(getattr(layer, 'total_layers', 32) - 1, 1)
+            tau_l = 8.0 + 141.0 * lf
+            i_target = min(1.0, c / tau_l)
         b_i_tau = math.log(max(i_target, 1e-6))
         b_i = b_i_base + b_i_tau
-        return max(b_i, -4.0)
+        return max(b_i, -6.0)  # floor: i_gate >= softplus(-6.0) ≈ 0.0025
 
     @staticmethod
     def layer_w_mem2v_scale(layer, min_val=0.544, max_val=1.0, diff=None):
