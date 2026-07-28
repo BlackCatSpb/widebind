@@ -12,7 +12,7 @@ MirrorMonitor:  Non-invasive tracer. After each forward, reads per-expert gates,
 """
 
 import torch
-from .model import WideBindStack, AdaptiveController
+from .stack import WideBindStack, AdaptiveController
 
 
 class MirrorMonitor:
