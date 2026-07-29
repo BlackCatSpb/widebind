@@ -384,7 +384,7 @@ class WideBindStack(nn.Module):
         if gate_rp_w > 0:
             n_rp = 0
             for layer in self.layers:
-                gate_usage = getattr(layer.mirror, '_last_gates', None)
+                gate_usage = getattr(layer.mirror, '_cached_gate_usage', None)
                 if gate_usage is not None:
                     gate_repulse_loss = gate_repulse_loss - gate_usage.var()
                     n_rp += 1
