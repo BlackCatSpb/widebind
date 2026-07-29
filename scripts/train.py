@@ -209,12 +209,36 @@ def train(cfg=None, resume_path=None):
             ce_grads = torch.autograd.grad(ce_loss, model.parameters(),
                                            retain_graph=bool(aux_dict), allow_unused=True)
 
-            # Spectral gradient alignment: scale aux by cos(g_CE, g_aux)
+            # Separate bypass losses from spectral alignment
+            w_div = getattr(cfg, 'div_weight', 0.0)
+            w_rp = getattr(cfg, 'gate_repulse_weight', 0.0)
+            w_nv = getattr(cfg, 'alpha_novelty_weight', 0.0)
+            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking'}
+            bypass_losses = {k: None for k in bypass_keys}
+            aligned_list = []
             if aux_dict:
-                aux_total = sum(
-                    v for v in aux_dict.values()
-                    if isinstance(v, torch.Tensor) and v.requires_grad
-                )
+                for k, v in aux_dict.items():
+                    w = 1.0
+                    if k == 'div': w = w_div
+                    if k == 'gate_repulse': w = w_rp
+                    if k == 'alpha_novelty': w = w_nv
+                    if not (isinstance(v, torch.Tensor) and v.requires_grad):
+                        continue
+                    if k in bypass_keys and w > 0:
+                        bypass_losses[k] = v * w
+                    elif w > 0:
+                        aligned_list.append(v * w)
+
+            # Bypass gradients: applied directly without spectral alignment
+            bypass_grads = {}
+            for k, v in bypass_losses.items():
+                if v is not None:
+                    bypass_grads[k] = torch.autograd.grad(
+                        v, model.parameters(), allow_unused=True)
+
+            # Spectral gradient alignment for non-bypass aux
+            if aligned_list:
+                aux_total = sum(aligned_list)
                 aux_grads = torch.autograd.grad(aux_total, model.parameters(), allow_unused=True)
                 ce_list, aux_list = [], []
                 for gce, gaux in zip(ce_grads, aux_grads):
@@ -229,21 +253,30 @@ def train(cfg=None, resume_path=None):
                 else:
                     scale = 0.0
             else:
+                aux_grads = None
                 scale = 0.0
 
-            # Combine: g = g_CE + scale * g_aux (scale > 0 only when aux aligns with CE)
+            # Combine: g = g_CE + scale * g_aligned + sum(bypass_grads)
             with torch.no_grad():
                 for p, cg in zip(model.parameters(), ce_grads):
                     if cg is not None:
                         p.grad = cg.clone()
                     else:
                         p.grad = None
-                if aux_dict and scale > 0:
+                if aux_grads is not None and scale > 0:
                     for p, ag in zip(model.parameters(), aux_grads):
                         if p.grad is not None and ag is not None:
                             p.grad.add_(ag, alpha=scale)
                         elif ag is not None:
                             p.grad = ag * scale
+                for gname, bgrads in bypass_grads.items():
+                    if bgrads is not None:
+                        for p, bg in zip(model.parameters(), bgrads):
+                            if bg is not None:
+                                if p.grad is not None:
+                                    p.grad.add_(bg)
+                                else:
+                                    p.grad = bg.clone()
             
             # Adaptive phase scaling: EMA-based mirror/base gradient balance
             phase_scales = []

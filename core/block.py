@@ -56,7 +56,9 @@ class WideBindBlock(nn.Module):
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
             tie_mirror_proj=cfg.tie_mirror_proj,
             layer_idx=layer_idx, n_layers=cfg.n_layers,
-            has_private_mem=getattr(cfg, 'private_mem', False))
+            has_private_mem=getattr(cfg, 'private_mem', False),
+            gate_bias_scale=0.5 + 1.5 * layer_idx / max(cfg.n_layers - 1, 1) if getattr(cfg, 'gate_bias_scale_per_layer', False) else cfg.gate_bias_scale,
+            alpha_novelty_weight=getattr(cfg, 'alpha_novelty_weight', 0.0))
         
         # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
         self._n_scales = 4

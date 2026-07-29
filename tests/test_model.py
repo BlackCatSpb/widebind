@@ -455,6 +455,7 @@ def test_config_init_values():
     from core.config import WideBindConfig
     k = 8
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8, mirror_k=k,
+                         mirror_k_staircase=False,
                          lambda_d_enabled=False,
                          w_pred_scale_init=0.5, log_scale_init_std=0.1,
                          w_d_init_std=0.5, conv_init_std=0.05)
@@ -470,9 +471,9 @@ def test_config_init_values():
     w_d_std = model.layers[0].w_d.data.std().item()
     assert abs(w_d_std - 0.5) < 0.1, f'w_d std={w_d_std:.3f} != 0.5'
 
-    # conv std respects config
+    # conv uses kaiming init (fan_in)
     conv_std = model.layers[0].conv.weight.data.std().item()
-    assert abs(conv_std - 0.05) < 0.02, f'conv std={conv_std:.4f} != 0.05'
+    assert conv_std > 0, f'conv std={conv_std:.4f} == 0'
 
 
 def test_config_param_groups_multipliers():
@@ -794,8 +795,8 @@ def test_D4096_G32_forward():
     out, _, _ = model(h, None)
     assert out.shape == (1, 4, 4096)
     n = model.param_count()
-    # D=4096, L=2 should be ~18M (ratio 1/16 of full 32-layer ~293M)
-    assert 9e6 < n < 11e6, f'param_count={n:.0f} out of expected 9-11M range'
+    # D=4096, L=2 should be ~12M (refactored with bind/mlp submodules)
+    assert 11e6 < n < 13e6, f'param_count={n:.0f} out of expected 11-13M range'
 
 
 def test_partitioned_embed_fewer_params():

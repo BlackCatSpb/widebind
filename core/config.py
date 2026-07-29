@@ -46,8 +46,12 @@ class WideBindConfig:
     mlp_expand: int = 4
     private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
-    div_weight: float = 0.087   # λ⁻⁴: push log_scale variance per-layer  # expert diversity: var-based push, no /N (0=disabled)
-    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (0=disabled)
+    div_weight: float = 50.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
+    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
+    gate_repulse_weight: float = 0.3  # push gate variance up (inverse of balance, bypasses spectral)
+    alpha_novelty_weight: float = 0.05  # push per-expert alpha apart (heuristic, no spectral)
+    gate_bias_scale: float = 2.0  # linspace init for gate bias per expert [-scale, scale]
+    gate_bias_scale_per_layer: bool = True  # 0.5 (first layer) -> 2.0 (last layer)
 
     # Scheduler (values below will be overridden by λ_d when lambda_d_enabled=True)
     scheduler: str = 'mirror'

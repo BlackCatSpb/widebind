@@ -375,9 +375,35 @@ class WideBindStack(nn.Module):
                 d = ls.shape[-1]
                 G = ls.shape[0]
                 intra_weight = math.sqrt(d / G)
-                div_loss_raw = div_loss_raw - (ls.var(dim=0).mean() + intra_weight * ls.var(dim=-1).mean())
+                div_loss_raw = div_loss_raw - (ls.sigmoid().var(dim=0).mean() + intra_weight * ls.sigmoid().var(dim=-1).mean())
             div_loss_raw = div_loss_raw / max(len(self.layers), 1)
-        
+
+        # Gate repulsion: push gate variance up (inverse of balance)
+        gate_repulse_loss = 0.0
+        gate_rp_w = getattr(self.cfg, 'gate_repulse_weight', 0.0)
+        if gate_rp_w > 0:
+            n_rp = 0
+            for layer in self.layers:
+                gate_usage = getattr(layer.mirror, '_last_gates', None)
+                if gate_usage is not None:
+                    gate_repulse_loss = gate_repulse_loss - gate_usage.var()
+                    n_rp += 1
+            if n_rp > 0:
+                gate_repulse_loss = gate_repulse_loss / n_rp
+
+        # Alpha novelty: push per-expert alpha apart
+        alpha_novelty_loss = 0.0
+        alpha_nv_w = getattr(self.cfg, 'alpha_novelty_weight', 0.0)
+        if alpha_nv_w > 0:
+            n_nv = 0
+            for layer in self.layers:
+                ad = layer.mirror.alpha_diag
+                if ad is not None:
+                    alpha_novelty_loss = alpha_novelty_loss - ad.mean(dim=-1).var()
+                    n_nv += 1
+            if n_nv > 0:
+                alpha_novelty_loss = alpha_novelty_loss / n_nv
+
         decorr_loss = 0.0
         n_decorr = 0
         for layer in self.layers:
@@ -395,6 +421,8 @@ class WideBindStack(nn.Module):
             'reinforce': reinforce_loss.item() if isinstance(reinforce_loss, torch.Tensor) else reinforce_loss,
             'balance': balance_loss.item() if isinstance(balance_loss, torch.Tensor) else balance_loss,
             'div': div_loss_raw.item() if isinstance(div_loss_raw, torch.Tensor) else div_loss_raw,
+            'gate_repulse': gate_repulse_loss.item() if isinstance(gate_repulse_loss, torch.Tensor) else gate_repulse_loss,
+            'alpha_novelty': alpha_novelty_loss.item() if isinstance(alpha_novelty_loss, torch.Tensor) else alpha_novelty_loss,
             'ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
             'signal_ent': signal_entropy.item() if isinstance(signal_entropy, torch.Tensor) else signal_entropy,
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
@@ -421,6 +449,10 @@ class WideBindStack(nn.Module):
             aux_dict['branch'] = branch_loss
         if div_loss_raw != 0:
             aux_dict['div'] = div_loss_raw
+        if gate_repulse_loss != 0:
+            aux_dict['gate_repulse'] = gate_repulse_loss
+        if alpha_novelty_loss != 0:
+            aux_dict['alpha_novelty'] = alpha_novelty_loss
         if ranking_loss != 0:
             aux_dict['ranking'] = ranking_loss
         if n_decorr > 0:

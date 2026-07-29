@@ -110,20 +110,21 @@ def vsa_prefix_scan(a, b, state=None):
         b_chunk = b[:, start:end]
         a_chunk = a[:, start:end]
         
-        log_a_chunk = torch.log(a_chunk.clamp(min=eps))
+        log_a_chunk = torch.log(a_chunk.clamp(min=eps)).double()
         log_cum_chunk = torch.cumsum(log_a_chunk, dim=1)
         cum_decay_chunk = torch.exp(log_cum_chunk)
-        inv_cum_decay_chunk = (1.0 / cum_decay_chunk.clamp(min=eps)).clamp(max=1e6)
-        
-        weighted = b_chunk * inv_cum_decay_chunk
+        inv_cum_decay_chunk = 1.0 / cum_decay_chunk
+
+        weighted = b_chunk.to(torch.double) * inv_cum_decay_chunk
         cum_weighted = torch.cumsum(weighted, dim=1)
-        
+
         if s is not None:
+            s = s.to(torch.double)
             result_chunk = cum_decay_chunk * s.unsqueeze(1) + cum_decay_chunk * cum_weighted
         else:
             result_chunk = cum_decay_chunk * cum_weighted
-        
-        out.append(result_chunk)
+
+        out.append(result_chunk.to(b_chunk.dtype))
         s = result_chunk[:, -1]
     
     result = torch.cat(out, dim=1)
