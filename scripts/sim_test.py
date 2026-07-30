@@ -1,6 +1,9 @@
-"""Sim-test: 200 steps + comprehensive checks for Big model (D=2560, 24 layers).
-Without args: quick smoke test (200 steps).
-With --full: adds alpha grad flow, gate behavior, aux loss breakdown, deeper checks.
+"""Sim-test for Big model (D=2560, 24 layers).
+Usage:
+  python scripts/sim_test.py                         # quick smoke (200 steps)
+  python scripts/sim_test.py --full                   # + comprehensive checks
+  python scripts/sim_test.py --steps 100000           # long-run stability test
+  python scripts/sim_test.py --steps 100000 --full    # both
 """
 import sys, os, math, time, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -11,6 +14,7 @@ from core import WideBindConfig, WideBindStack, AdaptiveController, MirrorLRSche
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--full', action='store_true', help='Run comprehensive checks')
+parser.add_argument('--steps', type=int, default=200, help='Number of training steps (default: 200)')
 parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
 args = parser.parse_args()
 
@@ -18,7 +22,8 @@ device = args.device
 print(f'Device: {device} ({torch.cuda.get_device_name(0) if device=="cuda" else "N/A"})')
 
 # ─── Smoke test (always) ────────────────────────────────────────────
-print('\n=== SMOKE TEST: 200 steps (Big: D=2560, 24 layers, G=32) ===')
+N = args.steps
+print(f'\n=== SMOKE TEST: {N} steps (Big: D=2560, 24 layers, G=32) ===')
 cfg = WideBindConfig(
     D=2560, n_layers=24, bind_K=64, mlp_groups=32, mlp_expand=4,
     seq_len=128, batch_size=1, lr=3e-4, conv_kernel=48,
@@ -60,7 +65,7 @@ t0 = time.time()
 losses = []
 n_finite = 0
 
-for step in range(200):
+for step in range(N):
     x = torch.randint(0, cfg.vocab, (B, L), device=device)
     y = torch.randint(0, cfg.vocab, (B, L), device=device)
     optimizer.zero_grad()
@@ -82,8 +87,8 @@ for step in range(200):
         print(f'  step {step+1:3d}  loss={loss.item():.4f}  ce={ce_loss.item():.4f}  |g|={grad_norm if torch.isfinite(loss) else 0:.4f}  VRAM={vr:.0f}MB')
 
 t1 = time.time()
-print(f'\nTime: {t1-t0:.1f}s ({200/(t1-t0):.1f} steps/s)')
-print(f'Finite steps: {n_finite}/200')
+print(f'\nTime: {t1-t0:.1f}s ({N/(t1-t0):.1f} steps/s)')
+print(f'Finite steps: {n_finite}/{N}')
 
 with torch.no_grad():
     model.eval()
