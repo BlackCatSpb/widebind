@@ -138,19 +138,19 @@ class WideBindBlock(nn.Module):
         device = h.device
         K = self.K
         
-        # Transfer stale mirror cache (with shape check)
+        # Transfer stale mirror cache (with shape & dtype check)
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
             pen = self.mirror._cached_pred_error_norm
             if pen.shape[-1] != L:
                 self.mirror._cached_pred_error_norm = None
             else:
-                self.mirror._cached_pred_error_norm = pen.detach().to(device)
+                self.mirror._cached_pred_error_norm = pen.detach().to(device=device, dtype=h.dtype)
         if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
             hp_cached = self.mirror._cached_hp
             if hp_cached.shape[1] != L:
                 self.mirror._cached_hp = None
             else:
-                self.mirror._cached_hp = hp_cached.detach().to(device)
+                self.mirror._cached_hp = hp_cached.detach().to(device=device, dtype=h.dtype)
         
         # ─── Pre-LN ───
         h = F.rms_norm(h, (D,), self.pre_ln_w)
@@ -190,7 +190,7 @@ class WideBindBlock(nn.Module):
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
             pen = self.mirror._cached_pred_error_norm
             d_pen_factor = 1.0 - 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
-            d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.unsqueeze(-1)).reshape(B, L, D)
+            d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.to(d_mod.dtype).unsqueeze(-1)).reshape(B, L, D)
 
         # Vectorize over S scales: (B, L, D) → (B, L, S*D)
         d_s_vec = d_s.view(1, 1, S, 1).expand(B, L, S, D).reshape(B, L, S * D)
