@@ -137,6 +137,11 @@ class WideBindBlock(nn.Module):
 
         device = h.device
         K = self.K
+        S = self._n_scales
+        
+        # Consistent NaN state shapes (prevent ndim mismatch in next step)
+        _nan_conv = torch.zeros(B, D, self.conv.padding[0], device=device) * NaN
+        _nan_mem = torch.zeros(B, S * D, device=device) * NaN
         
         # Transfer stale mirror cache (with shape & dtype check)
         if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
@@ -163,12 +168,12 @@ class WideBindBlock(nn.Module):
         h_conv = h_conv[..., :L].transpose(1, 2)
         conv_state_out = h_perm[:, :, -(self.conv.padding[0]):]
         h = h + h_conv
-        if _chk(h, 'conv'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(h, 'conv'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_conv_out = h_conv  # for branch_loss (with grad)
         
         # ─── BottleneckBind (Fibonacci-twisted) ───
         bind_out = self.bind(h)  # (B, L, D)
-        if _chk(bind_out, 'bind'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
         S = self._n_scales
@@ -297,16 +302,16 @@ class WideBindBlock(nn.Module):
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
         mu_state_out = mu_state_out_vec.reshape(B, S * D)
-        if _chk(mem_read, 'mem_read'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(mem_read, 'mem_read'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── Mirror (self-consistency: local + global) ───
         mirror, mlp_mod, mem_mod = self.mirror(
             h, mem_all, global_state=global_state, diff=diff,
             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
             context_mem=context_mem, allow_write=allow_write)
-        if _chk(mirror, 'mirror'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
-        if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
-        if _chk(mem_mod, 'mem_mod'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(mirror, 'mirror'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(mem_mod, 'mem_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── Output (adaptive memory scale, per-group modulation) ───
         # mem_mod: per-token, per-expert gating of memory contribution
@@ -329,24 +334,24 @@ class WideBindBlock(nn.Module):
         bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
-        if _chk(enhanced, 'enhanced'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_bind_out = enhanced_base  # for branch_loss (with grad)
         self._cache_mirror_out = mirror  # for branch_loss (with grad)
         h = h + enhanced
-        if _chk(h, 'post_enhanced'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(h, 'post_enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
         h_dct = h @ self.V_dct.T
         h = h + (h_dct * self.lambda_k * spectral_mod) @ self.V_dct
-        if _chk(h, 'spectral'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(h, 'spectral'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── MLP (per-group modulation by mlp_mod) ───
         h_mlp = self.mlp(h)
-        if _chk(h_mlp, 'mlp_out'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(h_mlp, 'mlp_out'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         mm2 = mlp_mod.unsqueeze(-1)  # (B, L, G, 1)
         h_mlp = (h_mlp.reshape(B, L, g, d) * mm2).reshape(B, L, D)
         h = h + h_mlp
-        if _chk(h, 'post_mlp'): return h * NaN, (h[0,:1]*NaN, h[0,:1]*NaN, h[0,:1]*NaN)
+        if _chk(h, 'post_mlp'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         return h, (mem_state_out, mu_state_out, conv_state_out)
     
