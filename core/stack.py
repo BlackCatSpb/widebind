@@ -138,12 +138,23 @@ class WideBindStack(nn.Module):
                 pred_scale_mod = None
             
             gs_i = global_state[i:i+1].detach().clone()  # (1, 1, D), no grad through global_state (EMA-only)
-            h, s_out = layer(h, s, global_state=gs_i,
-                             mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
-                             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-                             spectral_mod=spectral_mod,
-                             context_mem=context_mem, allow_write=allow_write,
-                             tau_s=vsa_tau)
+            if self.cfg.gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint as _cp
+                h, s_out = _cp(
+                    WideBindStack._checkpointed_block,
+                    layer, h, s, gs_i,
+                    mem2v_scale, l_diff, nscale,
+                    tanh_bias_mod, pred_scale_mod, spectral_mod,
+                    context_mem, allow_write, vsa_tau,
+                    use_reentrant=False,
+                )
+            else:
+                h, s_out = layer(h, s, global_state=gs_i,
+                                 mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
+                                 tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+                                 spectral_mod=spectral_mod,
+                                 context_mem=context_mem, allow_write=allow_write,
+                                 tau_s=vsa_tau)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -474,6 +485,18 @@ class WideBindStack(nn.Module):
             aux_dict['ls_reg'] = log_scale_reg * w_ls
         return ce_loss, aux_dict
     
+    @staticmethod
+    def _checkpointed_block(layer, h, state, global_state,
+                             mem2v_scale, diff, noise_scale,
+                             tanh_bias_mod, pred_scale_mod, spectral_mod,
+                             context_mem, allow_write, tau_s):
+        """Wrapper for gradient checkpointing — all positional args are passed by checkpoint."""
+        return layer(h, state, global_state=global_state,
+                     mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
+                     tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+                     spectral_mod=spectral_mod, context_mem=context_mem,
+                     allow_write=allow_write, tau_s=tau_s)
+
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
     

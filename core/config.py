@@ -150,6 +150,7 @@ class WideBindConfig:
     accum_steps: int = 1  # effective batch = batch_size * seq_len * accum_steps
 
     compile: bool = False
+    gradient_checkpointing: bool = True  # trade compute for memory, essential on T4
 
     # Training
     max_steps: int = 500000
