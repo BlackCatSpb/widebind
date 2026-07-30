@@ -8,14 +8,14 @@
 Вся архитектура — композиция дифференцируемых резервуаров:
 
 ```
-token → PartitionedEmbedding (sparse 6/32 код)
+token → PartitionedEmbedding (sparse 6/32 код) + RoPE (θ=1e6)
       → [WideBindBlock × 32]
          → RMSNorm → Conv1d (k=48)
-         → BottleneckBind (D→K↔D, билинейное скрещивание)
+         → BottleneckBind (D→K↔D, QK-RMSNorm, билинейное скрещивание)
          → VSA Memory (4-масштабная суперпозиция, τ=8..512)
          → GroupedCognitiveMirror (32 эксперта×32 слоя, k=4/8/16 staircase)
          → DCT Spectral (частотная фильтрация)
-         → GroupedMLP (32 группы × expand=4)
+         → GroupedMLP (32 группы × SwiGLU, expand=4)
       → Final RMSNorm → PartitionedHead → logits
 ```
 
@@ -80,9 +80,24 @@ h_mix = code @ mix @ basis  # каждый бит влияет на все се�
 - Детерминированность: одинаковые токены → одинаковые коды.
 - V=50000, K=32: каждому сегменту ≈ 1563 токена, d=128.
 
-### 2.4 Параметры
+### 2.4 RoPE (Rotary Position Embedding)
+
+После embedding каждого токена применяется RoPE с θ=1e6 (Qwen3-style):
+
+```python
+rope = RotaryEmbedding(D=4096, theta=1000000.0)
+h = rope(h)  # вращение пар половинок размерности по позиции
+```
+
+- **0 дополнительных параметров** — только предвычисленные cos/sin таблицы.
+- theta=1e6: период ≈ 6.28M токенов, достаточен для context window любой длины.
+- RoPE **ортогонален VSA memory**: не конфликтует с аддитивным VSA сигналом, даёт ортогональный позиционный код через вращение.
+- Последовательности разной длины: кеш строится на лету (lazy build).
+
+### 2.5 Параметры
 
 basis: K × d = 32 × 128 = 4,096. Инициализация: нормальное распределение std=0.02.
+RoPE: 0 параметров.
 
 ---
 
@@ -238,7 +253,22 @@ return Σ softmax(mix_logit)[n] · a[n] @ W_out[n]
 Per-token adaptive gate: `g = sigmoid(W_gate_proj(hp))` — каждый сдвиг
 получает свой вес `g[s]`, модулирующий `prod[s]`.
 
-### 7.3 Инициализация
+### 7.3 QK-RMSNorm (Qwen3-inspired)
+
+На `hp = W_proj(h) + bias` перед cross-операциями применяется RMSNorm(K):
+
+```python
+self.hp_norm = nn.RMSNorm(K)
+hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
+```
+
+- **Зачем**: без нормализации градиент билинейного произведения масштабируется как ∝‖hp‖³.
+  При ‖hp‖ ≫ √K — взрыв, при ‖hp‖ ≪ √K — затухание. RMSNorm фиксирует ‖hp‖=√K.
+- **Параметры**: 2K = 128 (scale+bias, или 64 если elementwise_affine=False).
+- У Qwen3 то же самое: `q_norm` и `k_norm` на query/key проекциях перед attention.
+  У нас — аналог для билинейного cross-произведения в bottleneck.
+
+### 7.4 Инициализация
 
 - w_u, w_v: std=1.0 (критичен — градиент ∝ std³).
 - W_proj: Linear(D→K), инициализация по умолчанию (kaiming).
@@ -553,22 +583,28 @@ contra_expert: систематически противоречивый экс�
 
 ---
 
-## 12. GroupedMLP — Feed-Forward
+## 12. GroupedMLP — Feed-Forward (SwiGLU)
 
 ### 12.1 Архитектура
 
-32 группы × (128 → 512 → 128, SiLU). ~83% параметров.
+32 группы × (128 → 512 → 128, SwiGLU). ~86% параметров.
 
 ```python
-h = F.rms_norm(h, (D,), norm_w)          # pre-LN
-h = h.reshape(B, L, G, d)                 # split на G групп
-h = SiLU(einsum('blgd,gdf->blgf', h, W_up))  # d → expand·d
-h = einsum('blgf,gfd->blgd', h, W_down)      # expand·d → d
+h = F.rms_norm(h, (D,), norm_w)                # pre-LN
+h = h.reshape(B, L, G, d)                       # split на G групп
+gate = SiLU(einsum('blgd,gdf->blgf', h, W_gate))  # d → expand·d (gate)
+up   = einsum('blgd,gdf->blgf', h, W_up)           # d → expand·d (up)
+h = gate * up                                      # SwiGLU
+h = einsum('blgf,gfd->blgd', h, W_down)            # expand·d → d
 ```
 
-Per-group: d · 4d + 4d · d = 2 · d² · expand = 2 · 128² · 4 = 131,072.
-Per layer: 32 × 131,072 = 4,194,304.
-Total 32 layers: 134,217,728 (83.2% default).
+SwiGLU (Qwen3-style): `silu(W_gate(x)) * W_up(x)` вместо `silu(W_up(x))`.
+Gate решает **ЧТО** пропускать, up — **В КАКОМ НАПРАВЛЕНИИ**.
+Разделение ответственности даёт бо́льшую выразительность при +50% параметров.
+
+Per-group: d · 4d (gate) + d · 4d (up) + 4d · d (down) = 3 · d² · expand = 3 · 128² · 4 = 196,608.
+Per layer: 32 × 196,608 = 6,291,456.
+Total 32 layers: 201,326,592 (86.5% default).
 
 ### 12.2 Usefulness modulation
 
@@ -714,34 +750,33 @@ ce_loss = mean(w · CE)
 
 ## 18. Параметры
 
-### 18.1 Default (S=1, bind_twist_mode=off)
-
-| Компонент | Параметров | % |
-|-----------|-----------|----|
-| Embed + LM Head | 4,096 | <0.01 |
-| Embed + LM Head (basis+head) | 55,120 | 0.03 |
-| BottleneckBind (K=64, S=1) | 16,781,312 | 10.40 |
-| GroupedCognitiveMirror | 1,867,712 | 1.16 |
-| Conv1d (k=48, groups=D) | 6,291,456 | 3.90 |
-| DCT Spectral (lambda_k) | 131,072 | 0.08 |
-| VSA Gates (4-масштабная) | 1,835,040 | 1.14 |
-| Private Memory (w_help, w_contra) | 1,056 | <0.01 |
-| GroupedMLP (expand=4) | 134,348,800 | 83.22 |
-| **Total** | **~161,443,632** | **100** |
-
-### 18.2 Multi-Ocular (S=4, bind_twist_mode=shift)
+### 18.1 Default (S=1, bind_twist_mode=off, SwiGLU)
 
 | Компонент | Параметров | % |
 |-----------|-----------|----|
 | Embed + LM Head | 55,120 | 0.03 |
-| BottleneckBind (S=4, multi) | 41,959,424 | 22.48 |
-| GroupedCognitiveMirror | 1,867,712 | 1.00 |
-| Conv1d (k=48, groups=D) | 6,291,456 | 3.37 |
-| DCT Spectral | 131,072 | 0.07 |
-| VSA Gates | 1,835,040 | 0.98 |
+| BottleneckBind (K=64, S=1, QK-RMSNorm) | 16,781,440 | 8.61 |
+| GroupedCognitiveMirror | 1,867,712 | 0.96 |
+| Conv1d (k=48, groups=D) | 6,291,456 | 3.23 |
+| DCT Spectral (lambda_k) | 131,072 | 0.07 |
+| VSA Gates (4-масштабная) | 1,835,040 | 0.94 |
+| Private Memory (w_help, w_contra) | 1,056 | <0.01 |
+| GroupedMLP (expand=4, SwiGLU) | 201,326,592 | 86.18 |
+| **Total** | **~228,288,488** | **100** |
+
+### 18.2 Multi-Ocular (S=4, bind_twist_mode=shift, SwiGLU)
+
+| Компонент | Параметров | % |
+|-----------|-----------|----|
+| Embed + LM Head | 55,120 | 0.02 |
+| BottleneckBind (S=4, multi, QK-RMSNorm) | 41,959,552 | 16.41 |
+| GroupedCognitiveMirror | 1,867,712 | 0.73 |
+| Conv1d (k=48, groups=D) | 6,291,456 | 2.46 |
+| DCT Spectral | 131,072 | 0.05 |
+| VSA Gates | 1,835,040 | 0.72 |
 | Private Memory | 1,056 | <0.01 |
-| GroupedMLP (expand=4) | 134,348,800 | 71.99 |
-| **Total** | **~186,621,744** | **100** |
+| GroupedMLP (expand=4, SwiGLU) | 201,326,592 | 79.50 |
+| **Total** | **~253,466,600** | **100** |
 
 ### 18.3 K-space mirror staircase (32 слоя)
 
@@ -764,11 +799,15 @@ ce_loss = mean(w · CE)
 | d per expert | 112 | 128 |
 | k (staircase) | 32 (flat) | 4/8/16 (по глубине) |
 | Embedding | Partitioned (8×112) | Sparse Block Codes (6/32) |
+| RoPE | θ=1e6 (lazy cache) | θ=1e6 (lazy cache) |
+| BottleneckBind | D→K=32→D | D→K=64→D |
+| QK-RMSNorm | RMSNorm(K=32) | RMSNorm(K=64) |
+| MLP | Grouped (8×, SiLU) | Grouped (32×, **SwiGLU**) |
 | VSA | single-scale (τ per channel) | 4-scale (τ=8,32,128,512) |
-| AdaptiveController | нет | λ_d-выведенный |
+| AdaptiveController | упрощённый | λ_d-выведенный |
 | λ_d LR hierarchy | нет | да (p=-2..+2) |
 | Vocab | 11,000 | 50,000 |
-| Параметров (default) | 11.20M | 161.44M |
+| Параметров (default) | **10.44M** (SwiGLU) / 12.85M (classic) | **228M** (SwiGLU) / 161M (classic) |
 | VRAM | 2.1 GB (MX550) | 11-16 GB (T4) |
 
 ---
