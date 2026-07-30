@@ -123,6 +123,12 @@ class WideBindConfig:
                                     # 1.0 = instant overwrite (old behavior)
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
+    # ─── Qwen3-inspired upgrades ───
+    bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)
+    rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)
+    rope_scaling: float = 1.0            # RoPE scaling factor (linear)
+    mlp_swiglu: bool = True              # SwiGLU gate_proj parallel to up_proj (Qwen3-style)
+
     # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
     bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"
     bind_twist_S: int = 4                # number of shifts (1 when mode=off)

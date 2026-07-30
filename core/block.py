@@ -106,7 +106,8 @@ class WideBindBlock(nn.Module):
         self.lambda_k = nn.Parameter(lam)
         
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
-        self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups)
+        self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
+                              swiglu=getattr(cfg, 'mlp_swiglu', True))
     
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
