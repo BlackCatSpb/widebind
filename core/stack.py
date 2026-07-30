@@ -158,7 +158,12 @@ class WideBindStack(nn.Module):
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
-                S = layer._n_scales
+                S_expected = layer._n_scales
+                # Guard: checkpoint can flatten state to (B, D); infer actual S from numel
+                mem_flat = mem_state_out.reshape(B, -1)
+                S = mem_flat.shape[-1] // layer.D
+                if S == 0:
+                    S = 1
                 # Per-layer tau from VSA timescales + per-layer deviation (Idea 4)
                 lf = i / max(n_layers - 1, 1)
                 dev = torch.tanh(self._tau_l_dev[i])
@@ -166,7 +171,9 @@ class WideBindStack(nn.Module):
                 alpha_l = torch.clamp(1.0 - c_ema / tau_l, min=0.0)
                 # Weighted combination of scales для global state
                 w = torch.sigmoid(layer.scale_w)  # (S, D), per-channel independent
-                mem_combined = (mem_state_out.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
+                if S < S_expected:
+                    w = w[:S]  # truncate weights to match available scales
+                mem_combined = (mem_flat.reshape(B, S, layer.D) * w.unsqueeze(0)).sum(dim=1)
                 mem_avg = mem_combined.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
                 if momentum_beta > 0:
                     vel_update = momentum_beta * self._gs_velocity[i:i+1].detach() + (1.0 - momentum_beta) * (mem_avg - gs_i)
