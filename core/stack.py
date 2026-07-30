@@ -429,38 +429,49 @@ class WideBindStack(nn.Module):
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
         aux_dict = {}
+        w_pred = getattr(self.cfg, 'pred_weight', 0.0) or 0.01
         if pred_loss != 0:
-            aux_dict['pred'] = pred_loss
-        if gate_l1 != 0:
-            aux_dict['gate_l1'] = gate_l1
+            aux_dict['pred'] = pred_loss * w_pred
+        w_gate = getattr(self.cfg, 'gate_l1_weight', 0.0001)
+        if gate_l1 != 0 and w_gate > 0:
+            aux_dict['gate_l1'] = gate_l1 * w_gate
+        w_reinf = getattr(self.cfg, 'reinforce_weight', 0.001)
         if reinforce_loss != 0:
-            aux_dict['reinforce'] = reinforce_loss
+            aux_dict['reinforce'] = reinforce_loss * w_reinf
+        w_bal = getattr(self.cfg, 'balance_weight', 0.026)
         if balance_loss != 0:
-            aux_dict['balance'] = balance_loss
+            aux_dict['balance'] = balance_loss * w_bal
+        w_div = getattr(self.cfg, 'diversity_weight', 0.001)
         if diversity_loss != 0:
-            aux_dict['diversity'] = diversity_loss
+            aux_dict['diversity'] = diversity_loss * w_div
+        w_nuc = getattr(self.cfg, 'nuclear_weight', 1e-5)
         if nuc_loss != 0:
-            aux_dict['nuc'] = nuc_loss
+            aux_dict['nuc'] = nuc_loss * w_nuc
+        w_orth = getattr(self.cfg, 'orth_weight', 1e-4)
         if orth_loss != 0:
-            aux_dict['orth'] = orth_loss
+            aux_dict['orth'] = orth_loss * w_orth
         if w_m2v_loss != 0:
-            aux_dict['w_m2v'] = w_m2v_loss
+            aux_dict['w_m2v'] = w_m2v_loss * getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.001)
         if branch_loss != 0:
-            aux_dict['branch'] = branch_loss
+            aux_dict['branch'] = branch_loss * getattr(self.cfg, 'branch_balance_weight', 0.0)
+        w_repulse = getattr(self.cfg, 'gate_repulse_weight', 0.3)
         if div_loss_raw != 0:
-            aux_dict['div'] = div_loss_raw
+            aux_dict['div'] = div_loss_raw * getattr(self.cfg, 'div_weight', 50.0)
         if gate_repulse_loss != 0:
-            aux_dict['gate_repulse'] = gate_repulse_loss
+            aux_dict['gate_repulse'] = gate_repulse_loss * w_repulse
+        w_novelty = getattr(self.cfg, 'alpha_novelty_weight', 0.05)
         if alpha_novelty_loss != 0:
-            aux_dict['alpha_novelty'] = alpha_novelty_loss
+            aux_dict['alpha_novelty'] = alpha_novelty_loss * w_novelty
+        w_rank = getattr(self.cfg, 'ranking_weight', 0.01)
         if ranking_loss != 0:
-            aux_dict['ranking'] = ranking_loss
+            aux_dict['ranking'] = ranking_loss * w_rank
         if n_decorr > 0:
-            aux_dict['decorr'] = decorr_loss
+            aux_dict['decorr'] = decorr_loss * 0.01
         if n_sig > 0:
-            aux_dict['signal_ent'] = signal_entropy
+            aux_dict['signal_ent'] = signal_entropy * 0.01
+        w_ls = getattr(self.cfg, 'log_scale_l2_weight', 0.01)
         if log_scale_reg != 0:
-            aux_dict['ls_reg'] = log_scale_reg
+            aux_dict['ls_reg'] = log_scale_reg * w_ls
         return ce_loss, aux_dict
     
     def param_count(self):
@@ -842,8 +853,16 @@ class MirrorLRScheduler:
         pass
 
     def report_val_loss(self, val_loss):
-        """Report validation loss (kept for interface compatibility, no LR damping)."""
-        pass
+        """Report validation loss — halve _loss_lr_factor when val loss regresses >2%.
+        This implements ReduceLROnPlateau semantics on top of the mirror-based schedule."""
+        if not hasattr(self, '_best_val_loss'):
+            self._best_val_loss = val_loss
+            self._loss_lr_factor = 1.0
+        if val_loss < self._best_val_loss * 0.998:
+            self._best_val_loss = val_loss
+            self._loss_lr_factor = min(1.0, self._loss_lr_factor * 1.1)
+        elif val_loss > self._best_val_loss * 1.02:
+            self._loss_lr_factor = max(0.05, self._loss_lr_factor * 0.5)
 
     def step(self):
         self._step += 1
@@ -898,6 +917,8 @@ class MirrorLRScheduler:
 
             mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
             mult = max(0.05, min(1.0, mirror_mult))
+            if hasattr(self, '_loss_lr_factor'):
+                mult = mult * self._loss_lr_factor
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
@@ -914,7 +935,7 @@ class MirrorLRScheduler:
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
     def state_dict(self):
-        return {
+        sd = {
             'step': self._step,
             'last_log': self._last_log,
             'type': 'MirrorLRScheduler',
@@ -924,6 +945,10 @@ class MirrorLRScheduler:
             'tau_gate_var': self._tau_gate_var,
             'orig_lrs': self._orig_lrs,
         }
+        if hasattr(self, '_best_val_loss'):
+            sd['best_val_loss'] = self._best_val_loss
+            sd['loss_lr_factor'] = self._loss_lr_factor
+        return sd
 
     def load_state_dict(self, sd):
         self._step = sd.get('step', 0)
@@ -934,6 +959,9 @@ class MirrorLRScheduler:
         self._tau_gate_var = sd.get('tau_gate_var')
         if 'orig_lrs' in sd:
             self._orig_lrs = sd['orig_lrs']
+        if 'best_val_loss' in sd:
+            self._best_val_loss = sd['best_val_loss']
+            self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
         self._tau_var = None

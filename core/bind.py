@@ -120,7 +120,7 @@ class BottleneckBind(nn.Module):
 
         # --- cascade mix ---
         if self.mode == "cascade":
-            self.mix_logit = nn.Parameter(torch.zeros(self.S))
+            self.mix_logit = nn.Parameter(fib_sigmoid_init(self.S).log() - (1 - fib_sigmoid_init(self.S)).log())
 
     def _tie_hook(self, module, inp):
         with torch.no_grad():

@@ -47,6 +47,7 @@ class GroupedCognitiveMirror(nn.Module):
     def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
                  layer_idx=0, n_layers=32, has_private_mem=False,
+                 expert_asymmetry=False, meta_trust=False,
                  gate_bias_scale=0.0, alpha_novelty_weight=0.0):
         super().__init__()
         assert D % G == 0
@@ -61,7 +62,13 @@ class GroupedCognitiveMirror(nn.Module):
         
         proj_std = 1.0 / (self.d * k) ** 0.25
         
-        self.W_proj = nn.Parameter(torch.randn(G, self.d, k) * proj_std)
+        if expert_asymmetry:
+            W_p = torch.empty(G, self.d, k)
+            for g in range(G):
+                nn.init.orthogonal_(W_p[g])
+            self.W_proj = nn.Parameter(W_p)
+        else:
+            self.W_proj = nn.Parameter(torch.randn(G, self.d, k) * proj_std)
         if tie_mirror_proj:
             self.register_buffer('W_out', torch.zeros(G, k, self.d))
             with torch.no_grad():
@@ -97,13 +104,21 @@ class GroupedCognitiveMirror(nn.Module):
         else:
             tau_k = torch.tensor([(tau_min + tau_max) / 2])
         alpha_init = torch.exp(-1.0 / tau_k).view(1, k).expand(G, -1).clone()
+        if expert_asymmetry and G > 1:
+            for g in range(G):
+                init_alpha = 0.85 + (g / (G - 1)) * 0.14
+                alpha_init[g] = init_alpha
         self.alpha_diag = nn.Parameter(alpha_init)
         self.w_pred_scale_legacy = nn.Parameter(torch.full((G, k), w_pred_scale_init))
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         # EMA norms for signal normalization (Proposal V-1)
         n_signals = 5 if has_private_mem else 4
         self.register_buffer('_signal_norm_ema', torch.ones(n_signals, G, k), persistent=False)
-        ls_base = torch.linspace(-0.3, 0.3, G).unsqueeze(1).expand(G, self.d)
+        if expert_asymmetry and G > 1:
+            ls_vals = [math.log(0.05 * (1.5 ** g)) for g in range(G)]
+            ls_base = torch.tensor(ls_vals).unsqueeze(1).expand(G, self.d)
+        else:
+            ls_base = torch.linspace(-0.3, 0.3, G).unsqueeze(1).expand(G, self.d)
         self.log_scale = nn.Parameter(ls_base + torch.randn(G, self.d) * log_scale_init_std)
         
         # ─── K-space gate (per-token, per-expert from hp) ───
@@ -119,6 +134,8 @@ class GroupedCognitiveMirror(nn.Module):
 
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self._expert_asymmetry = expert_asymmetry
+        self._meta_trust = meta_trust
         # Private memory bank: expert confident K-space states (cross-expert recall)
         self._has_private_mem = has_private_mem
         # Minimum training forward steps before private memory writes activate.
@@ -135,6 +152,9 @@ class GroupedCognitiveMirror(nn.Module):
             self.register_buffer('_concept_sim_ema', torch.eye(G), persistent=False)   # (G, G) — who shares concepts
             self.register_buffer('_behavior_div_ema', torch.zeros(G, G), persistent=False)  # (G, G) — who behaves differently
             self.register_buffer('_trust_matrix', torch.eye(G) * 0.5, persistent=False)     # (G, G) — who helps whom
+            if meta_trust:
+                self.register_buffer('_prev_trust_matrix', torch.eye(G) * 0.5, persistent=False)
+                self.register_buffer('_meta_private_mem', torch.zeros(G), persistent=False)
         self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
         self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
@@ -220,6 +240,13 @@ class GroupedCognitiveMirror(nn.Module):
                 None
             )[1])
         mc_k = torch.einsum('b l gd,gdk->b l gk', mc_g, self.W_proj)
+
+        # ─── Bipolar pos_id binding: hp = hp ⊛ pos_id ───
+        # Each token gets a unique bipolar (±1) position key.
+        # VSA scan stores hp_bound, enabling associative recall via pos_id unbind.
+        # pos_id: (1, L, 1, k) — broadcasts over B batch and G experts.
+        pos_id = torch.sign(torch.randn(1, L, 1, self.k, device=hp.device))
+        hp = hp * pos_id
         
         # hp_prev shared by sym_k and pred_error
         hp_prev = torch.cat([torch.zeros_like(hp[:, 0:1]), hp[:, :-1]], dim=1)
@@ -329,7 +356,13 @@ class GroupedCognitiveMirror(nn.Module):
                 behavior_div = 1.0 - behavior_sim
                 self._behavior_div_ema.mul_(0.99).add_(behavior_div, alpha=0.01)
                 trust_weights = attn.mean(dim=(0, 1))
+                if self._meta_trust and self._has_private_mem:
+                    self._prev_trust_matrix.copy_(self._trust_matrix)
                 self._trust_matrix.mul_(0.99).add_(trust_weights, alpha=0.01)
+                if self._meta_trust and self._has_private_mem:
+                    delta_tm = self._trust_matrix - self._prev_trust_matrix
+                    instability = delta_tm.abs().mean(dim=1)
+                    self._meta_private_mem.mul_(0.9).add_(instability, alpha=0.1)
                 contra_g = concept_sim * behavior_div
                 self._cached_contra_graph = contra_g
                 contra_expert = contra_g.mean(dim=-1)
@@ -485,6 +518,16 @@ class GroupedCognitiveMirror(nn.Module):
             cons = cons / (cons.max() + 1e-10)                    # norm to [0, 1]
             gate_bonus = (spec * 0.5 + cons * 0.5) * self.w_contra * 0.1
             gate_logits = gate_logits + gate_bonus.unsqueeze(0).unsqueeze(0)
+        if self._meta_trust and self._has_private_mem:
+            p = self._meta_private_mem.unsqueeze(0).unsqueeze(0)
+            gate_logits = gate_logits - 0.5 * p
+        if self.training:
+            ls = self.log_scale
+            ls_dev = ls.mean(dim=-1) - ls.mean()
+            ls_var = ls.var().item()
+            if ls_var < 0.05:
+                boost = 1.0 * torch.sigmoid(3.0 * ls_dev)
+                gate_logits = gate_logits + boost.unsqueeze(0).unsqueeze(0)
         
         expert_gate = torch.sigmoid(gate_logits)  # (B, L, G)
         # Cache gate L1 for auxiliary sparsity loss (still in graph for gradients)
@@ -526,21 +569,36 @@ class GroupedCognitiveMirror(nn.Module):
         info['w_help'] = torch.sigmoid(self.w_help).mean().item()
         info['w_contra'] = self.w_contra.mean().item()
         w = torch.sigmoid(self._signal_log_weights)
+        w_norm = w / (w.sum() + 1e-10)
         for i, label in enumerate(['temp','pred','smooth','sym','help'][:len(w)]):
-            info[f'signal_w_{label}'] = w[i].item()
+            info[f'signal_w_{label}'] = w_norm[i].item()
         if self._cached_contra_expert is not None:
             info['contra_expert'] = self._cached_contra_expert.mean().item()
+            info['contra_expert_raw'] = self._cached_contra_expert.tolist()
         if self._cached_contra_graph is not None:
             info['contra_graph_mean'] = self._cached_contra_graph.mean().item()
         if self._cached_dominance is not None:
-            info['dominance_top3'] = sorted(self._cached_dominance.tolist(), reverse=True)[:3]
+            info['dominance'] = self._cached_dominance.tolist()
         if self._cached_isolation is not None:
-            info['isolation_top3'] = sorted(self._cached_isolation.tolist(), reverse=True)[:3]
+            info['isolation'] = self._cached_isolation.tolist()
         if self._cached_concept_dendrogram is not None:
             info['concept_q_hi'], info['concept_q_lo'] = self._cached_concept_dendrogram
-        tm = self._trust_matrix
-        info['trust_max'] = tm.max().item()
-        info['trust_min'] = tm[tm > 0].min().item() if (tm > 0).any() else 0.0
-        info['trust_diag_mean'] = tm.diag().mean().item()
+        info['gate_ema'] = self._gate_ema.tolist()
+        info['gate_ema_mean'] = self._gate_ema.mean().item()
+        info['gate_selectivity'] = self._last_gates.std().item()
+        info['ls_var'] = self.log_scale.var(dim=-1).tolist()
+        info['ls_var_mean'] = self.log_scale.var(dim=-1).mean().item()
+        if self._has_private_mem:
+            tm = self._trust_matrix
+            info['trust_max'] = tm.max().item()
+            info['trust_min'] = tm[tm > 0].min().item() if (tm > 0).any() else 0.0
+            info['trust_diag'] = tm.diag().mean().item()
+            info['behavior_div'] = self._behavior_div_ema.mean(dim=-1).tolist()
+            info['concept_sim'] = self._concept_sim_ema.mean(dim=-1).tolist()
+            bd = self._behavior_div_ema.mean(dim=-1)
+            cs = self._concept_sim_ema.mean(dim=-1)
+            tr = self._trust_matrix.mean(dim=-1)
+            info['spec_index'] = (self._last_gates * bd).tolist()
+            info['cons_index'] = (cs * tr).tolist()
         return info
 
