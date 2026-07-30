@@ -140,14 +140,18 @@ class WideBindStack(nn.Module):
             gs_i = global_state[i:i+1].detach().clone()  # (1, 1, D), no grad through global_state (EMA-only)
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
-                h, s_out = _cp(
+                _saved_pen = layer.mirror._cached_pred_error_norm
+                _saved_hp = layer.mirror._cached_hp
+                _out = _cp(
                     WideBindStack._checkpointed_block,
                     layer, h, s, gs_i,
+                    _saved_pen, _saved_hp,
                     mem2v_scale, l_diff, nscale,
                     tanh_bias_mod, pred_scale_mod, spectral_mod,
                     context_mem, allow_write, vsa_tau,
                     use_reentrant=False,
                 )
+                h, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp = _out
             else:
                 h, s_out = layer(h, s, global_state=gs_i,
                                  mem2v_scale=mem2v_scale, diff=l_diff, noise_scale=nscale,
@@ -494,15 +498,21 @@ class WideBindStack(nn.Module):
     
     @staticmethod
     def _checkpointed_block(layer, h, state, global_state,
+                             _cached_pred_error_norm, _cached_hp,
                              mem2v_scale, diff, noise_scale,
                              tanh_bias_mod, pred_scale_mod, spectral_mod,
                              context_mem, allow_write, tau_s):
-        """Wrapper for gradient checkpointing — all positional args are passed by checkpoint."""
-        return layer(h, state, global_state=global_state,
-                     mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
-                     tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-                     spectral_mod=spectral_mod, context_mem=context_mem,
-                     allow_write=allow_write, tau_s=tau_s)
+        """Wrapper for gradient checkpointing.
+        Mirror cache is passed as explicit args/returns so checkpoint saves/restores it,
+        preventing stale-cache mismatch between forward and backward recomputation."""
+        layer.mirror._cached_pred_error_norm = _cached_pred_error_norm
+        layer.mirror._cached_hp = _cached_hp
+        h_out, s_out = layer(h, state, global_state=global_state,
+                             mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
+                             tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+                             spectral_mod=spectral_mod, context_mem=context_mem,
+                             allow_write=allow_write, tau_s=tau_s)
+        return h_out, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp
 
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
