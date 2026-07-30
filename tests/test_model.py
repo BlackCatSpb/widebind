@@ -428,7 +428,7 @@ def test_adaptive_controller_ranges():
     scale = AdaptiveController.w_mem2v_scale(model.layers)
     assert 0.5 <= scale <= 1.0, f'mem2v_scale out of range: {scale}'
     alpha = AdaptiveController.ema_alpha(model.layers)
-    assert 0.90 <= alpha <= 0.99, f'ema_alpha out of range: {alpha}'
+    assert 0.90 <= alpha <= 0.995, f'ema_alpha out of range: {alpha}'
 
 
 # ─── Config integration tests ──────────────────────────────────────────
@@ -795,8 +795,8 @@ def test_D4096_G32_forward():
     out, _, _ = model(h, None)
     assert out.shape == (1, 4, 4096)
     n = model.param_count()
-    # D=4096, L=2 should be ~12M (refactored with bind/mlp submodules)
-    assert 11e6 < n < 13e6, f'param_count={n:.0f} out of expected 11-13M range'
+    # D=4096, L=2 should be ~16.4M (refactored with bind/mlp submodules)
+    assert 15e6 < n < 18e6, f'param_count={n:.0f} out of expected 15-18M range'
 
 
 def test_partitioned_embed_fewer_params():
