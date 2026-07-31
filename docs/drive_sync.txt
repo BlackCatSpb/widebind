@@ -1,6 +1,7 @@
 === WideBind — Files for Cloud training (Сферум / Colab) ===
 
-D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, ~293M params
+D=2560, G=32, d=80, K=64, mirror_k=32 (staircase 8/16/32), expand=4, 86.39M params
+L=24, vocab=50000, seq_len=128, batch_size=1
 
 === CHANGES IN THIS VERSION ===
 
@@ -8,26 +9,32 @@ D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, ~293M params
 - lo/hi k-space split removed — pred_error flows to all k dims
 - G=16→32 (d/k 8:1→4:1) — 2× stronger temporal signal
 - |1-alpha| logs instead of |I-diff|
-- w_pred_scale removed (dead param); pred_scale_mod derived from delta_var
+- w_pred_scale_legacy REMOVED (dead param, no grad); pred_scale_mod derived from delta_var
 - private_mem cross-attention: softmax → sigmoid (independent per-expert gates)
+- Colab notebook: stale-code guard assert (w_pred_scale_legacy check) after model build
 
 === FILES REQUIRED ===
 
   1. core/config.py
   2. core/model.py
   3. notebooks/colab.ipynb  (or notebooks/cloud.ipynb)
-  4. token_stream_*_clean.bin  (data files)
+  4. token_stream_*_clean.bin  (data files — MUST be present, otherwise training
+     runs on random data and CE is stuck at ln(vocab)≈10.82!)
 
 === QUICK VERIFY ===
 
 >>> from core import WideBindConfig, WideBindStack
->>> cfg = WideBindConfig(D=4096, n_layers=2, mlp_groups=32, mirror_k=32)
+>>> cfg = WideBindConfig(D=2560, n_layers=2, mlp_groups=32, mirror_k=32)
 >>> m = WideBindStack(cfg)
->>> m.param_count()  # ~18M (2 layers)
->>> m.layers[0].mirror.alpha.shape  # torch.Size([32])
->>> m.layers[0].mirror.alpha.data   # tensor([0.99, ..., 0.99])
+>>> m.param_count()  # ~7M (2 layers)
+>>> assert not any('w_pred_scale_legacy' in k for k in dict(m.named_parameters()))
+>>> m.layers[0].mirror.alpha.shape  # torch.Size([32, k])
 
 === IMPORTANT ===
 
-Old checkpoints with W_pred INCOMPATIBLE. Fresh start required.
-alpha must show |1-alpha| > 0.01 within first 1000 steps on structured data.
+- New sigmoid code: ranking loss starts ~5× higher (~240) vs softmax (~40),
+  converges slower but gates are independent. Checkpoints are compatible
+  (only w_pred_scale_legacy removed).
+- Verify before training: "Code version OK (no w_pred_scale_legacy)" in notebook output.
+- Real data required: CE must drop below ln(vocab)=10.82 within ~200 steps.
+  If CE plateaus at ~10.8 → data files missing, training is on random tokens.

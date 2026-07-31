@@ -35,6 +35,18 @@ BottleneckBind shift mode (default). GroupedCognitiveMirror с private memory.
 - Main (T4, pre-fix): training loss расходился (12→49) при eval loss 6.5→6.4 — echo chamber collapse из-за private memory writes в рандомные K-space. Фикс: `_pm_write_delay=5000` + `accum_steps=8`
 - Никаких NaN. Gradient clipping 0.5. FP32 (без AMP).
 
+### Текущий статус (July 2026, sigmoid-код, реальные данные)
+
+D=2560, L=24, G=32, 86.39M. Colab T4, tok/s≈70-95, mem 8.9GB.
+
+- CE: 11.27 → 5.3–5.9 (пол ln(50000)=10.82 пройден — обучение на реальных данных)
+- val_ppl: 13233 → 268 (val_loss 9.49 → 5.59, step 2563)
+- ranking: 242 → 146 (step 2750), падение ускоряется после выхода на полный LR
+- lr_adapt mult: 0.50 → 1.0 (полная скорость к step ~2475)
+- Гейт-дифференцировка: b_gate std 6×, tanh_bias ±0.53, w_help std 4.4× (к step 1631)
+- Урок: раньше обучение шло на СЛУЧАЙНЫХ данных (нет token_stream_*.bin) —
+  CE был застрявшим на 10.82. Real data обязательна.
+
 ## BottleneckBind Modes
 
 | Mode | Description | Params |
