@@ -12,6 +12,10 @@ L=24, vocab=50000, seq_len=128, batch_size=1
 - w_pred_scale_legacy REMOVED (dead param, no grad); pred_scale_mod derived from delta_var
 - private_mem cross-attention: softmax → sigmoid (independent per-expert gates)
 - Colab notebook: stale-code guard assert (w_pred_scale_legacy check) after model build
+- scripts/expand_vocab.py: vocab expansion WITHOUT losing trained weights.
+  Vocab math: max = min(C(K,S), 65536) = 65536; balance requires vocab % 16 == 0
+  (so V·S/K is an integer). Use: python scripts/expand_vocab.py best.pt
+  --streams wb/token_stream_*.bin --margin 5000
 
 === FILES REQUIRED ===
 

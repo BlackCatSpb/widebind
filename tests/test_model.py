@@ -53,6 +53,13 @@ def test_sparse_codes_combinadic_coverage():
     assert len(seen) == 50000, f'Duplicate codes: {50000 - len(seen)} collisions'
 
 
+def test_sparse_codes_prefix_stable():
+    """Expanding vocab must keep the first V codes identical (prefix-stable)."""
+    small = sparse_block_codes(vocab=5000, K=32, S=6)
+    big = sparse_block_codes(vocab=10000, K=32, S=6)
+    assert torch.equal(small, big[:5000]), 'codes prefix changed after vocab expansion'
+
+
 # ─── PartitionedEmbedding ──────────────────────────────────────────
 
 def test_partitioned_embed_shape():
@@ -824,6 +831,60 @@ def test_gradient_grouping_demonstrable():
             assert grad == 0.0, f'M[{k},:] has grad {grad} but bit inactive for all tokens'
         if is_active_anywhere:
             assert grad > 0, f'M[{k},:] has zero grad but bit is active'
+
+
+# ─── Vocab expansion ─────────────────────────────────────────────────
+
+def test_vocab_math_rounding():
+    """compute_vocab must respect combinadic ceiling, uint16 cap and /16."""
+    from scripts.expand_vocab import compute_vocab
+    v, expl = compute_vocab(32, 6, data_floor=49965, margin=5000, current_vocab=50000)
+    assert v % 16 == 0, f'vocab {v} not multiple of 16'
+    assert v <= 65536, f'vocab {v} exceeds uint16 cap'
+    assert v <= math.comb(32, 6), f'vocab {v} exceeds combinadic cap'
+    assert v >= 50000, f'vocab {v} shrank below current'
+
+
+def test_expand_vocab_preserves_weights():
+    """Expanding vocab must keep old-token embeddings and logits identical."""
+    import torch as _t
+    from core.model import WideBindStack as _Stack
+    from core.config import WideBindConfig as _Cfg
+    from scripts.expand_vocab import expand, compute_vocab
+
+    cfg = _Cfg(D=896, n_layers=2, mlp_groups=8, mirror_k=16, vocab=5000,
+               private_mem=True)
+    m = _Stack(cfg)
+    ckpt_path = 'tmp_expand_test.pt'
+    _t.save({'step': 10, 'model': m.state_dict(), 'cfg': cfg}, ckpt_path)
+
+    new_vocab, _ = compute_vocab(32, 6, data_floor=4800, margin=500,
+                                 current_vocab=5000)
+    out = 'tmp_expand_test_out.pt'
+    new_cfg = expand(ckpt_path, new_vocab, out)
+
+    loaded = _t.load(out, map_location='cpu', weights_only=False)
+    m2 = _Stack(loaded['cfg'])
+    m2.load_state_dict(loaded['model'])
+    assert m2.cfg.vocab == new_vocab
+    assert m2.cfg.vocab > 5000
+
+    # Every shared weight must be preserved exactly (embed, layers, head readout).
+    # EMA buffers are non-persistent and re-created on ANY rebuild (same as a
+    # normal resume), so state_dict comparison is the correct losslessness check.
+    sd_old, sd_new = m.state_dict(), m2.state_dict()
+    for k in sd_old:
+        assert k in sd_new, f'missing key after expansion: {k}'
+        a, b = sd_old[k], sd_new[k]
+        if a.shape == b.shape:
+            assert _t.equal(a, b), f'weight changed after expansion: {k}'
+    assert sd_new['lm_head.codes'].shape[0] == new_vocab
+    assert _t.equal(sd_new['lm_head.token_bias'][:5000], sd_old['lm_head.token_bias'])
+    assert _t.equal(sd_new['lm_head.token_bias'][5000:],
+                    _t.zeros(new_vocab - 5000)), 'new token bias not zero-init'
+
+    os.remove(ckpt_path)
+    os.remove(out)
 
 
 # ─── Run all ────────────────────────────────────────────────────────
