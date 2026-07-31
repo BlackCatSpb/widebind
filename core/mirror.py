@@ -44,7 +44,7 @@ class GroupedCognitiveMirror(nn.Module):
       - mirror = tanh(linear + bias) + alpha * linear
       - Обеспечивает per-dim градиент для log_scale даже при насыщении tanh
     """
-    def __init__(self, D, G=32, k=32, w_pred_scale_init=3.0, log_scale_init_std=0.05,
+    def __init__(self, D, G=32, k=32, log_scale_init_std=0.05,
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
@@ -109,7 +109,6 @@ class GroupedCognitiveMirror(nn.Module):
                 init_alpha = 0.85 + (g / (G - 1)) * 0.14
                 alpha_init[g] = init_alpha
         self.alpha_diag = nn.Parameter(alpha_init)
-        self.w_pred_scale_legacy = nn.Parameter(torch.full((G, k), w_pred_scale_init))
         self.tanh_bias = nn.Parameter(torch.zeros(G, k))
         # EMA norms for signal normalization (Proposal V-1)
         n_signals = 5 if has_private_mem else 4
@@ -284,7 +283,7 @@ class GroupedCognitiveMirror(nn.Module):
             damp = torch.sigmoid(-raw_pred_error.norm(dim=-1).mean() / self._damp_tau)
             alpha_eff = 1.0 + (alpha_eff - 1.0) * damp
             pred_k = hp_prev * alpha_eff.view(1, 1, G, k)
-        # Без w_pred_scale — сигнал нормируется EMA вместе с остальными
+        # Сигнал нормируется EMA вместе с остальными
         pred_error = (hp - pred_k) / hp_norm * pred_scale_mod.view(G, 1)
         # Adaptive tau: K-измерения с высокой ошибкой → короткое τ, с низкой → длинное.
         # alpha_target = sigmoid(2.2 - log(rel_var)):
@@ -323,7 +322,7 @@ class GroupedCognitiveMirror(nn.Module):
             if context_mem is not None:
                 keys = context_mem * 0.3 + keys * 0.7
                 keys = F.normalize(keys, dim=-1) * self._private_mem.norm(dim=-1, keepdim=True)
-            attn = F.softmax(q @ keys.T / math.sqrt(self.k), dim=-1)  # (B, L, G, G)
+            attn = F.sigmoid(q @ keys.T / math.sqrt(self.k))  # (B, L, G, G) — independent gates
             help_k_base = attn @ keys  # (B, L, G, k) — collective confident memory
             # Contradiction gate: disagreement between expert hp and collective help_k
             hp_n = hp.norm(dim=-1).clamp(min=1e-8)  # (B, L, G)

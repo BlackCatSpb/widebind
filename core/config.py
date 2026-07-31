@@ -40,7 +40,6 @@ class WideBindConfig:
     # Mirror
     mirror_k: int = 32
     mirror_k_staircase: bool = True  # True = k_l∈{8,16,32} по третям глубины
-    w_pred_scale_init: float = 3.0
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
     mlp_expand: int = 4

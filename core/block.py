@@ -52,7 +52,7 @@ class WideBindBlock(nn.Module):
         else:
             k = cfg.mirror_k
         self.mirror = GroupedCognitiveMirror(cfg.D, G=cfg.mlp_groups, k=k,
-            w_pred_scale_init=cfg.w_pred_scale_init, log_scale_init_std=cfg.log_scale_init_std,
+            log_scale_init_std=cfg.log_scale_init_std,
             delta_var_ema_min=cfg.delta_var_ema_min, delta_var_ema_max=cfg.delta_var_ema_max,
             tie_mirror_proj=cfg.tie_mirror_proj,
             layer_idx=layer_idx, n_layers=cfg.n_layers,

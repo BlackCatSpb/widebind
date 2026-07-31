@@ -21,7 +21,7 @@ print(f'Device: {device} ({torch.cuda.get_device_name(0) if device=="cuda" else 
 # ─── Smoke test (always) ────────────────────────────────────────────
 print('\n=== SMOKE TEST: 100 steps ===')
 cfg = WideBindConfig(D=896, n_layers=4, mlp_groups=8, seq_len=64, batch_size=1,
-                     w_pred_scale_init=0.5, lr=2e-4)
+                     lr=2e-4)
 model = WideBindStack(cfg).to(device)
 print(f'Params: {model.param_count()/1e6:.1f}M')
 
@@ -34,7 +34,7 @@ def snapshot(model, tag):
         lm = model.layers[-1].mirror
         print(f'\n=== {tag} ===')
         print(f'  expl={expl:.4f}  diff={diff:.6f}  noise={ns:.6f}')
-        print(f'  alpha.mean:       {m0.alpha_diag.data.mean().item():.4f}   alpha.std={m0.alpha_diag.data.std().item():.4f}   pred_scale.std={m0.w_pred_scale.data.std().item():.4f}')
+        print(f'  alpha.mean:       {m0.alpha_diag.data.mean().item():.4f}   alpha.std={m0.alpha_diag.data.std().item():.4f}   tanh_bias.std={m0.tanh_bias.data.std().item():.4f}')
         print(f'  log_scale.var (diff):{diff:.6f}')
         print(f'  log_skip_alpha:   mean={m0.log_skip_alpha.data.mean().item():.4f}')
         print(f'  dvar_mod_bias:    mean={m0.dvar_mod_bias.data.mean().item():.4f}')

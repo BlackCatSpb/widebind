@@ -8,7 +8,8 @@ D=4096, G=32, d=128, K=32, mirror_k=32, expand=4, ~293M params
 - lo/hi k-space split removed — pred_error flows to all k dims
 - G=16→32 (d/k 8:1→4:1) — 2× stronger temporal signal
 - |1-alpha| logs instead of |I-diff|
-- w_pred_scale_init=3.0 in config
+- w_pred_scale removed (dead param); pred_scale_mod derived from delta_var
+- private_mem cross-attention: softmax → sigmoid (independent per-expert gates)
 
 === FILES REQUIRED ===
 

@@ -370,7 +370,7 @@ pred_error = hp - pred_k  # ошибка предсказания
 ```
 
 - alpha_diag: init из τ-иерархии, (G, k).
-- w_pred_scale: init=3.0, learnable per-expert масштаб ошибки.
+- pred_scale_mod: per-expert модуляция ошибки из delta_var (без learnable параметра).
 
 ### 8.7 Skip connection (L0)
 

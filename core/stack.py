@@ -561,7 +561,7 @@ class WideBindStack(nn.Module):
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
                     groups[k]['params'].append(p)
-                elif any(g in name for g in ['.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
+                elif any(g in name for g in ['.mirror.alpha_diag',
                                               '.log_skip_alpha', '.mirror.W_proj', '.mirror.W_out',
                                               '.mirror.w_temp', '.mirror.w_global',
                                               '.mirror.log_scale', '.mirror.tanh_bias',
@@ -602,13 +602,13 @@ class WideBindStack(nn.Module):
                                                '.tanh_bias', '.log_scale',
                                                '.mirror.W_proj', '.mirror.W_out',
                                                '.mirror.w_temp', '.mirror.w_global',
-                                                '.mirror.alpha_diag', '.mirror.w_pred_scale_legacy',
+                                                 '.mirror.alpha_diag',
                                                '.mirror.w_gate', '.mirror.b_gate',
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
                                                '.log_skip_alpha'])
             if is_gate:
-                if p.ndim < 2 or 'w_pred_scale_legacy' in name:
+                if p.ndim < 2:
                     gate_no_decay.append(p)
                 else:
                     gate_decay.append(p)
@@ -665,9 +665,8 @@ class AdaptiveController:
       (more asymmetric correction when actively exploring)
     - ``spectral_modulation(layer)`` — lambda_k amplified by differentiation
       (more aggressive freq shaping when experts are specialized)
-    - ``pred_scale_mod(layer)`` — per-expert w_pred_scale modulation
-      from delta_var (experts with volatile dynamics get more
-      temporal teaching signal)
+    - ``pred_scale_mod(layer)`` — per-expert modulation from delta_var
+      (experts with volatile dynamics get more temporal teaching signal)
 
     Mathematically derived ranges (λ_d d=3):
     ────────────────────────────────────────
@@ -802,7 +801,7 @@ class AdaptiveController:
 
     @staticmethod
     def pred_scale_mod(layer):
-        """Per-expert w_pred_scale modulation from delta_var.
+        """Per-expert prediction-error modulation from delta_var.
         
         Experts with volatile K-space dynamics (high delta_var relative
         to layer average) get more temporal teaching signal.

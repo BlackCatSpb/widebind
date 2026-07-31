@@ -457,15 +457,14 @@ def test_config_init_values():
     cfg = WideBindConfig(D=896, n_layers=2, mlp_groups=8, mirror_k=k,
                          mirror_k_staircase=False,
                          lambda_d_enabled=False,
-                         w_pred_scale_init=0.5, log_scale_init_std=0.1,
+                         log_scale_init_std=0.1,
                          w_d_init_std=0.5, conv_init_std=0.05)
     model = WideBindStack(cfg)
     m0 = model.layers[0].mirror
 
     # alpha_diag shape (G, k) — per-dim per-expert
     assert m0.alpha_diag.shape == (8, k), f'alpha_diag.shape={m0.alpha_diag.shape} != (8,{k})'
-    assert m0.w_pred_scale_legacy.shape == (8, k), f'w_pred_scale_legacy.shape={m0.w_pred_scale_legacy.shape} != (8,{k})'
-    assert m0.w_pred_scale_legacy.data[0, 0].item() == 0.5
+    assert m0.tanh_bias.shape == (8, k), f'tanh_bias.shape={m0.tanh_bias.shape} != (8,{k})'
 
     # w_d std respects config
     w_d_std = model.layers[0].w_d.data.std().item()

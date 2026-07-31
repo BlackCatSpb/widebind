@@ -42,7 +42,7 @@ def snapshot(model, tag):
         print(f'\n=== {tag} ===')
         print(f'  expl={expl:.4f}  diff={diff:.6f}  noise={ns:.6f}')
         print(f'  alpha.mean:       {m0.alpha_diag.data.mean().item():.4f}   alpha.std={m0.alpha_diag.data.std().item():.4f}')
-        print(f'  pred_scale.std:   {m0.w_pred_scale.data.std().item():.4f}')
+        print(f'  tanh_bias.std:    {m0.tanh_bias.data.std().item():.4f}')
         print(f'  log_skip_alpha:   mean={m0.log_skip_alpha.data.mean().item():.4f}')
         print(f'  w_q[L0].mean:     {model.layers[0].w_q.data.mean().item():.4f}')
 
