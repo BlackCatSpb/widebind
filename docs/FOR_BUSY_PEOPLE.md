@@ -6,24 +6,27 @@
 
 **1. Память — вектор, не матрица.** Один D-мерный вектор на слой, не матрица K×V всех прошлых токенов. ~16 KB на слой — генерация хоть миллион токенов без роста памяти.
 
-**2. Скрещивание размерностей — биллинейность, не weighted sum.** Проекция D→K, покомпонентное произведение u⊙v, проекция K→D.
+**2. Скрещивание размерностей — биллинейность, не weighted sum.** Проекция D→K, покомпонентное произведение u⊙v (с golden-ratio сдвигами), проекция K→D.
 
-**3. Мета-познание.** Трёхслойный cognitive mirror: веса (опасные) → private memory (безопасная EMA) → meta-gate (самонастройка). Cross-expert recall через contradiction gate.
+**3. Мета-познание.** Трёхслойный cognitive mirror: веса (опасные) → private memory (безопасная EMA) → meta-gate (самонастройка). Cross-expert recall через contradiction gate (при private_mem).
 
 ## Два варианта
 
 | | Mini | Main |
 |---|---|---|
-| Параметров | 12.23M | ~161M |
+| Параметров | ~17.6M | ~255M |
 | Групп (G) | 8 | 32 |
 | D | 896 | 4096 |
-| VRAM | 2.1 GB (MX550) | 11-16 GB (T4) |
+| VRAM | ~2 GB (MX550) | 11–16 GB (T4) |
 | Bottleneck K | 32 | 64 |
 
-- **87.9% параметров** — GroupedMLP (SiLU, expand=4)
-- **K=64 bottleneck**, shift mode (golden-ratio twisted)
-- **Эмбеддинг + голова**: 8192 параметра (0.01%)
-- **VSA scan** — O(L log L), chunked, fp32 guard
-- **Private memory** — soft-competition write, Knowledge Graph, 3-слойная meta-reflection
-- **MirrorLR** — без cosine decay, loss-damped при росте train/eval loss
-- **Чекпоинт**: 159 MB (FCF-CPR 8-bit). **Инференс**: ~0.55 GB VRAM (fp16)
+- **~79% параметров** — GroupedMLP (SwiGLU, expand=4)
+- **K bottleneck**, shift mode (golden-ratio twisted, S=4), multi-ocular
+- **Эмбеддинг + голова**: basis 4096 + mix 1024 + token_bias 50000 ≈ 55K (<0.05%)
+- **VSA scan** — 4 масштаба, learnable τ, chunked prefix scan, fp32 guard
+- **RoPE** — позиционное кодирование в эмбеддинге (θ=1e6), 0 параметров
+- **Private memory** (опц.) — soft-competition write, Knowledge Graph, 3-слойная meta-reflection
+- **MirrorLR** — без cosine decay, counter-cyclical (среднее геометрическое), loss-damped по eval
+- **Инференс (fp16)**: ~0.5–0.6 GB VRAM
+
+Подробное описание — в корневом [README.md](../README.md).
