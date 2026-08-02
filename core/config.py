@@ -132,6 +132,20 @@ class WideBindConfig:
                                     # 1.0 = instant overwrite (old behavior)
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
+    # ─── Collective Concept Layer (per-layer concept accumulation) ───
+    collective_layer: bool = False            # enable on every block
+    collective_read_out: bool = False         # False = accumulate only (no signal emission, zero params);
+                                              # True = concepts enter the block signal via W_o
+    collective_S: int = 8                     # slots per layer bank
+    collective_write_delay: int = 5000        # training steps before mining starts
+    collective_maturity_warmup: int = 5000    # steps before resvar_ref is captured
+    collective_uncert_theta: float = 0.5
+    collective_uncert_kappa: float = 3.0
+    collective_contra_thresh: float = -0.1
+    collective_contra_gain: float = 6.0
+    collective_birth_gap: float = 0.55
+    collective_maturity_frac: float = 0.85
+
     # ─── Qwen3-inspired upgrades ───
     bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)
     rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)

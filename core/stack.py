@@ -148,7 +148,7 @@ class WideBindStack(nn.Module):
                     _saved_pen, _saved_hp,
                     mem2v_scale, l_diff, nscale,
                     tanh_bias_mod, pred_scale_mod, spectral_mod,
-                    context_mem, allow_write, vsa_tau,
+                    context_mem, allow_write, vsa_tau, step,
                     use_reentrant=False,
                 )
                 h, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp = _out
@@ -158,7 +158,7 @@ class WideBindStack(nn.Module):
                                  tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                                  spectral_mod=spectral_mod,
                                  context_mem=context_mem, allow_write=allow_write,
-                                 tau_s=vsa_tau)
+                                 tau_s=vsa_tau, step=step)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -501,7 +501,7 @@ class WideBindStack(nn.Module):
                              _cached_pred_error_norm, _cached_hp,
                              mem2v_scale, diff, noise_scale,
                              tanh_bias_mod, pred_scale_mod, spectral_mod,
-                             context_mem, allow_write, tau_s):
+                             context_mem, allow_write, tau_s, step):
         """Wrapper for gradient checkpointing.
         Mirror cache is passed as explicit args/returns so checkpoint saves/restores it,
         preventing stale-cache mismatch between forward and backward recomputation."""
@@ -511,11 +511,33 @@ class WideBindStack(nn.Module):
                              mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod, context_mem=context_mem,
-                             allow_write=allow_write, tau_s=tau_s)
+                             allow_write=allow_write, tau_s=tau_s, step=step)
         return h_out, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp
 
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
+
+    def collective_stats(self):
+        """Per-layer collective-bank readiness summary.
+
+        Returns (n_layers, n_mature, n_occupied, n_slots, per_layer) where
+        per_layer is a list of (layer_idx, mature, occupied, u_gate, step).
+        """
+        per_layer = []
+        n_mature = n_occupied = n_slots = n_layers = 0
+        for layer in self.layers:
+            c = getattr(layer, 'collective', None)
+            if c is None:
+                continue
+            dbg = c.debug()
+            n_layers += 1
+            n_slots += c.S
+            n_occupied += dbg['occupied']
+            if dbg['mature'] > 0.5:
+                n_mature += 1
+            per_layer.append((layer.layer_idx, dbg['mature'], dbg['occupied'],
+                              dbg['u_gate'], dbg['step']))
+        return n_layers, n_mature, n_occupied, n_slots, per_layer
     
     def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None):
         """Optimizer parameter groups with λ_d LR hierarchy or legacy flat groups.
@@ -1015,13 +1037,13 @@ if __name__ == '__main__':
     import torch
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    cfg = WideBindConfig(n_layers=24, D=896, bottleneck=896, bind_K=32, mlp_groups=8)
+    cfg = WideBindConfig(n_layers=24, D=896, bind_K=32, mlp_groups=8)
     model = WideBindStack(cfg).to(device)
     n = model.param_count()
     print(f'  D=896 G=8: params={n:,} ({n/1e6:.2f}M)')
     
     print()
-    cfg = WideBindConfig(n_layers=4, D=896, bottleneck=896, bind_K=32)
+    cfg = WideBindConfig(n_layers=4, D=896, bind_K=32)
     model = WideBindStack(cfg).to(device)
     
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)

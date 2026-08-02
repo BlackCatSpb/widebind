@@ -333,6 +333,12 @@ def train(cfg=None, resume_path=None):
                 print(f'  step={step:>6} loss={ce_loss.item():.4f} lr={current_lr:.2e} '
                       f'tok/s={tok_s:.0f} stream={stream_idx} '
                       f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} | {aux_str}')
+                if getattr(cfg, 'collective_layer', False):
+                    n_l, n_m, n_occ, n_slots, per_layer = model.collective_stats()
+                    occ_list = ','.join(str(o) for _, _, o, _, _ in per_layer)
+                    mat_list = ','.join(str(int(m)) for _, m, _, _, _ in per_layer)
+                    print(f'  col: mature={n_m}/{n_l} occ={n_occ}/{n_slots} '
+                          f'mat:[{mat_list}] occ_l:[{occ_list}]')
             
             # Eval
             if step > 0 and step % cfg.eval_interval == 0:
@@ -422,10 +428,13 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--seq-len', type=int, default=128)
     parser.add_argument('--n-layers', type=int, default=24)
-    parser.add_argument('--bottleneck', type=int, default=896)
     parser.add_argument('--bind-K', type=int, default=64)
     parser.add_argument('--mlp-groups', type=int, default=8)
     parser.add_argument('--mlp-expand', type=int, default=8)
+    parser.add_argument('--collective-layer', action='store_true',
+                        help='enable per-layer collective concept bank (accumulation by default)')
+    parser.add_argument('--collective-read-out', action='store_true',
+                        help='emit concepts into the block signal (creates W_o readout)')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--max-steps', type=int, default=50000)
     parser.add_argument('--warmup', type=int, default=500)
@@ -442,10 +451,11 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         n_layers=args.n_layers,
-        bottleneck=args.bottleneck,
         bind_K=args.bind_K,
         mlp_groups=args.mlp_groups,
         mlp_expand=args.mlp_expand,
+        collective_layer=args.collective_layer,
+        collective_read_out=args.collective_read_out,
         lr=args.lr,
         max_steps=args.max_steps,
         warmup_steps=args.warmup,
