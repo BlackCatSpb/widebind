@@ -26,6 +26,7 @@
 - **VSA scan** — 4 масштаба, learnable τ, chunked prefix scan, fp32 guard
 - **RoPE** — позиционное кодирование в эмбеддинге (θ=1e6), 0 параметров
 - **Private memory** (опц.) — soft-competition write, Knowledge Graph, 3-слойная meta-reflection
+- **Коллективные концепты** — пер-слойный майнинг: модель сама находит семантические лакуны в K-пространстве и рождает слоты-прототипы; включение по зрелости слоя (resvar); фаза аккумуляции — 0 параметров, сигнал не затрагивается
 - **MirrorLR** — без cosine decay, counter-cyclical (среднее геометрическое), loss-damped по eval
 - **Инференс (fp16)**: ~0.5–0.6 GB VRAM
 
