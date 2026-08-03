@@ -585,7 +585,8 @@ class WideBindStack(nn.Module):
                                               '.log_dvar_mod_scale', '.dvar_mod_bias',
                                               '.log_grad_mod_scale', '.grad_mod_bias']):
                     # Mirror projections, alpha, gates -> mirror LR (1.84x)
-                    k = 'mirror_wd' if p.ndim >= 2 else 'mirror'
+                    # alpha_diag is gate-like (G,K) diagonal -> never weight-decayed
+                    k = 'mirror_wd' if (p.ndim >= 2 and '.alpha_diag' not in name) else 'mirror'
                     groups[k]['params'].append(p)
                 elif '.mlp.' in name or '.bind.W_proj.weight' in name or name.endswith('.W_out') or name.endswith('.W_proj'):
                     # Block-level W_proj/W_out (not mirror, caught above) -> mlp speed (0.54x)
