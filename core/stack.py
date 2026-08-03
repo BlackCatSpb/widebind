@@ -498,50 +498,46 @@ class WideBindStack(nn.Module):
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
+        # ─── Scale-adaptive aux weighting (no per-term magic weights) ───
+        # Every active term is weighted by  aux_share·CE / Σ|terms|  using the
+        # EMA of its own measured magnitude. The total auxiliary pressure is a
+        # fixed fraction of the language-model CE, and no single hand-tuned
+        # constant (0.01 / 50 / 0.3 …) can dominate or vanish with term scale.
+        raw_terms = {
+            'pred': pred_loss,
+            'gate_l1': gate_l1,
+            'reinforce': reinforce_loss,
+            'balance': balance_loss,
+            'diversity': diversity_loss,
+            'nuc': nuc_loss,
+            'orth': orth_loss,
+            'w_m2v': w_m2v_loss,
+            'branch': branch_loss,
+            'div': div_loss_raw,
+            'gate_repulse': gate_repulse_loss,
+            'alpha_novelty': alpha_novelty_loss,
+            'ranking': ranking_loss,
+            'decorr': decorr_loss,
+            'signal_ent': signal_entropy,
+            'ls_reg': log_scale_reg,
+        }
+        active = {k: v for k, v in raw_terms.items() if v != 0}
         aux_dict = {}
-        w_pred = getattr(self.cfg, 'pred_weight', 0.0) or 0.01
-        if pred_loss != 0:
-            aux_dict['pred'] = pred_loss * w_pred
-        w_gate = getattr(self.cfg, 'gate_l1_weight', 0.0001)
-        if gate_l1 != 0 and w_gate > 0:
-            aux_dict['gate_l1'] = gate_l1 * w_gate
-        w_reinf = getattr(self.cfg, 'reinforce_weight', 0.001)
-        if reinforce_loss != 0:
-            aux_dict['reinforce'] = reinforce_loss * w_reinf
-        w_bal = getattr(self.cfg, 'balance_weight', 0.026)
-        if balance_loss != 0:
-            aux_dict['balance'] = balance_loss * w_bal
-        w_div = getattr(self.cfg, 'diversity_weight', 0.001)
-        if diversity_loss != 0:
-            aux_dict['diversity'] = diversity_loss * w_div
-        w_nuc = getattr(self.cfg, 'nuclear_weight', 1e-5)
-        if nuc_loss != 0:
-            aux_dict['nuc'] = nuc_loss * w_nuc
-        w_orth = getattr(self.cfg, 'orth_weight', 1e-4)
-        if orth_loss != 0:
-            aux_dict['orth'] = orth_loss * w_orth
-        if w_m2v_loss != 0:
-            aux_dict['w_m2v'] = w_m2v_loss * getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.001)
-        if branch_loss != 0:
-            aux_dict['branch'] = branch_loss * getattr(self.cfg, 'branch_balance_weight', 0.0)
-        w_repulse = getattr(self.cfg, 'gate_repulse_weight', 0.3)
-        if div_loss_raw != 0:
-            aux_dict['div'] = div_loss_raw * getattr(self.cfg, 'div_weight', 50.0)
-        if gate_repulse_loss != 0:
-            aux_dict['gate_repulse'] = gate_repulse_loss * w_repulse
-        w_novelty = getattr(self.cfg, 'alpha_novelty_weight', 0.05)
-        if alpha_novelty_loss != 0:
-            aux_dict['alpha_novelty'] = alpha_novelty_loss * w_novelty
-        w_rank = getattr(self.cfg, 'ranking_weight', 0.01)
-        if ranking_loss != 0:
-            aux_dict['ranking'] = ranking_loss * w_rank
-        if n_decorr > 0:
-            aux_dict['decorr'] = decorr_loss * 0.01
-        if n_sig > 0:
-            aux_dict['signal_ent'] = signal_entropy * 0.01
-        w_ls = getattr(self.cfg, 'log_scale_l2_weight', 0.01)
-        if log_scale_reg != 0:
-            aux_dict['ls_reg'] = log_scale_reg * w_ls
+        if active:
+            share = getattr(self.cfg, 'aux_share', 0.05)
+            ema = getattr(self, '_aux_ema', None)
+            if ema is None:
+                ema = {}
+                self._aux_ema = ema
+            if self.training:
+                for k, v in active.items():
+                    mag = abs(float(v))
+                    s = ema.get(k)
+                    ema[k] = mag if s is None else 0.99 * s + 0.01 * mag
+            scales = {k: max(ema[k], 1e-9) for k in active if k in ema}
+            if scales:
+                weight = (share * float(ce_loss.detach())) / sum(scales.values())
+                aux_dict = {k: v * weight for k, v in active.items()}
         return ce_loss, aux_dict
     
     @staticmethod
@@ -653,6 +649,8 @@ class WideBindStack(nn.Module):
                 else:
                     k = 'default_wd' if p.ndim >= 2 else 'default'
                     groups[k]['params'].append(p)
+            for k, g in groups.items():
+                g['group_role'] = 'reg' if k in ('mirror', 'mirror_wd', 'gate', 'gate_wd', 'vsa') else 'base'
             return [v for v in groups.values() if v['params']]
         
         # ─── Legacy groups (lambda_lr_hierarchy=False) ───
@@ -688,16 +686,16 @@ class WideBindStack(nn.Module):
                 else:
                     decay.append(p)
         groups = [
-            {'params': decay, 'lr': lr, 'weight_decay': wd},
-            {'params': no_decay, 'lr': lr, 'weight_decay': 0},
+            {'params': decay, 'lr': lr, 'weight_decay': wd, 'group_role': 'base'},
+            {'params': no_decay, 'lr': lr, 'weight_decay': 0, 'group_role': 'base'},
         ]
         if gate_decay:
-            groups.append({'params': gate_decay, 'lr': lr * gate_lr_mult, 'weight_decay': wd})
+            groups.append({'params': gate_decay, 'lr': lr * gate_lr_mult, 'weight_decay': wd, 'group_role': 'reg'})
         if gate_no_decay:
-            groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0})
+            groups.append({'params': gate_no_decay, 'lr': lr * gate_lr_mult, 'weight_decay': 0, 'group_role': 'reg'})
         if vsa_bias:
             vsa_lr_mult = getattr(cfg, 'vsa_b_lr_mult', 0.1)
-            groups.append({'params': vsa_bias, 'lr': lr * vsa_lr_mult, 'weight_decay': 0})
+            groups.append({'params': vsa_bias, 'lr': lr * vsa_lr_mult, 'weight_decay': 0, 'group_role': 'reg'})
         return groups
 
 
@@ -912,13 +910,18 @@ class AdaptiveController:
 
 
 class MirrorLRScheduler:
-    """LR scheduler modulated by cognitive mirror state dynamics.
+    """LR scheduler with principled base profile and role-decoupled mirror control.
 
-    Growth-ratio multipliers (neutral at growth=1):
-      var/alpha/gate growth  →  LR up when specialization grows, down when stalled
-    mag_factor (cap): |mirror| above threshold → LR reduced (counter-cyclical)
-    Loss damping (persistent): val_loss regression >2% → _loss_lr_factor halved
-      (ReduceLROnPlateau semantics; resets to 1.0 on new best).
+    Two independent channels (no plateau ratchet, no magic thresholds):
+    ──────────────────────────────────────────────────────────────
+    - base profile  (embed / mlp / trunk / lm_head groups):
+        warmup ramp → hold at 1.0 → WSD cosine tail decay toward lr_min_ratio.
+        Driven only by training progress (cfg.max_steps), never by any
+        per-eval regression heuristic.
+    - regulatory channel (mirror / gate / vsa groups):
+        growth-ratio multipliers (neutral at growth=1) applied ONLY to the
+        groups whose dynamics they measure — a mirror instability must not
+        freeze the language-model trunk.
     """
     def __init__(self, model, optimizer, base_lr=None, warmup=1000,
                  target_var=0.161, mag_threshold=0.296, lr_min_ratio=0.026,
@@ -927,9 +930,12 @@ class MirrorLRScheduler:
         if cfg is not None:
             base_lr = base_lr or cfg.lr
             warmup = getattr(cfg, 'warmup_steps', warmup)
+            lr_min_ratio = getattr(cfg, 'lr_min_ratio', lr_min_ratio)
+        self.cfg = cfg or getattr(model, 'cfg', None)
         self.model = model
         self.optimizer = optimizer
         self.base_lr = base_lr
+        self.lr_min_ratio = max(1e-4, lr_min_ratio)
         self._orig_lrs = [pg['lr'] for pg in optimizer.param_groups]
         self.warmup = warmup
         self._step = 0
@@ -957,21 +963,37 @@ class MirrorLRScheduler:
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
 
+    def _base_mult(self):
+        """Warmup ramp → 1.0 → WSD cosine tail down to lr_min_ratio.
+
+        No val-loss feedback: the shared trunk LR never gets ratcheted down
+        by a noisy eval; progress handling at the end of training is the
+        schedule's own responsibility.
+        """
+        if self._step < self.warmup:
+            return max(1e-6, self._step / max(self.warmup, 1))
+        max_steps = getattr(self.cfg, 'max_steps', None) if self.cfg else None
+        if max_steps and max_steps > self.warmup + 10:
+            tail_frac = getattr(self.cfg, 'lr_tail_frac', 0.2)
+            tail_len = max(tail_frac * max_steps, 1)
+            start = max_steps - tail_len
+            if self._step > start:
+                frac = min(1.0, (self._step - start) / tail_len)
+                return self.lr_min_ratio + 0.5 * (1.0 - self.lr_min_ratio) * (1.0 + math.cos(math.pi * frac))
+        return 1.0
+
     def report_train_loss(self, train_loss, ce_loss=None):
-        """Report training loss for LR damping. Uses CE (not total) to avoid pred_loss false dampings."""
+        """Deprecated: no training-loss feedback (would couple aux noise into LR)."""
         pass
 
     def report_val_loss(self, val_loss):
-        """Report validation loss — halve _loss_lr_factor when val loss regresses >2%.
-        This implements ReduceLROnPlateau semantics on top of the mirror-based schedule."""
-        if not hasattr(self, '_best_val_loss'):
-            self._best_val_loss = val_loss
-            self._loss_lr_factor = 1.0
-        if val_loss < self._best_val_loss * 0.998:
-            self._best_val_loss = val_loss
-            self._loss_lr_factor = min(1.0, self._loss_lr_factor * 1.1)
-        elif val_loss > self._best_val_loss * 1.02:
-            self._loss_lr_factor = max(0.05, self._loss_lr_factor * 0.5)
+        """Deprecated: ReduceLROnPlateau ratchet removed (magic 0.998/1.02/2x).
+
+        Kept for caller compatibility. The old one-way plateau factor persisted
+        across checkpoints and is exactly what froze the T4 run at mult≈0.125.
+        Base LR now follows the principled WSD profile; mirror instability is
+        handled per regulatory group in step()."""
+        pass
 
     def step(self):
         self._step += 1
@@ -995,6 +1017,8 @@ class MirrorLRScheduler:
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(override)
                 layer.mirror._usefulness_temp.fill_(max(temp, 0.1))
+            base_mult = mult
+            reg_mult = mult
         else:
             for layer in self.model.layers:
                 layer.mirror._alpha_override.fill_(0.0)
@@ -1025,9 +1049,8 @@ class MirrorLRScheduler:
             mag_factor = min(1.0, max(0.2, 1.0 / max(mag_ratio, 1e-10)))
 
             mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
-            mult = max(0.05, min(1.0, mirror_mult))
-            if hasattr(self, '_loss_lr_factor'):
-                mult = mult * self._loss_lr_factor
+            reg_mult = max(self.lr_min_ratio, min(1.0, mirror_mult))
+            base_mult = self._base_mult()
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
@@ -1035,9 +1058,12 @@ class MirrorLRScheduler:
                 print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
                       f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
                       f'tau_var={tau_var:.6f} '
-                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
+                      f'base_mult={base_mult:.4f} reg_mult={reg_mult:.4f} '
+                      f'lr_base={self.base_lr * base_mult:.2e}')
 
         for i, pg in enumerate(self.optimizer.param_groups):
+            role = pg.get('group_role', 'base')
+            mult = reg_mult if role == 'reg' else base_mult
             pg['lr'] = self._orig_lrs[i] * mult
 
     def get_last_lr(self):
@@ -1054,9 +1080,6 @@ class MirrorLRScheduler:
             'tau_gate_var': self._tau_gate_var,
             'orig_lrs': self._orig_lrs,
         }
-        if hasattr(self, '_best_val_loss'):
-            sd['best_val_loss'] = self._best_val_loss
-            sd['loss_lr_factor'] = self._loss_lr_factor
         return sd
 
     def load_state_dict(self, sd):
@@ -1068,9 +1091,6 @@ class MirrorLRScheduler:
         self._tau_gate_var = sd.get('tau_gate_var')
         if 'orig_lrs' in sd:
             self._orig_lrs = sd['orig_lrs']
-        if 'best_val_loss' in sd:
-            self._best_val_loss = sd['best_val_loss']
-            self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
         self._tau_var = None

@@ -76,6 +76,10 @@ class WideBindConfig:
     max_decay_steps: int = 50000
     var_min_for_lr_decay: float = 0.005
 
+    # ─── Scale-adaptive aux pressure (no per-term magic weights) ───
+    aux_share: float = 0.05      # total auxiliary pressure as a fraction of CE
+    lr_tail_frac: float = 0.2    # WSD: fraction of max_steps used for tail cosine decay
+
     # AdaptiveController (values below will be overridden by λ_d when lambda_d_enabled=True)
     exploration_threshold: float = 0.25
     differentiation_threshold: float = 0.08
