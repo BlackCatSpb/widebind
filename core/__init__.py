@@ -7,6 +7,7 @@ from .mlp import GroupedMLP
 from .block import WideBindBlock
 from .stack import WideBindStack, AdaptiveController, MirrorLRScheduler
 from .zeckendorf_readout import ZeckendorfReadout, fibonacci_bases, zeckendorf_code
+from .sigmoid_head import SigmoidCodedHead
 from .live_inference import LiveInference, MirrorMonitor
 from .curriculum import CurriculumTracker
 

@@ -72,7 +72,7 @@ def test_no_softmax_in_active_path():
     import inspect
     active_core = ['bind', 'block', 'concept_layer', 'embedding',
                    'lambda_utils', 'live_inference', 'mirror', 'mlp',
-                   'stack', 'vsa_utils']
+                   'sigmoid_head', 'stack', 'vsa_utils']
     offenders = []
     for name in active_core:
         mod = _core_module(name)
@@ -943,3 +943,115 @@ if __name__ == '__main__':
     
     print(f'\n{passed}/{passed + failed} passed')
     sys.exit(0 if failed == 0 else 1)
+
+
+# ─── SigmoidCodedHead (единая softmax-замена) ─────────────────────────
+
+def _head_cfg(vocab=1500):
+    cfg = WideBindConfig()
+    cfg.n_layers = 1
+    cfg.D = 128
+    cfg.vocab = vocab
+    cfg.base_vocab = vocab
+    cfg.code_dim = 16
+    cfg.code_sparsity = 4
+    cfg.head_mode = 'sigmoid_coded'
+    return cfg
+
+
+def test_sigmoid_head_forward_consistency():
+    """forward()-логиты на target == log_probs_for_target (без logZ)."""
+    from core.sigmoid_head import SigmoidCodedHead
+    from core.embedding import PartitionedEmbedding
+    cfg = _head_cfg()
+    embed = PartitionedEmbedding(cfg)
+    head = SigmoidCodedHead(cfg, embed_basis=embed.basis)
+    h = torch.randn(2, 5, cfg.D)
+    tgt = torch.randint(0, cfg.vocab, (2, 5))
+    lg = head(h)
+    lp = head.log_probs_for_target(h, tgt)
+    gathered = lg.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(gathered, lp, atol=1e-5), (
+        f'forward/log_probs mismatch: {(gathered - lp).abs().max().item():.2e}')
+
+
+def test_sigmoid_head_factorized_manual():
+    """log_probs_for_target совпадает с явным factored-Bernoulli выражением."""
+    from core.sigmoid_head import SigmoidCodedHead
+    from core.embedding import PartitionedEmbedding
+    cfg = _head_cfg()
+    embed = PartitionedEmbedding(cfg)
+    head = SigmoidCodedHead(cfg, embed_basis=embed.basis)
+    h = torch.randn(2, 3, cfg.D)
+    tgt = torch.randint(0, cfg.vocab, (2, 3))
+    zt = head._gates(h)
+    sig = torch.sigmoid(zt)
+    c = head.codes[tgt]
+    manual = (c * torch.log(sig.clamp_min(1e-9)) +
+              (1 - c) * torch.log((1 - sig).clamp_min(1e-9))).sum(-1)
+    manual = manual + head.token_bias[tgt]
+    lp = head.log_probs_for_target(h, tgt)
+    assert torch.allclose(lp, manual, atol=1e-5)
+
+
+def test_sigmoid_head_gradients_flow():
+    """Градиенты достигают bit_bias, log_temp, readout и token_bias."""
+    from core.sigmoid_head import SigmoidCodedHead
+    from core.embedding import PartitionedEmbedding
+    cfg = _head_cfg()
+    embed = PartitionedEmbedding(cfg)
+    head = SigmoidCodedHead(cfg, embed_basis=embed.basis)
+    h = torch.randn(2, 4, cfg.D)
+    tgt = torch.randint(0, cfg.vocab, (2, 4))
+    loss = -head.log_probs_for_target(h, tgt).mean()
+    loss.backward()
+    for name, p in [('bit_bias', head.bit_bias), ('log_temp', head.log_temp),
+                    ('token_bias', head.token_bias)]:
+        assert p.grad is not None and p.grad.abs().max() > 0, f'{name} no grad'
+    assert head.readout.grad is not None, 'readout (shared) no grad'
+
+
+def test_sigmoid_head_temperature_effect():
+    """Более низкая температура (малый log_temp) заостряет распределение."""
+    from core.sigmoid_head import SigmoidCodedHead
+    from core.embedding import PartitionedEmbedding
+    cfg = _head_cfg()
+    embed = PartitionedEmbedding(cfg)
+    head = SigmoidCodedHead(cfg, embed_basis=embed.basis)
+    h = torch.randn(2, 1, cfg.D)
+    base = head(h).std().item()
+    head.log_temp.data.fill_(-5.0)  # T → 0.1 (clamp): gates → argmax, более поляризовано
+    sharp = head(h).std().item()
+    assert sharp > base, f'sharper head should have larger logit spread: {base:.3f} -> {sharp:.3f}'
+
+
+def test_sigmoid_head_end_to_end_trainable():
+    """Микро-обучение: CE факторизованной головы падает."""
+    from core.stack import WideBindStack
+    cfg = _head_cfg()
+    cfg.surprisal_weight = 0.0
+    model = WideBindStack(cfg)
+    from core.sigmoid_head import SigmoidCodedHead
+    assert isinstance(model.lm_head, SigmoidCodedHead)
+    torch.manual_seed(0)
+    tgt = torch.randint(0, cfg.vocab, (2, 8))
+    h = torch.randn(2, 8, cfg.D)
+    opt = torch.optim.Adam(model.lm_head.parameters(), lr=1e-2)
+    loss0 = model.compute_loss(h, tgt).item()
+    for _ in range(30):
+        opt.zero_grad()
+        loss = model.compute_loss(h, tgt)
+        loss.backward()
+        opt.step()
+    loss1 = model.compute_loss(h, tgt).item()
+    assert loss1 < loss0, f'loss did not drop: {loss0:.3f} -> {loss1:.3f}'
+
+
+def test_sigmoid_head_no_softmax_source():
+    """Исходник SigmoidCodedHead не содержит softmax."""
+    import inspect
+    from core.sigmoid_head import SigmoidCodedHead
+    src = inspect.getsource(SigmoidCodedHead)
+    for pat in ('F.softmax(', 'torch.softmax(', 'F.log_softmax(', 'torch.log_softmax('):
+        assert pat not in src, f'found {pat} in SigmoidCodedHead'
+    assert 'torch.sigmoid(' in src, 'expected sigmoid gates'

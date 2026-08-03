@@ -9,6 +9,7 @@ from .block import WideBindBlock
 from .embedding import ZeckendorfEmbedding, PartitionedEmbedding, LmHead, PartitionedHead
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 from .zeckendorf_readout import ZeckendorfReadout
+from .sigmoid_head import SigmoidCodedHead
 
 class WideBindStack(nn.Module):
     """Stack of WideBindBlock layers with embedding and lm_head."""
@@ -17,8 +18,11 @@ class WideBindStack(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = PartitionedEmbedding(cfg)
+        head_mode = getattr(cfg, 'head_mode', 'partitioned')
         if getattr(cfg, 'zeckendorf_readout', False):
             self.lm_head = ZeckendorfReadout(cfg)
+        elif head_mode == 'sigmoid_coded':
+            self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
         else:
             self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
         
@@ -202,7 +206,35 @@ class WideBindStack(nn.Module):
         """Returns CE only (aux losses applied via gradient scaling in training step)."""
         ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight)
         return ce_loss
-    
+
+    def _finalize_ce(self, ce, targets):
+        """Mask PAD/EOS, apply surprisal weighting, and refresh CE diagnostics."""
+        mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
+        ce_m = ce * mask.float()
+        sw = getattr(self.cfg, 'surprisal_weight', 0.0)
+        if self.training and sw > 0:
+            with torch.no_grad():
+                ce_ratio = ce_m / (ce_m.mean() + 1e-8)
+                w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
+            ce_loss = (ce_m * w).sum() / mask.sum().clamp(min=1)
+        else:
+            ce_loss = ce_m.sum() / mask.sum().clamp(min=1)
+        # ─── Diagnostic: CE по срезам словаря (base vs extended) ───
+        with torch.no_grad():
+            tgt = targets.reshape(-1)
+            base_v = getattr(self.cfg, 'base_vocab', 50000)
+            if self.cfg.vocab > base_v:
+                base_m = (tgt < base_v) & mask
+                ext_m = (tgt >= base_v) & mask
+                self._diag_ce_base = (ce * base_m.float()).sum() / base_m.sum().clamp(min=1)
+                self._diag_ce_ext = (ce * ext_m.float()).sum() / ext_m.sum().clamp(min=1)
+                self._diag_ext_frac = ext_m.float().mean()
+            else:
+                self._diag_ce_base = ce_loss
+                self._diag_ce_ext = None
+                self._diag_ext_frac = 0.0
+        return ce_loss
+
     def compute_losses(self, h, targets, pred_weight=None):
         """Compute CE and auxiliary losses separately. Returns raw (unweighted) values.
         
@@ -214,37 +246,19 @@ class WideBindStack(nn.Module):
             B, L, D = h.shape
             log_probs = self.lm_head.log_probs_for_target(
                 h.reshape(-1, D), targets.reshape(-1))
-            ce_loss = -log_probs.mean()
+            ce = -log_probs.reshape(-1)  # per-token CE
+            ce_loss = self._finalize_ce(ce, targets)
+        elif hasattr(self.lm_head, 'log_probs_for_target'):
+            # SigmoidCodedHead и др. факторизованные головы: точный per-target
+            # log P за O(K), без материализации и softmax-нормализации по V.
+            logp = self.lm_head.log_probs_for_target(h, targets)  # (B, L)
+            ce = -logp.reshape(-1)
+            ce_loss = self._finalize_ce(ce, targets)
         else:
             logits = self.lm_head(h)
             ce = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                  targets.reshape(-1), reduction='none')
-            mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
-            ce = ce * mask.float()
-            sw = getattr(self.cfg, 'surprisal_weight', 0.0)
-            if self.training and sw > 0:
-                with torch.no_grad():
-                    ce_ratio = ce / (ce.mean() + 1e-8)
-                    w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
-                ce_loss = (ce * w).sum() / mask.sum().clamp(min=1)
-            else:
-                ce_loss = ce.sum() / mask.sum().clamp(min=1)
-            # ─── Diagnostic: CE по срезам словаря (base vs extended) ───
-            # Позволяет проверить, что расширенные токены 50000..vocab-1 реально
-            # усваиваются (CE_ext должен падать заметно ниже ln(1/|ext|)).
-            with torch.no_grad():
-                tgt = targets.reshape(-1)
-                base_v = getattr(self.cfg, 'base_vocab', 50000)
-                if self.cfg.vocab > base_v:
-                    base_m = (tgt < base_v) & (tgt != 0) & (tgt != 2)
-                    ext_m = (tgt >= base_v) & (tgt != 0) & (tgt != 2)
-                    self._diag_ce_base = (ce * base_m.float()).sum() / base_m.sum().clamp(min=1)
-                    self._diag_ce_ext = (ce * ext_m.float()).sum() / ext_m.sum().clamp(min=1)
-                    self._diag_ext_frac = ext_m.float().mean()
-                else:
-                    self._diag_ce_base = ce_loss
-                    self._diag_ce_ext = None
-                    self._diag_ext_frac = 0.0
+            ce_loss = self._finalize_ce(ce, targets)
         pred_loss = 0.0
         n_pred = 0
         cache = getattr(self, '_pred_cache', [])
