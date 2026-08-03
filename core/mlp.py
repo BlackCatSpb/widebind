@@ -18,7 +18,7 @@ class GroupedMLP(nn.Module):
     G=32, d=128, expand=4 → 4× per-group expansion.
     With SwiGLU: gate and up projections both d → expand*d, down expand*d → d.
     """
-    def __init__(self, D, expand, groups, swiglu=True, situ_glu=False, beta1=4.0, beta2=25.0):
+    def __init__(self, D, expand, groups, swiglu=True):
         super().__init__()
         assert D % groups == 0
         self.D = D
@@ -27,10 +27,7 @@ class GroupedMLP(nn.Module):
         d = self.d
         e = expand
         self.swiglu = swiglu
-        self.situ_glu = situ_glu
-        self.beta1 = beta1
-        self.beta2 = beta2
-        if swiglu or situ_glu:
+        if swiglu:
             hidden = e * d
             up_std = (2.0 / (d + hidden)) ** 0.5
             down_std = (2.0 / (hidden + d)) ** 0.5
@@ -48,13 +45,7 @@ class GroupedMLP(nn.Module):
         B, L, D = h.shape
         h = F.rms_norm(h, (D,), self.norm_w)
         h = h.reshape(B, L, self.G, self.d)
-        if self.situ_glu:
-            g = torch.einsum('blgd,gdf->blgf', h, self.W_gate)
-            u = torch.einsum('blgd,gdf->blgf', h, self.W_up)
-            gate = self.beta1 * torch.tanh(g / self.beta1) * torch.sigmoid(g)
-            up = self.beta2 * torch.tanh(u / self.beta2)
-            h = gate * up
-        elif self.swiglu:
+        if self.swiglu:
             gate = F.silu(torch.einsum('blgd,gdf->blgf', h, self.W_gate))
             up = torch.einsum('blgd,gdf->blgf', h, self.W_up)
             h = gate * up

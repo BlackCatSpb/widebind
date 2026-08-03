@@ -172,7 +172,7 @@ class BottleneckBind(nn.Module):
                 crossed = self._cross(a[n-1] * self.w_u[n-1], a[n-2] * self.w_v[n-1], self.shifts[n-1])
                 a[n] = F.normalize(crossed + 1e-10, dim=-1) * seed_norm
 
-            mix = torch.sigmoid(self.mix_logit)  # независимые веса масштабов (init — логиты для sigmoid)
+            mix = torch.softmax(self.mix_logit, dim=0)
             if not self._tied and self.ocular == "multi":
                 out = None
                 for n in range(1, self.S + 1):

@@ -4,7 +4,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.stdout = open(1, 'w', encoding='utf-8', closefd=False)
 from torch.serialization import add_safe_globals
 from core import WideBindConfig, WideBindStack
-from core.checkpoints import find_latest_ckpt
 try:
     from generate import load_russian_tokenizer, generate
 except ImportError:
@@ -12,12 +11,7 @@ except ImportError:
 
 add_safe_globals([WideBindConfig])
 
-ckpt_path = find_latest_ckpt(os.path.join(os.path.dirname(__file__), '..', 'checkpoints'))
-if ckpt_path is None:
-    print('No checkpoint found in checkpoints/')
-    sys.exit(1)
-print(f'Loading latest checkpoint: {ckpt_path}')
-ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+ckpt = torch.load('checkpoints/step_5000.pt', map_location='cpu', weights_only=True)
 cfg = ckpt.get('cfg', WideBindConfig())
 model = WideBindStack(cfg)
 model.load_state_dict(ckpt['model'], strict=False)

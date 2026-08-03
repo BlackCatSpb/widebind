@@ -13,20 +13,15 @@ from compression import FCF_CPR
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--full', action='store_true', help='Run comprehensive checks')
-parser.add_argument('--head', default='sigmoid_coded',
-                    choices=['partitioned', 'sigmoid_coded'],
-                    help='LM head mode (default: sigmoid_coded)')
-parser.add_argument('--steps', type=int, default=100,
-                    help='Number of training steps (default: 100)')
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'Device: {device} ({torch.cuda.get_device_name(0) if device=="cuda" else "N/A"})')
 
 # ─── Smoke test (always) ────────────────────────────────────────────
-print(f'\n=== SMOKE TEST: 100 steps (head={args.head}) ===')
+print('\n=== SMOKE TEST: 100 steps ===')
 cfg = WideBindConfig(D=896, n_layers=4, mlp_groups=8, seq_len=64, batch_size=1,
-                     lr=2e-4, head_mode=args.head)
+                     lr=2e-4)
 model = WideBindStack(cfg).to(device)
 print(f'Params: {model.param_count()/1e6:.1f}M')
 

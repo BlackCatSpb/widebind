@@ -8,5 +8,4 @@ from .mirror import GroupedCognitiveMirror
 from .mlp import GroupedMLP
 from .block import WideBindBlock
 from .stack import WideBindStack, AdaptiveController, MirrorLRScheduler
-from .sigmoid_head import SigmoidCodedHead
 from .vsa_utils import dct_basis, zeckendorf_codes, fib_sigmoid_init, sparse_block_codes, vsa_prefix_scan

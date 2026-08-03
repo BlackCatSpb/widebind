@@ -8,7 +8,6 @@ from .config import WideBindConfig
 from .bind import BottleneckBind
 from .mirror import GroupedCognitiveMirror
 from .mlp import GroupedMLP
-from .concept_layer import CollectiveConceptLayer
 from .vsa_utils import dct_basis, fib_sigmoid_init
 
 class WideBindBlock(nn.Module):
@@ -81,7 +80,7 @@ class WideBindBlock(nn.Module):
         self.w_i_dyn = nn.Parameter(torch.randn(g, k, d) * (1.0 / math.sqrt(k)))
         self.w_d_pen = nn.Parameter(torch.zeros(g))
         self.w_bind_gate = nn.Parameter(torch.zeros(g))
-        # Per-scale per-channel combination weights (logits for sigmoid)
+        # Per-scale per-channel combination weights (logits for softmax)
         self.scale_w = nn.Parameter(fib_sigmoid_init(self._n_scales).unsqueeze(1).expand(-1, cfg.D).clone())
         # Linear decay across layers: shallow → short memory, deep → long
         # Per-channel (D,) — can differentiate via gradient when vsa_b_d_smooth < 1.0
@@ -118,32 +117,12 @@ class WideBindBlock(nn.Module):
         
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
-                              swiglu=getattr(cfg, 'mlp_swiglu', True),
-                              situ_glu=getattr(cfg, 'mlp_situ_glu', False))
-
-        # ─── Collective Concept Layer (per-layer concept bank) ───
-        # k follows this layer's mirror staircase (8/16/32). Accumulation mode
-        # (read_out=False) adds ZERO learnable params and does not touch the
-        # block signal — pure mining into the slot bank, gated by layer maturity.
-        self.collective = None
-        if getattr(cfg, 'collective_layer', False):
-            self.collective = CollectiveConceptLayer(
-                cfg.D, k,
-                S=getattr(cfg, 'collective_S', 8),
-                write_delay=getattr(cfg, 'collective_write_delay', 5000),
-                maturity_warmup=getattr(cfg, 'collective_maturity_warmup', 5000),
-                uncert_theta=getattr(cfg, 'collective_uncert_theta', 0.5),
-                uncert_kappa=getattr(cfg, 'collective_uncert_kappa', 3.0),
-                contra_thresh=getattr(cfg, 'collective_contra_thresh', -0.1),
-                contra_gain=getattr(cfg, 'collective_contra_gain', 6.0),
-                birth_gap=getattr(cfg, 'collective_birth_gap', 0.55),
-                maturity_frac=getattr(cfg, 'collective_maturity_frac', 0.85),
-                read_out=getattr(cfg, 'collective_read_out', False))
+                              swiglu=getattr(cfg, 'mlp_swiglu', True))
     
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
-                context_mem=None, allow_write=None, tau_s=None, step=None):
+                context_mem=None, allow_write=None, tau_s=None):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -151,9 +130,6 @@ class WideBindBlock(nn.Module):
         NaN = float('nan')
         self._nan_at = None
         def _chk(t, label):
-            # NaN diagnostics are training-only; in eval each .any().item() syncs GPU->CPU
-            if not self.training:
-                return False
             if t.is_floating_point() and (t.isnan().any() or t.isinf().any()):
                 self._nan_at = f'L{self.layer_idx}.{label}[{t.min():.2f},{t.max():.2f}]'
                 return True
@@ -356,18 +332,6 @@ class WideBindBlock(nn.Module):
         bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
-        if self.collective is not None:
-            hp_c = self.mirror._cached_hp
-            pen = self.mirror._cached_pred_error_norm
-            if hp_c is not None and pen is not None:
-                if pen.shape[0] != B or pen.shape[1] != L:
-                    pen = pen.new_zeros(B, L)
-                rv = self.mirror._residual_var_ema.mean().item()
-                col_write = (self.training if allow_write is None else allow_write)
-                concept_out = self.collective(h, hp_c, pen, resvar=rv,
-                                              allow_write=col_write, step=step)
-                if concept_out is not None:
-                    enhanced = enhanced + concept_out
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_bind_out = enhanced_base  # for branch_loss (with grad)
         self._cache_mirror_out = mirror  # for branch_loss (with grad)

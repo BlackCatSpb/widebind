@@ -14,7 +14,6 @@ class WideBindConfig:
     n_layers: int = 32
     bind_K: int = 64
     vocab: int = 50000
-    base_vocab: int = 50000   # граница базового токенизатора (для диагностики CE base/ext)
     seq_len: int = 128
     batch_size: int = 2
     lr: float = 3e-4
@@ -33,11 +32,6 @@ class WideBindConfig:
 
     # Zeckendorf Readout (experimental)
     zeckendorf_readout: bool = False  # True = replace LM head with Zeckendorf tree
-
-    # Head selector (overrides zeckendorf_readout when non-default)
-    #   "partitioned"   → PartitionedHead (linear V-logits + softmax-CE)
-    #   "sigmoid_coded" → SigmoidCodedHead (factored Bernoulli, no softmax, O(K) train)
-    head_mode: str = "partitioned"
 
     # Embed
     code_dim: int = 32
@@ -75,10 +69,6 @@ class WideBindConfig:
     lr_min_ratio: float = 0.05
     max_decay_steps: int = 50000
     var_min_for_lr_decay: float = 0.005
-
-    # ─── Scale-adaptive aux pressure (no per-term magic weights) ───
-    aux_share: float = 0.05      # total auxiliary pressure as a fraction of CE
-    lr_tail_frac: float = 0.2    # WSD: fraction of max_steps used for tail cosine decay
 
     # AdaptiveController (values below will be overridden by λ_d when lambda_d_enabled=True)
     exploration_threshold: float = 0.25
@@ -142,26 +132,11 @@ class WideBindConfig:
                                     # 1.0 = instant overwrite (old behavior)
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
-    # ─── Collective Concept Layer (per-layer concept accumulation) ───
-    collective_layer: bool = False            # enable on every block
-    collective_read_out: bool = False         # False = accumulate only (no signal emission, zero params);
-                                              # True = concepts enter the block signal via W_o
-    collective_S: int = 8                     # slots per layer bank
-    collective_write_delay: int = 5000        # training steps before mining starts
-    collective_maturity_warmup: int = 5000    # steps before resvar_ref is captured
-    collective_uncert_theta: float = 0.5
-    collective_uncert_kappa: float = 3.0
-    collective_contra_thresh: float = -0.1
-    collective_contra_gain: float = 6.0
-    collective_birth_gap: float = 0.55
-    collective_maturity_frac: float = 0.85
-
     # ─── Qwen3-inspired upgrades ───
     bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)
     rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)
     rope_scaling: float = 1.0            # RoPE scaling factor (linear)
     mlp_swiglu: bool = True              # SwiGLU gate_proj parallel to up_proj (Qwen3-style)
-    mlp_situ_glu: bool = False           # SiTU-GLU (bounded: β1·tanh on gate factor, β2·tanh on up); keeps SwiGLU local response, |f|≤β1·β2
 
     # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
     bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"

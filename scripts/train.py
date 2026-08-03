@@ -21,7 +21,6 @@ add_safe_globals([WideBindConfig])
 class TokenStream:
     """Memory-mapped uint16 token stream; converted to torch.long per batch."""
     def __init__(self, path):
-        self.path = path
         self.data = np.memmap(path, dtype=np.uint16, mode='r')
         self.len = len(self.data)
     def get_batch(self, seq_len, batch_size, offset):
@@ -34,58 +33,6 @@ class TokenStream:
         return x.long(), y.long(), offset + batch_size * seq_len
 
 
-def _load_tokenizer(extended=True):
-    """Загрузить русский токенизатор для декод-проверки (best-effort)."""
-    try:
-        from generate import load_russian_tokenizer
-    except ImportError:
-        from scripts.generate import load_russian_tokenizer
-    return load_russian_tokenizer(extended=extended)
-
-
-def check_streams_health(streams, cfg):
-    """Гигиен-гейт данных перед обучением.
-
-    Дефектный корпус (92% U+FFFD) — главная историческая причина деградации.
-    Проверяем (1) целостность диапазона id (данные ↔ cfg.vocab), (2) долю
-    расширенных токенов 50000..vocab-1, (3) долю U+FFFD и кириллицы в декоде.
-    """
-    print('[health] Проверка целостности стримов...')
-    base_v = getattr(cfg, 'base_vocab', 50000)
-    problems = []
-    for i, s in enumerate(streams):
-        sample = np.asarray(s.data[:min(1_000_000, s.len)], dtype=np.uint32)
-        if sample.size == 0:
-            continue
-        mx = int(sample.max())
-        if mx >= cfg.vocab:
-            problems.append(f'max_id={mx} >= vocab={cfg.vocab}')
-        ext_share = float((sample >= base_v).mean())
-        print(f'  [{i}] {os.path.basename(s.path):42s} len={s.len:>12,} '
-              f'max_id={mx:<6} ext_share={ext_share:.4f}')
-    if problems:
-        raise ValueError('Stream data несовместим с cfg.vocab:\n  ' + '\n  '.join(problems))
-    # Декод-проверка (best-effort): U+FFFD и кириллица
-    try:
-        tok = _load_tokenizer(extended=(cfg.vocab > base_v))
-        sample = np.asarray(streams[0].data[:4096], dtype=np.uint32)
-        if tok is not None and int(sample.max()) < tok.get_vocab_size():
-            text = tok.decode(sample.tolist(), skip_special_tokens=True)
-            fffd = text.count('\ufffd') / max(len(text), 1)
-            cyr = sum(1 for ch in text if '\u0400' <= ch <= '\u04ff') / max(len(text), 1)
-            print(f'[health] decoded sample: {len(text)} chars, '
-                  f'U+FFFD={fffd:.4%}, cyrillic={cyr:.4%} (U+FFFD должен быть 0.0%)')
-            if fffd > 0.0005:
-                raise ValueError(f'U+FFFD={fffd:.4%} > 0.05% — похоже на повреждённый корпус!')
-            if cyr < 0.5:
-                raise ValueError(f'cyrillic={cyr:.4%} < 50% — стрим не похож на русский текст')
-        else:
-            print('[health] tokenizer не покрывает стрим/vocab — пропуск декод-проверки')
-    except Exception as e:
-        print(f'[health] warning: декод-проверка пропущена ({e})')
-    print('[health] OK')
-
-
 def create_lr_scheduler(optimizer, warmup, max_steps, lr):
     """Linear warmup + cosine decay (returns multiplier 0..1 for LambdaLR)."""
     def get_lr_mult(step):
@@ -96,7 +43,7 @@ def create_lr_scheduler(optimizer, warmup, max_steps, lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
 
 
-def train(cfg=None, resume_path=None, head_mode=None):
+def train(cfg=None, resume_path=None):
     if cfg is None:
         cfg = WideBindConfig()
     
@@ -106,44 +53,6 @@ def train(cfg=None, resume_path=None, head_mode=None):
     if device == 'cuda':
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    
-    # Resolve resume target early so checkpoint cfg (vocab, arch) can be
-    # applied before the model is built.
-    if resume_path == 'auto':
-        # Find latest checkpoint: interrupt > step_* > best
-        ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'interrupt_step_*.pt')))
-        if not ckpts:
-            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'step_*.pt')))
-        if not ckpts:
-            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'best.pt')))
-        if ckpts:
-            resume_path = ckpts[-1]
-            print(f'Auto-resuming from latest: {resume_path}')
-    ckpt = None
-    if resume_path and os.path.exists(resume_path):
-        print(f'Resuming from {resume_path}')
-        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
-        if ckpt.get('cfg') is not None:
-            ck_cfg = ckpt['cfg']
-            import dataclasses
-            # Carry over model-shape settings from the checkpoint (vocab,
-            # base_vocab, D, n_layers, mlp_groups/mlp_expand, code_dim...),
-            # apply only *runtime* overrides on top (data/lr/head/etc).
-            cfg = dataclasses.replace(
-                ck_cfg,
-                data_dir=cfg.data_dir, save_dir=cfg.save_dir,
-                batch_size=cfg.batch_size, seq_len=cfg.seq_len,
-                lr=cfg.lr, max_steps=cfg.max_steps,
-                warmup_steps=cfg.warmup_steps,
-                log_interval=cfg.log_interval, eval_interval=cfg.eval_interval,
-                save_interval=cfg.save_interval, scheduler=cfg.scheduler,
-            )
-            print(f'  Using checkpoint cfg: vocab={cfg.vocab} '
-                  f'base_vocab={cfg.base_vocab} D={cfg.D} L={cfg.n_layers} '
-                  f'code_dim={cfg.code_dim} head_mode={cfg.head_mode}')
-    if head_mode is not None:
-        cfg.head_mode = head_mode
-        print(f'  head_mode -> {head_mode}')
     
     # Data
     print(f'Loading data from {cfg.data_dir}')
@@ -156,7 +65,6 @@ def train(cfg=None, resume_path=None, head_mode=None):
     streams = [TokenStream(f) for f in stream_files]
     total_tokens = sum(s.len for s in streams)
     print(f'Found {len(streams)} files, {total_tokens:,} total tokens')
-    check_streams_health(streams, cfg)
     
     # Model (retry once on OOM — transient CUDA context cleanup)
     try:
@@ -195,20 +103,28 @@ def train(cfg=None, resume_path=None, head_mode=None):
         scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
         print(f'Scheduler: cosine decay')
     
-    # Resume (checkpoint already loaded above; apply weights now)
+    # Resume
     start_step = 0
     best_val_loss = float('inf')
-    if ckpt is not None:
+    if resume_path == 'auto':
+        # Find latest checkpoint: interrupt > step_* > best
+        ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'interrupt_step_*.pt')))
+        if not ckpts:
+            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'step_*.pt')))
+        if not ckpts:
+            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'best.pt')))
+        if ckpts:
+            resume_path = ckpts[-1]
+            print(f'Auto-resuming from latest: {resume_path}')
+    if resume_path and os.path.exists(resume_path):
+        print(f'Resuming from {resume_path}')
+        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
             print(f'  Unexpected keys (old arch): {len(unexpected)}')
-        try:
-            optimizer.load_state_dict(ckpt['optimizer'])
-        except Exception as e:
-            # Head swap (e.g. partitioned -> sigmoid_coded) adds/removes params
-            print(f'  Optimizer state not restored ({type(e).__name__}); starting fresh')
+        optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt:
             sched_sd = ckpt['scheduler']
             if sched_sd.get('type') == 'MirrorLRScheduler':
@@ -417,12 +333,6 @@ def train(cfg=None, resume_path=None, head_mode=None):
                 print(f'  step={step:>6} loss={ce_loss.item():.4f} lr={current_lr:.2e} '
                       f'tok/s={tok_s:.0f} stream={stream_idx} '
                       f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} | {aux_str}')
-                if getattr(cfg, 'collective_layer', False):
-                    n_l, n_m, n_occ, n_slots, per_layer = model.collective_stats()
-                    occ_list = ','.join(str(o) for _, _, o, _, _ in per_layer)
-                    mat_list = ','.join(str(int(m)) for _, m, _, _, _ in per_layer)
-                    print(f'  col: mature={n_m}/{n_l} occ={n_occ}/{n_slots} '
-                          f'mat:[{mat_list}] occ_l:[{occ_list}]')
             
             # Eval
             if step > 0 and step % cfg.eval_interval == 0:
@@ -512,13 +422,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--seq-len', type=int, default=128)
     parser.add_argument('--n-layers', type=int, default=24)
+    parser.add_argument('--bottleneck', type=int, default=896)
     parser.add_argument('--bind-K', type=int, default=64)
     parser.add_argument('--mlp-groups', type=int, default=8)
     parser.add_argument('--mlp-expand', type=int, default=8)
-    parser.add_argument('--collective-layer', action='store_true',
-                        help='enable per-layer collective concept bank (accumulation by default)')
-    parser.add_argument('--collective-read-out', action='store_true',
-                        help='emit concepts into the block signal (creates W_o readout)')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--max-steps', type=int, default=50000)
     parser.add_argument('--warmup', type=int, default=500)
@@ -527,8 +434,6 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=1000)
     parser.add_argument('--save-interval', type=int, default=5000)
     parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
-    parser.add_argument('--head', type=str, default=None, choices=['partitioned', 'sigmoid_coded'],
-                        help='LM head mode (default: from checkpoint cfg, else partitioned)')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
@@ -537,11 +442,10 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         n_layers=args.n_layers,
+        bottleneck=args.bottleneck,
         bind_K=args.bind_K,
         mlp_groups=args.mlp_groups,
         mlp_expand=args.mlp_expand,
-        collective_layer=args.collective_layer,
-        collective_read_out=args.collective_read_out,
         lr=args.lr,
         max_steps=args.max_steps,
         warmup_steps=args.warmup,
@@ -551,4 +455,4 @@ if __name__ == '__main__':
         scheduler=args.scheduler,
     )
     
-    train(cfg, resume_path=args.resume, head_mode=args.head)
+    train(cfg, resume_path=args.resume)

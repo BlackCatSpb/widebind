@@ -6,35 +6,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 from compression import FCF_CPR
 from core import WideBindStack
-from core.checkpoints import find_latest_ckpt
 from tokenizers import Tokenizer
 
 
-def load_russian_tokenizer(path=None, extended=True):
-    names = (['tokenizer_v65536.json', 'tokenizer.json'] if extended
-             else ['tokenizer.json'])
+def load_russian_tokenizer(path=None):
     if path is None:
         path = r'C:\Users\black\OneDrive\Desktop\fcp'
-    for name in names:
-        tok_file = os.path.join(path, 'russian_tokenizer', name)
-        if not os.path.isfile(tok_file):
-            tok_file = os.path.join(os.path.dirname(__file__), '..', 'wb', 'russian_tokenizer', name)
-        if not os.path.isfile(tok_file):
-            tok_file = os.path.join(os.path.dirname(__file__), '..', 'fcp', 'russian_tokenizer', name)
-        if os.path.isfile(tok_file):
-            return Tokenizer.from_file(tok_file)
-    raise FileNotFoundError('russian_tokenizer/tokenizer*.json not found')
+    tok_file = os.path.join(path, 'russian_tokenizer', 'tokenizer.json')
+    if not os.path.isfile(tok_file):
+        tok_file = os.path.join(os.path.dirname(__file__), '..', 'fcp', 'russian_tokenizer', 'tokenizer.json')
+    return Tokenizer.from_file(tok_file)
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"})')
 
 # Load
-ckpt_path = find_latest_ckpt(os.path.join(os.path.dirname(__file__), '..', 'checkpoints'))
-if ckpt_path is None:
-    print('No checkpoint found in checkpoints/; pass --ckpt or put one there.')
-    sys.exit(1)
-print(f'Loading latest checkpoint: {ckpt_path}')
+ckpt_path = r'C:\Users\black\OneDrive\Desktop\WideBind\checkpoints\step_15000_infer.pt'
 cpr = FCF_CPR()
 ckpt = cpr.load_compressed(ckpt_path)
 cfg = ckpt['cfg']
@@ -51,11 +39,6 @@ print(f'Vocab: {tok.get_vocab_size()}')
 # Prompt
 prompt_text = 'В начале было'
 prompt_ids = tok.encode(prompt_text).ids
-if max(prompt_ids, default=0) >= cfg.vocab:
-    base_tok = load_russian_tokenizer(extended=False)
-    if base_tok is not None and max(base_tok.encode(prompt_text).ids, default=0) < cfg.vocab:
-        tok = base_tok
-        prompt_ids = base_tok.encode(prompt_text).ids
 print(f'Prompt: "{prompt_text}" -> {prompt_ids}')
 print()
 
