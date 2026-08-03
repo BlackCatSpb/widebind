@@ -15,6 +15,9 @@ from core import WideBindConfig, WideBindStack, AdaptiveController, MirrorLRSche
 parser = argparse.ArgumentParser()
 parser.add_argument('--full', action='store_true', help='Run comprehensive checks')
 parser.add_argument('--steps', type=int, default=200, help='Number of training steps (default: 200)')
+parser.add_argument('--head', default='sigmoid_coded',
+                    choices=['partitioned', 'sigmoid_coded'],
+                    help='LM head mode (default: sigmoid_coded)')
 parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
 args = parser.parse_args()
 
@@ -23,11 +26,11 @@ print(f'Device: {device} ({torch.cuda.get_device_name(0) if device=="cuda" else 
 
 # ─── Smoke test (always) ────────────────────────────────────────────
 N = args.steps
-print(f'\n=== SMOKE TEST: {N} steps (Big: D=2560, 24 layers, G=32) ===')
+print(f'\n=== SMOKE TEST: {N} steps (Big: D=2560, 24 layers, G=32, head={args.head}) ===')
 cfg = WideBindConfig(
     D=2560, n_layers=24, bind_K=64, mlp_groups=32, mlp_expand=4,
     seq_len=128, batch_size=1, lr=3e-4, conv_kernel=48,
-    gradient_checkpointing=False,
+    gradient_checkpointing=False, head_mode=args.head,
 )
 model = WideBindStack(cfg).to(device)
 print(f'Params: {model.param_count()/1e6:.1f}M')

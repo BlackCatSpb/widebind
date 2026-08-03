@@ -96,7 +96,7 @@ def create_lr_scheduler(optimizer, warmup, max_steps, lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
 
 
-def train(cfg=None, resume_path=None):
+def train(cfg=None, resume_path=None, head_mode=None):
     if cfg is None:
         cfg = WideBindConfig()
     
@@ -106,6 +106,44 @@ def train(cfg=None, resume_path=None):
     if device == 'cuda':
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    
+    # Resolve resume target early so checkpoint cfg (vocab, arch) can be
+    # applied before the model is built.
+    if resume_path == 'auto':
+        # Find latest checkpoint: interrupt > step_* > best
+        ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'interrupt_step_*.pt')))
+        if not ckpts:
+            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'step_*.pt')))
+        if not ckpts:
+            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'best.pt')))
+        if ckpts:
+            resume_path = ckpts[-1]
+            print(f'Auto-resuming from latest: {resume_path}')
+    ckpt = None
+    if resume_path and os.path.exists(resume_path):
+        print(f'Resuming from {resume_path}')
+        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        if ckpt.get('cfg') is not None:
+            ck_cfg = ckpt['cfg']
+            import dataclasses
+            # Carry over model-shape settings from the checkpoint (vocab,
+            # base_vocab, D, n_layers, mlp_groups/mlp_expand, code_dim...),
+            # apply only *runtime* overrides on top (data/lr/head/etc).
+            cfg = dataclasses.replace(
+                ck_cfg,
+                data_dir=cfg.data_dir, save_dir=cfg.save_dir,
+                batch_size=cfg.batch_size, seq_len=cfg.seq_len,
+                lr=cfg.lr, max_steps=cfg.max_steps,
+                warmup_steps=cfg.warmup_steps,
+                log_interval=cfg.log_interval, eval_interval=cfg.eval_interval,
+                save_interval=cfg.save_interval, scheduler=cfg.scheduler,
+            )
+            print(f'  Using checkpoint cfg: vocab={cfg.vocab} '
+                  f'base_vocab={cfg.base_vocab} D={cfg.D} L={cfg.n_layers} '
+                  f'code_dim={cfg.code_dim} head_mode={cfg.head_mode}')
+    if head_mode is not None:
+        cfg.head_mode = head_mode
+        print(f'  head_mode -> {head_mode}')
     
     # Data
     print(f'Loading data from {cfg.data_dir}')
@@ -157,28 +195,20 @@ def train(cfg=None, resume_path=None):
         scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
         print(f'Scheduler: cosine decay')
     
-    # Resume
+    # Resume (checkpoint already loaded above; apply weights now)
     start_step = 0
     best_val_loss = float('inf')
-    if resume_path == 'auto':
-        # Find latest checkpoint: interrupt > step_* > best
-        ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'interrupt_step_*.pt')))
-        if not ckpts:
-            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'step_*.pt')))
-        if not ckpts:
-            ckpts = sorted(glob.glob(os.path.join(cfg.save_dir, 'best.pt')))
-        if ckpts:
-            resume_path = ckpts[-1]
-            print(f'Auto-resuming from latest: {resume_path}')
-    if resume_path and os.path.exists(resume_path):
-        print(f'Resuming from {resume_path}')
-        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+    if ckpt is not None:
         missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
             print(f'  Unexpected keys (old arch): {len(unexpected)}')
-        optimizer.load_state_dict(ckpt['optimizer'])
+        try:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        except Exception as e:
+            # Head swap (e.g. partitioned -> sigmoid_coded) adds/removes params
+            print(f'  Optimizer state not restored ({type(e).__name__}); starting fresh')
         if 'scheduler' in ckpt:
             sched_sd = ckpt['scheduler']
             if sched_sd.get('type') == 'MirrorLRScheduler':
@@ -497,6 +527,8 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=1000)
     parser.add_argument('--save-interval', type=int, default=5000)
     parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
+    parser.add_argument('--head', type=str, default=None, choices=['partitioned', 'sigmoid_coded'],
+                        help='LM head mode (default: from checkpoint cfg, else partitioned)')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
@@ -519,4 +551,4 @@ if __name__ == '__main__':
         scheduler=args.scheduler,
     )
     
-    train(cfg, resume_path=args.resume)
+    train(cfg, resume_path=args.resume, head_mode=args.head)
