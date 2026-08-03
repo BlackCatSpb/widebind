@@ -286,20 +286,10 @@ class FCF_CPR:
 # ─── Test ───
 
 if __name__ == '__main__':
-    ckpt_path = None
-    candidates = [
-        r'C:\Users\black\OneDrive\Desktop\step_10000.pt',
-        r'C:\Users\black\OneDrive\Desktop\best.pt',
-        os.path.join('..', '..', 'best.pt'),
-        os.path.join('checkpoints', 'step_10000.pt'),
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            ckpt_path = p
-            break
-    
+    from core.checkpoints import find_latest_ckpt
+    ckpt_path = find_latest_ckpt(os.path.join(os.path.dirname(__file__), '..', 'checkpoints'))
     if not ckpt_path:
-        print(f'No checkpoint found. Checked: {candidates}')
+        print('No checkpoint found in checkpoints/.')
         sys.exit(1)
     
     print(f'Loading: {ckpt_path}')

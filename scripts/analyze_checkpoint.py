@@ -7,9 +7,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 from torch.serialization import add_safe_globals
 from core import WideBindConfig, WideBindStack
+from core.checkpoints import find_latest_ckpt
 add_safe_globals([WideBindConfig])
 
-ckpt_path = sys.argv[1] if len(sys.argv) > 1 else r'C:\Users\black\OneDrive\Desktop\step_987.pt'
+default_ckpt = find_latest_ckpt(os.path.join(os.path.dirname(__file__), '..', 'checkpoints'))
+if default_ckpt is None:
+    print('No checkpoint found in checkpoints/; pass an explicit path.')
+    sys.exit(1)
+ckpt_path = sys.argv[1] if len(sys.argv) > 1 else default_ckpt
 ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
 cfg = ckpt['cfg']
 sd = ckpt['model']
