@@ -118,7 +118,8 @@ class WideBindBlock(nn.Module):
         
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
-                              swiglu=getattr(cfg, 'mlp_swiglu', True))
+                              swiglu=getattr(cfg, 'mlp_swiglu', True),
+                              situ_glu=getattr(cfg, 'mlp_situ_glu', False))
 
         # ─── Collective Concept Layer (per-layer concept bank) ───
         # k follows this layer's mirror staircase (8/16/32). Accumulation mode

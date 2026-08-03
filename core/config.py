@@ -151,6 +151,7 @@ class WideBindConfig:
     rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)
     rope_scaling: float = 1.0            # RoPE scaling factor (linear)
     mlp_swiglu: bool = True              # SwiGLU gate_proj parallel to up_proj (Qwen3-style)
+    mlp_situ_glu: bool = False           # SiTU-GLU (bounded: β1·tanh on gate factor, β2·tanh on up); keeps SwiGLU local response, |f|≤β1·β2
 
     # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
     bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"
