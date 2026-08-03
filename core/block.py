@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .config import WideBindConfig
 from .bind import BottleneckBind
 from .mirror import GroupedCognitiveMirror
+from .concept_layer import CollectiveConceptLayer
 from .mlp import GroupedMLP
 from .vsa_utils import dct_basis, fib_sigmoid_init
 
@@ -118,11 +119,29 @@ class WideBindBlock(nn.Module):
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
                               swiglu=getattr(cfg, 'mlp_swiglu', True))
+
+        # ─── Collective Concept Layer (expert-memory bank, zero params) ───
+        self.collective = None
+        if getattr(cfg, 'collective_layer', False):
+            self.collective = CollectiveConceptLayer(
+                cfg.D, self.mirror.k,
+                S=getattr(cfg, 'collective_S', 8),
+                write_delay=getattr(cfg, 'collective_write_delay', 5000),
+                maturity_warmup=getattr(cfg, 'collective_maturity_warmup', 5000),
+                uncert_theta=getattr(cfg, 'collective_uncert_theta', 0.005),
+                uncert_kappa=getattr(cfg, 'collective_uncert_kappa', 0.10),
+                contrast_thresh=getattr(cfg, 'collective_contrast_thresh', 0.92),
+                contrast_gain=getattr(cfg, 'collective_contrast_gain', 1.0),
+                birth_gap=getattr(cfg, 'collective_birth_gap', 0.55),
+                maturity_frac=getattr(cfg, 'collective_maturity_frac', 0.85),
+                read_out=getattr(cfg, 'collective_read_out', False),
+                seed=7 * (layer_idx + 1),
+            )
     
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
-                context_mem=None, allow_write=None, tau_s=None):
+                context_mem=None, allow_write=None, tau_s=None, step=None):
         mem_state = mu_state = conv_state = None
         if state is not None:
             mem_state, mu_state, conv_state = state
@@ -332,6 +351,17 @@ class WideBindBlock(nn.Module):
         bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
+        if self.collective is not None:
+            # Collective memory: reads are DETACHED constants added to the
+            # residual; writes are no_grad in-place. No gradient through it.
+            hp_c = self.mirror._cached_hp
+            pen_c = self.mirror._cached_pred_error_norm
+            if hp_c is not None and pen_c is not None and self.training:
+                col_out = self.collective(
+                    h, hp_c, pen_c, resvar=self.mirror._residual_var_ema.mean().item(),
+                    allow_write=True, step=step)
+                if col_out is not None:
+                    enhanced = enhanced + col_out
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_bind_out = enhanced_base  # for branch_loss (with grad)
         self._cache_mirror_out = mirror  # for branch_loss (with grad)

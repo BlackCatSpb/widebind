@@ -148,7 +148,7 @@ class WideBindStack(nn.Module):
                     _saved_pen, _saved_hp,
                     mem2v_scale, l_diff, nscale,
                     tanh_bias_mod, pred_scale_mod, spectral_mod,
-                    context_mem, allow_write, vsa_tau,
+                    context_mem, allow_write, vsa_tau, step,
                     use_reentrant=False,
                 )
                 h, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp = _out
@@ -158,7 +158,7 @@ class WideBindStack(nn.Module):
                                  tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                                  spectral_mod=spectral_mod,
                                  context_mem=context_mem, allow_write=allow_write,
-                                 tau_s=vsa_tau)
+                                 tau_s=vsa_tau, step=step)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -501,7 +501,7 @@ class WideBindStack(nn.Module):
                              _cached_pred_error_norm, _cached_hp,
                              mem2v_scale, diff, noise_scale,
                              tanh_bias_mod, pred_scale_mod, spectral_mod,
-                             context_mem, allow_write, tau_s):
+                             context_mem, allow_write, tau_s, step):
         """Wrapper for gradient checkpointing.
         Mirror cache is passed as explicit args/returns so checkpoint saves/restores it,
         preventing stale-cache mismatch between forward and backward recomputation."""
@@ -511,11 +511,28 @@ class WideBindStack(nn.Module):
                              mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod, context_mem=context_mem,
-                             allow_write=allow_write, tau_s=tau_s)
+                             allow_write=allow_write, tau_s=tau_s, step=step)
         return h_out, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp
 
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
+
+    @torch.no_grad()
+    def collective_stats(self):
+        """Per-layer summary of the Collective Concept Layer (col: log).
+        Returns None when the collective layer is disabled."""
+        cols = [l for l in self.layers if l.collective is not None]
+        if not cols:
+            return None
+        out = {
+            'step': int(cols[0].collective._step.item()),
+            'mature': int(sum(1 for l in cols if l.collective._mature.item())),
+            'writes': int(sum(l.collective.N_s.sum().item() for l in cols)),
+            'act': float(sum(l.collective.U_s.mean().item() for l in cols) / len(cols)),
+            'occ': float(sum((l.collective.U_s > 0.01).float().mean().item() for l in cols) / len(cols)),
+            'last_write_step': max(l.collective._last_write_step for l in cols),
+        }
+        return out
     
     def param_groups(self, lr=None, weight_decay=None, gate_lr_mult=None):
         """Optimizer parameter groups with λ_d LR hierarchy or legacy flat groups.

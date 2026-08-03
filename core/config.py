@@ -54,6 +54,22 @@ class WideBindConfig:
     # ─── Spec 3: Recursive meta-trust ───
     meta_trust: bool = True  # track trust dynamics, penalize unstable experts (requires private_mem)
 
+    # ─── Spec 4: Collective Concept Layer (memory of the expert collective) ───
+    # Pure memory: experiments are mined into shared slot banks via detached
+    # in-place updates; zero learnable parameters; the readout (if enabled) is
+    # detached from autograd so NO gradient ever flows through this layer.
+    collective_layer: bool = False
+    collective_read_out: bool = False   # True = also add a (detached) memory read into the block signal
+    collective_S: int = 8               # number of shared concept slots per layer
+    collective_write_delay: int = 5000  # skip mining during warmup steps
+    collective_maturity_warmup: int = 5000  # steps before bank maturity unlocks writes
+    collective_uncert_theta: float = 0.005  # uncertainty gate: above ⇒ too noisy to mine
+    collective_uncert_kappa: float = 0.10   # novelty gate: below ⇒ too well-known to mine
+    collective_contrast_thresh: float = 0.92  # contrastive rewrite if sim in [0.5, thresh]
+    collective_contrast_gain: float = 1.0
+    collective_birth_gap: float = 0.55   # eviction similarity gap vs mature slot
+    collective_maturity_frac: float = 0.85
+
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
     div_weight: float = 50.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
     ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
