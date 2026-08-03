@@ -12,18 +12,32 @@ from core import WideBindConfig, WideBindStack
 from compression import FCF_CPR
 
 
-def load_russian_tokenizer(path=None):
-    """Load BPE tokenizer from russian_tokenizer/tokenizer.json."""
-    if path is None:
-        path = os.path.join(os.path.dirname(__file__), '..', '..', 'fcp')
-    tok_file = os.path.join(path, 'russian_tokenizer', 'tokenizer.json')
-    if not os.path.exists(tok_file):
-        tok_file = os.path.join(os.path.dirname(__file__), '..', 'fcp', 'russian_tokenizer', 'tokenizer.json')
-    if os.path.exists(tok_file):
-        tok = Tokenizer.from_file(tok_file)
-        tok.enable_padding(pad_id=0, pad_token='<|pad|>')
-        tok.enable_truncation(max_length=512)
-        return tok
+def load_russian_tokenizer(path=None, extended=True):
+    """Load BPE tokenizer from russian_tokenizer/.
+    
+    extended=True prefers tokenizer_v65536.json (whole-word boosted vocab,
+    65536 tokens) and falls back to the base 50000 tokenizer. extended=False
+    loads the base tokenizer explicitly (useful for models with vocab=50000
+    where a prompt must never encode to ids >= 50000).
+    """
+    names = (['tokenizer_v65536.json', 'tokenizer.json'] if extended
+             else ['tokenizer.json'])
+    candidates = []
+    if path is not None:
+        candidates.append(path)
+    base = os.path.dirname(__file__)
+    for name in names:
+        candidates += [
+            os.path.join(base, '..', 'wb', 'russian_tokenizer', name),
+            os.path.join(base, '..', '..', 'fcp', 'russian_tokenizer', name),
+            os.path.join(base, '..', 'fcp', 'russian_tokenizer', name),
+        ]
+    for tok_file in candidates:
+        if os.path.exists(tok_file):
+            tok = Tokenizer.from_file(tok_file)
+            tok.enable_padding(pad_id=0, pad_token='<|pad|>')
+            tok.enable_truncation(max_length=512)
+            return tok
     return None
 
 
@@ -40,9 +54,15 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     if tok is None:
         raise FileNotFoundError('russian_tokenizer/tokenizer.json not found')
     
-    # Encode prompt
+    # Encode prompt (fall back to base tokenizer if extended one produces
+    # ids beyond the model's vocab, e.g. old 50000-vocab checkpoints)
     encoded = tok.encode(prompt)
     prompt_tokens = encoded.ids
+    if max(prompt_tokens, default=0) >= model.cfg.vocab:
+        base_tok = load_russian_tokenizer(extended=False)
+        if base_tok is not None and max(base_tok.encode(prompt).ids, default=0) < model.cfg.vocab:
+            tok = base_tok
+            prompt_tokens = base_tok.encode(prompt).ids
     detokenize = lambda ids: tok.decode(ids, skip_special_tokens=True)
     
     tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
