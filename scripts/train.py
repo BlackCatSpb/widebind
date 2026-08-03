@@ -21,6 +21,7 @@ add_safe_globals([WideBindConfig])
 class TokenStream:
     """Memory-mapped uint16 token stream; converted to torch.long per batch."""
     def __init__(self, path):
+        self.path = path
         self.data = np.memmap(path, dtype=np.uint16, mode='r')
         self.len = len(self.data)
     def get_batch(self, seq_len, batch_size, offset):
@@ -31,6 +32,58 @@ class TokenStream:
         x = torch.from_numpy(chunk[:batch_size * seq_len].reshape(batch_size, seq_len).copy())
         y = torch.from_numpy(chunk[1:batch_size * seq_len + 1].reshape(batch_size, seq_len).copy())
         return x.long(), y.long(), offset + batch_size * seq_len
+
+
+def _load_tokenizer(extended=True):
+    """Загрузить русский токенизатор для декод-проверки (best-effort)."""
+    try:
+        from generate import load_russian_tokenizer
+    except ImportError:
+        from scripts.generate import load_russian_tokenizer
+    return load_russian_tokenizer(extended=extended)
+
+
+def check_streams_health(streams, cfg):
+    """Гигиен-гейт данных перед обучением.
+
+    Дефектный корпус (92% U+FFFD) — главная историческая причина деградации.
+    Проверяем (1) целостность диапазона id (данные ↔ cfg.vocab), (2) долю
+    расширенных токенов 50000..vocab-1, (3) долю U+FFFD и кириллицы в декоде.
+    """
+    print('[health] Проверка целостности стримов...')
+    base_v = getattr(cfg, 'base_vocab', 50000)
+    problems = []
+    for i, s in enumerate(streams):
+        sample = np.asarray(s.data[:min(1_000_000, s.len)], dtype=np.uint32)
+        if sample.size == 0:
+            continue
+        mx = int(sample.max())
+        if mx >= cfg.vocab:
+            problems.append(f'max_id={mx} >= vocab={cfg.vocab}')
+        ext_share = float((sample >= base_v).mean())
+        print(f'  [{i}] {os.path.basename(s.path):42s} len={s.len:>12,} '
+              f'max_id={mx:<6} ext_share={ext_share:.4f}')
+    if problems:
+        raise ValueError('Stream data несовместим с cfg.vocab:\n  ' + '\n  '.join(problems))
+    # Декод-проверка (best-effort): U+FFFD и кириллица
+    try:
+        tok = _load_tokenizer(extended=(cfg.vocab > base_v))
+        sample = np.asarray(streams[0].data[:4096], dtype=np.uint32)
+        if tok is not None and int(sample.max()) < tok.get_vocab_size():
+            text = tok.decode(sample.tolist(), skip_special_tokens=True)
+            fffd = text.count('\ufffd') / max(len(text), 1)
+            cyr = sum(1 for ch in text if '\u0400' <= ch <= '\u04ff') / max(len(text), 1)
+            print(f'[health] decoded sample: {len(text)} chars, '
+                  f'U+FFFD={fffd:.4%}, cyrillic={cyr:.4%} (U+FFFD должен быть 0.0%)')
+            if fffd > 0.0005:
+                raise ValueError(f'U+FFFD={fffd:.4%} > 0.05% — похоже на повреждённый корпус!')
+            if cyr < 0.5:
+                raise ValueError(f'cyrillic={cyr:.4%} < 50% — стрим не похож на русский текст')
+        else:
+            print('[health] tokenizer не покрывает стрим/vocab — пропуск декод-проверки')
+    except Exception as e:
+        print(f'[health] warning: декод-проверка пропущена ({e})')
+    print('[health] OK')
 
 
 def create_lr_scheduler(optimizer, warmup, max_steps, lr):
@@ -65,6 +118,7 @@ def train(cfg=None, resume_path=None):
     streams = [TokenStream(f) for f in stream_files]
     total_tokens = sum(s.len for s in streams)
     print(f'Found {len(streams)} files, {total_tokens:,} total tokens')
+    check_streams_health(streams, cfg)
     
     # Model (retry once on OOM — transient CUDA context cleanup)
     try:

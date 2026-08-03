@@ -229,6 +229,22 @@ class WideBindStack(nn.Module):
                 ce_loss = (ce * w).sum() / mask.sum().clamp(min=1)
             else:
                 ce_loss = ce.sum() / mask.sum().clamp(min=1)
+            # ─── Diagnostic: CE по срезам словаря (base vs extended) ───
+            # Позволяет проверить, что расширенные токены 50000..vocab-1 реально
+            # усваиваются (CE_ext должен падать заметно ниже ln(1/|ext|)).
+            with torch.no_grad():
+                tgt = targets.reshape(-1)
+                base_v = getattr(self.cfg, 'base_vocab', 50000)
+                if self.cfg.vocab > base_v:
+                    base_m = (tgt < base_v) & (tgt != 0) & (tgt != 2)
+                    ext_m = (tgt >= base_v) & (tgt != 0) & (tgt != 2)
+                    self._diag_ce_base = (ce * base_m.float()).sum() / base_m.sum().clamp(min=1)
+                    self._diag_ce_ext = (ce * ext_m.float()).sum() / ext_m.sum().clamp(min=1)
+                    self._diag_ext_frac = ext_m.float().mean()
+                else:
+                    self._diag_ce_base = ce_loss
+                    self._diag_ce_ext = None
+                    self._diag_ext_frac = 0.0
         pred_loss = 0.0
         n_pred = 0
         cache = getattr(self, '_pred_cache', [])
@@ -247,6 +263,20 @@ class WideBindStack(nn.Module):
                 n_gates = n_gates + 1
         if n_gates > 0:
             gate_l1 = gate_l1 / n_gates
+        
+        # ─── Diagnostic: разброс использования экспертов (gate collapse индикатор) ───
+        # gate_var ~ var(usage_frac): падение к 0 = все эксперты одинаково используются
+        # (коллапс), рост — специализация. Историческое значение ~0.25.
+        gate_var = 0.0
+        n_gv = 0
+        for layer in self.layers:
+            gu = getattr(layer.mirror, '_cached_gate_usage', None)
+            if gu is not None:
+                gu_norm = gu / (gu.sum() + 1e-10)
+                gate_var = gate_var + gu_norm.var(dim=-1)
+                n_gv += 1
+        if n_gv > 0:
+            gate_var = gate_var / n_gv
         
         reinforce_loss = 0.0
         n_reinf = 0
@@ -438,6 +468,10 @@ class WideBindStack(nn.Module):
         
         self._cached_losses = {
             'ce': ce_loss.item(),
+            'ce_base': self._diag_ce_base.item() if isinstance(getattr(self, '_diag_ce_base', None), torch.Tensor) else 0.0,
+            'ce_ext': self._diag_ce_ext.item() if isinstance(getattr(self, '_diag_ce_ext', None), torch.Tensor) else 0.0,
+            'ext_frac': float(getattr(self, '_diag_ext_frac', 0.0) or 0.0),
+            'gate_var': gate_var.item() if isinstance(gate_var, torch.Tensor) else gate_var,
             'pred': pred_loss.item() if isinstance(pred_loss, torch.Tensor) else pred_loss,
             'gate_l1': gate_l1.item() if isinstance(gate_l1, torch.Tensor) else gate_l1,
             'reinforce': reinforce_loss.item() if isinstance(reinforce_loss, torch.Tensor) else reinforce_loss,

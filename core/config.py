@@ -14,6 +14,7 @@ class WideBindConfig:
     n_layers: int = 32
     bind_K: int = 64
     vocab: int = 50000
+    base_vocab: int = 50000   # граница базового токенизатора (для диагностики CE base/ext)
     seq_len: int = 128
     batch_size: int = 2
     lr: float = 3e-4
