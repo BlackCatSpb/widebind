@@ -52,9 +52,9 @@ class CollectiveConceptLayer(nn.Module):
         self.register_buffer('M', F.normalize(m_init, dim=-1))
         self.register_buffer('U_s', torch.zeros(S))
         self.register_buffer('N_s', torch.zeros(S, dtype=torch.long))
-        self.register_buffer('_step', torch.zeros(1, dtype=torch.long), persistent=False)
-        self.register_buffer('_resvar_ref', torch.zeros(1), persistent=False)
-        self.register_buffer('_mature', torch.zeros(1), persistent=False)
+        self.register_buffer('_step', torch.zeros(1, dtype=torch.long), persistent=True)
+        self.register_buffer('_resvar_ref', torch.zeros(1), persistent=True)
+        self.register_buffer('_mature', torch.zeros(1), persistent=True)
         self.register_buffer('_gate_u', torch.zeros(1), persistent=False)
         self.register_buffer('_gate_c', torch.zeros(1), persistent=False)
         self._last_write_step = -1
