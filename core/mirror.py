@@ -288,9 +288,10 @@ class GroupedCognitiveMirror(nn.Module):
         # Adaptive tau: K-измерения с высокой ошибкой → короткое τ, с низкой → длинное.
         # alpha_target = sigmoid(2.2 - log(rel_var)):
         #   rel_var=1 (noise) → α=0.9 (init), rel_var=0.5 → α=0.95, rel_var=2 → α=0.82
+        # Training-only (adaptive tau + alpha drift); in eval .item()/var() sync GPU->CPU.
         with torch.no_grad():
             override = self._alpha_override.item()
-            if override < 0.1:
+            if self.training and override < 0.1:
                 residual_var = pred_error.var(dim=(0, 1), unbiased=False)
                 self._residual_var_ema.lerp_(residual_var, 0.01)
                 rv = self._residual_var_ema
@@ -419,10 +420,13 @@ class GroupedCognitiveMirror(nn.Module):
             signals = [temp_k, pred_error, smooth_k, sym_k]
         signals_normed = []
         decay = 0.01  # ~100-step EMA
+        n_sig = len(signals)
         for i, s in enumerate(signals):
-            with torch.no_grad():
-                rms = s.norm(dim=(-2, -1), keepdim=True).mean(dim=(0, 1), keepdim=True)  # (1, 1, G, k)
-                self._signal_norm_ema[i].mul_(1 - decay).add_(rms.squeeze(), alpha=decay)
+            # EMA update is training-only; in eval use the frozen EMA (avoids GPU->CPU sync)
+            if self.training:
+                with torch.no_grad():
+                    rms = s.norm(dim=(-2, -1), keepdim=True).mean(dim=(0, 1), keepdim=True)  # (1, 1, G, k)
+                    self._signal_norm_ema[i].mul_(1 - decay).add_(rms.squeeze(), alpha=decay)
             s_norm = s / (self._signal_norm_ema[i].unsqueeze(0).unsqueeze(0) + 1e-8)
             signals_normed.append(s_norm)
         
@@ -430,21 +434,24 @@ class GroupedCognitiveMirror(nn.Module):
         w = torch.sigmoid(self._signal_log_weights)  # (n_sig,), no sum-to-1 constraint
         
         # ─── Decorrelation: orthogonalize WEIGHTED signals (gradient flows to _signal_log_weights) ───
-        n_sig = len(signals)
-        decorr = 0.0
-        npairs = 0
-        for i in range(n_sig):
-            for j in range(i + 1, n_sig):
-                si = (signals_normed[i] * w[i]).reshape(-1, signals_normed[i].shape[-2] * signals_normed[i].shape[-1])
-                sj = (signals_normed[j] * w[j]).reshape(-1, signals_normed[j].shape[-2] * signals_normed[j].shape[-1])
-                si_c = si - si.mean(dim=0, keepdim=True)
-                sj_c = sj - sj.mean(dim=0, keepdim=True)
-                cos_ij = (si_c * sj_c).sum(dim=-1) / (si_c.norm(dim=-1) * sj_c.norm(dim=-1) + 1e-8)
-                decorr = decorr + cos_ij.pow(2).mean()
-                npairs = npairs + 1
-        if npairs > 0:
-            decorr = decorr / npairs
-        self._cached_decorr = decorr
+        # Loss-only metric; skipped in eval (saves ~6 pair reductions per layer).
+        if self.training:
+            decorr = 0.0
+            npairs = 0
+            for i in range(n_sig):
+                for j in range(i + 1, n_sig):
+                    si = (signals_normed[i] * w[i]).reshape(-1, signals_normed[i].shape[-2] * signals_normed[i].shape[-1])
+                    sj = (signals_normed[j] * w[j]).reshape(-1, signals_normed[j].shape[-2] * signals_normed[j].shape[-1])
+                    si_c = si - si.mean(dim=0, keepdim=True)
+                    sj_c = sj - sj.mean(dim=0, keepdim=True)
+                    cos_ij = (si_c * sj_c).sum(dim=-1) / (si_c.norm(dim=-1) * sj_c.norm(dim=-1) + 1e-8)
+                    decorr = decorr + cos_ij.pow(2).mean()
+                    npairs = npairs + 1
+            if npairs > 0:
+                decorr = decorr / npairs
+            self._cached_decorr = decorr
+        else:
+            self._cached_decorr = None
         
         # ─── Merge all signals (weighted sum) ───
         delta = sum(w[i] * signals_normed[i] for i in range(n_sig))
@@ -455,12 +462,14 @@ class GroupedCognitiveMirror(nn.Module):
         # ─── Gate modulation signals (shared between gate & usefulness) ───
         grad_mod = torch.exp(self.log_grad_mod_scale) * torch.tanh(self._prev_grad_norm + self.grad_mod_bias)
         with torch.no_grad():
-            dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)  # (G,)
-            if diff is not None:
-                ema_alpha = self._delta_var_ema_min + diff * (self._delta_var_ema_max - self._delta_var_ema_min)
-            else:
-                ema_alpha = 0.9
-            self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
+            # EMA update training-only; eval uses frozen _delta_var (no sync)
+            if self.training:
+                dvar = delta.var(dim=(0, 1), unbiased=False).mean(dim=-1)  # (G,)
+                if diff is not None:
+                    ema_alpha = self._delta_var_ema_min + diff * (self._delta_var_ema_max - self._delta_var_ema_min)
+                else:
+                    ema_alpha = 0.9
+                self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
         
         # ─── Self-organizing usefulness (sigmoid + adaptive threshold) ───
@@ -473,9 +482,10 @@ class GroupedCognitiveMirror(nn.Module):
             threshold = usefulness_logits.median(dim=-1, keepdim=True).values  # (B, L, 1)
         usefulness = torch.sigmoid((usefulness_logits - threshold) / temp)
         # Homeostatic temperature (after warmup): бинарная энтропия управляет остротой
+        # Training-only adaptation; eval uses frozen temperature.
         with torch.no_grad():
             override = self._alpha_override.item()
-            if override < 0.1:
+            if self.training and override < 0.1:
                 u_ent = -(usefulness * torch.log(usefulness + 1e-10) +
                           (1 - usefulness) * torch.log(1 - usefulness + 1e-10))
                 u_ent_mean = u_ent.sum(dim=-1).mean()

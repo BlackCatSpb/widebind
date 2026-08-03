@@ -150,6 +150,9 @@ class WideBindBlock(nn.Module):
         NaN = float('nan')
         self._nan_at = None
         def _chk(t, label):
+            # NaN diagnostics are training-only; in eval each .any().item() syncs GPU->CPU
+            if not self.training:
+                return False
             if t.is_floating_point() and (t.isnan().any() or t.isinf().any()):
                 self._nan_at = f'L{self.layer_idx}.{label}[{t.min():.2f},{t.max():.2f}]'
                 return True
