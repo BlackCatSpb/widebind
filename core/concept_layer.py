@@ -177,7 +177,10 @@ class CollectiveConceptLayer(nn.Module):
         M_n = F.normalize(self.M, dim=-1)
         sim = shared @ M_n.T                              # (B,L,S)
         temp = self._temp.clamp(min=0.5)
-        a = torch.softmax(sim * temp, dim=-1)             # (B,L,S)
+        # Независимые per-slot гейты (sigmoid+норм): слоты могут быть
+        # соактивными, но сумма по S нормируется для сохранения масштаба readout.
+        a = torch.sigmoid(sim * temp)                      # (B,L,S) независимые гейты
+        a = a / (a.sum(dim=-1, keepdim=True) + 1e-8)       # нормировка бленда
         occ_w = (self.U_s / (self.U_s.max() + 1e-8)).clamp(0, 1)
         blend = (a.unsqueeze(-1) * occ_w.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
                  * M_n.unsqueeze(0).unsqueeze(0))

@@ -199,9 +199,8 @@ class GroupedCognitiveMirror(nn.Module):
         
         # ─── Self-organizing usefulness predictor (competitive) ───
         # Каждый эксперт предсказывает свою полезность по delta (K-space correction)
-        # Softmax по G: эксперты конкурируют за право модулировать слой.
-        # Только лучшие эксперты для данного токена получают высокий вес.
-        # init: без Sigmoid — raw logits для softmax-конкуренции
+        # Sigmoid + медианный порог: конкуренция без zero-sum (сумма ≠ 1).
+        # init: raw logits — sigmoid применяется ниже по температуре/порогу
         self.usefulness_predictor = nn.Sequential(
             nn.Linear(k, k),
             nn.Tanh(),
@@ -210,7 +209,7 @@ class GroupedCognitiveMirror(nn.Module):
         # Per-expert масштабы модуляции (learned log-scale)
         self.mod_scale_mlp = nn.Parameter(torch.full((G,), math.log(2.0)))
         self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
-        # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
+        # Softmax-температура (для sigmoid): >1 = мягче, <1 = острее (winner-take-all)
         self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)
         # Error-gated damping: порог резонансного демпфирования α на инференсе
         self.register_buffer('_damp_tau', torch.tensor(0.1), persistent=False)
@@ -413,7 +412,7 @@ class GroupedCognitiveMirror(nn.Module):
         # Symmetry: bilinear temporal interaction
         sym_k = (hp * self.w_sym_u) * (hp_prev * self.w_sym_v)
         
-        # ─── EMA-нормировка сигналов (соизмеримость перед softmax) ───
+        # ─── EMA-нормировка сигналов (соизмеримость перед смешиванием) ───
         if self._has_private_mem:
             signals = [temp_k, pred_error, smooth_k, sym_k, help_k]
         else:

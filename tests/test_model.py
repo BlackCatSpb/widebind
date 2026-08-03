@@ -60,6 +60,43 @@ def test_sparse_codes_prefix_stable():
     assert torch.equal(small, big[:5000]), 'codes prefix changed after vocab expansion'
 
 
+def test_no_softmax_in_active_path():
+    """Нет softmax в активном forward-пути архитектуры (тело без softmax).
+
+    Сканируем исходники ядра на фактические вызовы softmax/log_softmax.
+    Исключения (не тело, а выходные/обучающие распределения):
+      - LM-head-семплинг (scripts/generate.py) — распределение по словарю;
+      - curriculum sampler — выбор стримов в обучении;
+      - Zeckendorf readout (off по умолчанию) — вероятностное дерево головы.
+    """
+    import inspect
+    active_core = ['bind', 'block', 'concept_layer', 'embedding',
+                   'lambda_utils', 'live_inference', 'mirror', 'mlp',
+                   'stack', 'vsa_utils']
+    offenders = []
+    for name in active_core:
+        mod = _core_module(name)
+        if mod is None:
+            continue
+        try:
+            src = inspect.getsource(mod)
+        except (TypeError, OSError):
+            continue
+        for pat in ('F.log_softmax(', 'torch.log_softmax(', 'F.softmax(',
+                    'torch.softmax('):
+            if pat in src:
+                offenders.append(f'{name}:: {pat}')
+    assert not offenders, f'softmax-вызовы в активном коде ядра: {offenders}'
+
+
+def _core_module(name):
+    import importlib
+    try:
+        return importlib.import_module(f'core.{name}')
+    except Exception:
+        return None
+
+
 # ─── PartitionedEmbedding ──────────────────────────────────────────
 
 def test_partitioned_embed_shape():

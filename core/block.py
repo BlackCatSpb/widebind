@@ -81,7 +81,7 @@ class WideBindBlock(nn.Module):
         self.w_i_dyn = nn.Parameter(torch.randn(g, k, d) * (1.0 / math.sqrt(k)))
         self.w_d_pen = nn.Parameter(torch.zeros(g))
         self.w_bind_gate = nn.Parameter(torch.zeros(g))
-        # Per-scale per-channel combination weights (logits for softmax)
+        # Per-scale per-channel combination weights (logits for sigmoid)
         self.scale_w = nn.Parameter(fib_sigmoid_init(self._n_scales).unsqueeze(1).expand(-1, cfg.D).clone())
         # Linear decay across layers: shallow → short memory, deep → long
         # Per-channel (D,) — can differentiate via gradient when vsa_b_d_smooth < 1.0
