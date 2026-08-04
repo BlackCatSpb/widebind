@@ -9,6 +9,7 @@ from .block import WideBindBlock
 from .embedding import ZeckendorfEmbedding, PartitionedEmbedding, LmHead, PartitionedHead
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 from .zeckendorf_readout import ZeckendorfReadout
+from .amp_codec import SignedAmpEmbedding, SignedAmpHead
 
 class WideBindStack(nn.Module):
     """Stack of WideBindBlock layers with embedding and lm_head."""
@@ -16,11 +17,17 @@ class WideBindStack(nn.Module):
     def __init__(self, cfg: WideBindConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed = PartitionedEmbedding(cfg)
-        if getattr(cfg, 'zeckendorf_readout', False):
-            self.lm_head = ZeckendorfReadout(cfg)
+        if getattr(cfg, 'amp_codec', False):
+            self.embed = SignedAmpEmbedding(cfg)
+            self.lm_head = SignedAmpHead(cfg,
+                                         embed_basis=self.embed.basis,
+                                         embed_proto=self.embed.proto)
         else:
-            self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
+            self.embed = PartitionedEmbedding(cfg)
+            if getattr(cfg, 'zeckendorf_readout', False):
+                self.lm_head = ZeckendorfReadout(cfg)
+            else:
+                self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
         
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
@@ -202,15 +209,32 @@ class WideBindStack(nn.Module):
         """Returns CE only (aux losses applied via gradient scaling in training step)."""
         ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight)
         return ce_loss
-    
-    def compute_losses(self, h, targets, pred_weight=None):
+
+    def compute_losses(self, h, targets, pred_weight=None, h_emb=None):
         """Compute CE and auxiliary losses separately. Returns raw (unweighted) values.
-        
+
+        h_emb: (optional) эмбеддинг-вход для кодечной головы (двухконечное чтение).
+
         Returns:
             ce_loss: scalar, cross-entropy loss
             aux_dict: dict of named auxiliary losses (raw, unweighted).
         """
         if isinstance(self.lm_head, ZeckendorfReadout):
+            B, L, D = h.shape
+            log_probs = self.lm_head.log_probs_for_target(
+                h.reshape(-1, D), targets.reshape(-1))
+            ce_loss = -log_probs.mean()
+        elif hasattr(self.lm_head, 'margin_loss'):
+            B, L, D = h.shape
+            hf = h.reshape(-1, D)
+            he = None if h_emb is None else h_emb.reshape(-1, D)
+            t = targets.reshape(-1)
+            margin = self.lm_head.margin_loss(hf, t, he)
+            ce_loss = margin.mean()
+            hw = getattr(self.cfg, 'amp_hinge_weight', 1.0)
+            if hw > 0 and hasattr(self.lm_head, 'argmax_hinge'):
+                ce_loss = ce_loss + hw * self.lm_head.argmax_hinge(hf, t, he).mean()
+        elif hasattr(self.lm_head, 'log_probs_for_target'):
             B, L, D = h.shape
             log_probs = self.lm_head.log_probs_for_target(
                 h.reshape(-1, D), targets.reshape(-1))

@@ -37,6 +37,18 @@ class WideBindConfig:
     code_dim: int = 32
     code_sparsity: int = 6
 
+    # ─── SignedAmpCodec (эксперимент: читаем подписанные амплитуды, без softmax) ───
+    amp_codec: bool = False         # True = SignedAmpEmbedding/SignedAmpHead вместо Partitioned
+    amp_proto_init: float = 0.2     # разброс прототипов амплитуд α_vk
+    amp_gain_init: float = 0.5      # стартовый gain чтения (против насыщения tanh)
+    amp_w_init: float = 0.5         # стартовое двухконечное чтение: вес собственного кода
+    amp_sigma_init: float = 0.3     # стартовая неопределённость позиций (до sqrt-ish)
+    amp_sigma_min: float = 0.2      # нижняя граница σ: для маржинальной цели ограниченность
+                                    # требует σ_min > 0 (масштабная инвариантность);
+                                    # 0.399 = граница допустимости likelihood для обычного CE
+    amp_scale: float = 1.0          # масштаб записи в residual stream
+    amp_seed: int = 0               # детерминизм базиса/прототипов
+
     # Mirror
     mirror_k: int = 32
     mirror_k_staircase: bool = True  # True = k_l∈{8,16,32} по третям глубины
