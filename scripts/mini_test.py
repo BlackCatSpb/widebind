@@ -1,14 +1,17 @@
 """Mini-test: 100 steps + comprehensive checks.
-Without args: quick smoke test (100 steps).
-With --full: adds alpha grad flow, gate behavior, checkpoint, aux loss checks.
+Without args: quick smoke test (100 steps + SignedAmpCodec smoke on counter).
+With --full: adds alpha grad flow, gate behavior, checkpoint, aux loss,
+codec phasor/hybrid/wiring checks.
 """
 import sys, os, math, time, argparse
+from dataclasses import replace as d_replace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import torch
 import torch.nn.functional as F
 from core import WideBindConfig, WideBindStack, AdaptiveController, MirrorLRScheduler
+from core.amp_optim import build_amp_groups, AmpAdam
 from compression import FCF_CPR
 
 parser = argparse.ArgumentParser()
@@ -90,6 +93,86 @@ snapshot(model, 'AFTER')
 assert not math.isnan(loss_after.item()), 'Loss is NaN!'
 assert not math.isinf(loss_after.item()), 'Loss is Inf!'
 print('  PASS: No NaN/Inf')
+
+# ─── Codec smoke: SignedAmpCodec on counter (always) ───────────────
+print('\n=== CODEC SMOKE: SignedAmpCodec (counter V=64, pred+reg) ===')
+
+def csm_sample(prev=None):
+    x0 = prev if prev is not None else torch.randint(0, 64, (1, 1), device=device)
+    x = (x0 + torch.arange(64, device=device).unsqueeze(0)) % 64
+    return x, (x + 1) % 64
+
+def csm_top1(model):
+    with torch.no_grad():
+        model.eval()
+        x, y = csm_sample()
+        he = model.embed_tokens(x)
+        out, _, _ = model(he)
+        logits = model.lm_head(out, h_emb=he)
+        acc = (logits.argmax(-1).reshape(-1) == y.reshape(-1)).float().mean().item()
+    model.train()
+    return acc
+
+csm_cfg = WideBindConfig(D=896, n_layers=4, mlp_groups=8, seq_len=64, batch_size=1,
+                         lr=2e-4, amp_codec=True, vocab=64,
+                         amp_pred=True, amp_reg_weight=0.5)
+torch.manual_seed(123)
+csm = WideBindStack(csm_cfg).to(device)
+torch.manual_seed(123)
+csm_plain = WideBindStack(d_replace(csm_cfg, amp_pred=False)).to(device)
+csm.train()
+
+# W_pred init-identity: без pred и с pred при тех же весах почти одинаковый margin
+with torch.no_grad():
+    x0, y0 = csm_sample()
+    he0 = csm.embed_tokens(x0)
+    out0, _, _ = csm(he0)
+    m_pre = csm.lm_head.margin_loss(out0.reshape(-1, csm_cfg.D), y0.reshape(-1),
+                                    he0.reshape(-1, csm_cfg.D)).mean().item()
+    out0p, _, _ = csm_plain(he0)
+    m_plain = csm_plain.lm_head.margin_loss(out0p.reshape(-1, csm_cfg.D), y0.reshape(-1),
+                                            he0.reshape(-1, csm_cfg.D)).mean().item()
+print(f'  pred init vs plain: margin {m_pre:.4f} vs {m_plain:.4f} (diff={abs(m_pre - m_plain):.4f})')
+assert abs(m_pre - m_plain) < 0.05, f'pred init должен быть ~тождественен plain: diff={abs(m_pre - m_plain):.4f}'
+print('  PASS: W_pred init ~ identity (diff < 0.05)')
+
+csm_opt = AmpAdam(build_amp_groups(csm, lr=2e-4, head_scale=1.0, embed_scale=0.5))
+csm_state, csm_gs, cx = None, None, None
+csm_nan, m1, h1 = False, None, None
+for step in range(100):
+    x, y = csm_sample(cx)
+    cx = x[0, -1:]
+    csm_opt.zero_grad()
+    he = csm.embed_tokens(x)
+    out, st, gl = csm(he, state=csm_state, global_state=csm_gs)
+    mh = csm.lm_head
+    hf, t, hef = out.reshape(-1, csm_cfg.D), y.reshape(-1), he.reshape(-1, csm_cfg.D)
+    margin = mh.margin_loss(hf, t, hef)
+    hinge = mh.argmax_hinge(hf, t, hef)
+    loss = margin.mean() + hinge.mean() + csm_cfg.amp_reg_weight * mh.code_reg(hf, t, hef).mean()
+    if step == 0:
+        m1, h1 = margin.mean().item(), hinge.mean().item()
+    if not torch.isfinite(loss):
+        csm_nan = True
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(csm.parameters(), csm_cfg.grad_clip)
+    csm_opt.step()
+    if st is not None:
+        csm_state = [(s[0].detach(), s[1].detach(), s[2].detach()) if s is not None else None for s in st]
+        csm_gs = gl.detach()
+
+m60, h60 = margin.mean().item(), hinge.mean().item()
+son, soff, semb = [s.mean().item() for s in mh._sigmas()]
+acc60 = csm_top1(csm)
+assert not csm_nan, 'codec loss NaN'
+assert min(son, soff, semb) >= 0.2 - 1e-3, f'sigma floor нарушен: {son:.3f}/{soff:.3f}/{semb:.3f}'
+assert m60 < m1, f'margin не убывает: {m1:.3f} -> {m60:.3f}'
+assert h60 < h1, f'hinge не убывает: {h1:.3f} -> {h60:.3f}'
+assert acc60 > 0.03, f'top1 не поднялся выше шанса (1.56%): {acc60 * 100:.2f}%'
+print(f'  margin {m1:.3f}->{m60:.3f}, hinge {h1:.3f}->{h60:.3f}, '
+      f'top1={acc60 * 100:.2f}% (шанс 1.56%), sigma={son:.3f}/{soff:.3f}/{semb:.3f}')
+print('  PASS: codec учит counter, без NaN, sigma floor соблюдён')
+del csm, csm_plain, csm_opt
 
 # ─── Full checks (--full flag) ─────────────────────────────────────
 if not args.full:
@@ -256,6 +339,47 @@ check('No NaN/Inf in 50 steps', not any(math.isnan(l) or math.isinf(l) for l in 
 check('Loss stable (no divergence)', max(losses) - min(losses) < 5.0,
       f'range=[{min(losses):.4f}, {max(losses):.4f}]')
 del deep_model, ds, dgs
+
+# ─── Check 9: Codec phasor/hybrid forward finite ───
+print('\n--- Check 9: Codec phasor/hybrid margin/hinge finite ---')
+for tag, kw in [('phasor', dict(amp_phasor=True)),
+                ('hybrid', dict(amp_hybrid=True)),
+                ('pred', dict(amp_pred=True))]:
+    cc9 = WideBindConfig(D=256, n_layers=2, mlp_groups=4, seq_len=16, batch_size=1,
+                         vocab=64, amp_codec=True, **kw)
+    cm9 = WideBindStack(cc9).to(device)
+    cm9.eval()
+    with torch.no_grad():
+        x9 = torch.randint(4, 60, (1, 16), device=device)
+        he9 = cm9.embed_tokens(x9)
+        out9, _, _ = cm9(he9)
+        mg9 = cm9.lm_head.margin_loss(out9.reshape(-1, cc9.D), x9.reshape(-1),
+                                      he9.reshape(-1, cc9.D)).mean().item()
+        hg9 = cm9.lm_head.argmax_hinge(out9.reshape(-1, cc9.D), x9.reshape(-1),
+                                       he9.reshape(-1, cc9.D)).mean().item()
+    ok9 = math.isfinite(mg9) and math.isfinite(hg9)
+    check(f'{tag}: margin/hinge finite', ok9, f'margin={mg9:.3f} hinge={hg9:.3f}')
+    del cm9
+
+# ─── Check 10: code_reg wiring via compute_losses ───
+print('\n--- Check 10: compute_losses == margin + hinge + reg (manual) ---')
+cc10 = WideBindConfig(D=256, n_layers=2, mlp_groups=4, seq_len=16, batch_size=1,
+                      vocab=64, amp_codec=True, amp_pred=True, amp_reg_weight=0.5)
+cm10 = WideBindStack(cc10).to(device)
+cm10.eval()
+with torch.no_grad():
+    x10 = torch.randint(4, 60, (1, 16), device=device)
+    he10 = cm10.embed_tokens(x10)
+    out10, _, _ = cm10(he10)
+    hf10 = out10.reshape(-1, cc10.D)
+    t10, hef10 = x10.reshape(-1), he10.reshape(-1, cc10.D)
+    ce10, _ = cm10.compute_losses(out10, x10, h_emb=he10)
+    manual10 = cm10.lm_head.margin_loss(hf10, t10, hef10).mean()
+    manual10 = manual10 + cc10.amp_hinge_weight * cm10.lm_head.argmax_hinge(hf10, t10, hef10).mean()
+    manual10 = manual10 + cc10.amp_reg_weight * cm10.lm_head.code_reg(hf10, t10, hef10).mean()
+check('compute_losses == margin+hinge+reg manual', abs(ce10.item() - manual10.item()) < 1e-4,
+      f'ce={ce10.item():.4f} manual={manual10.item():.4f}')
+del cm10
 
 # ─── Summary ───
 print(f'\n{"="*40}')
