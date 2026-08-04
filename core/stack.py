@@ -229,14 +229,17 @@ class WideBindStack(nn.Module):
             hf = h.reshape(-1, D)
             he = None if h_emb is None else h_emb.reshape(-1, D)
             t = targets.reshape(-1)
-            margin = self.lm_head.margin_loss(hf, t, he)
-            ce_loss = margin.mean()
-            hw = getattr(self.cfg, 'amp_hinge_weight', 1.0)
-            if hw > 0 and hasattr(self.lm_head, 'argmax_hinge'):
-                ce_loss = ce_loss + hw * self.lm_head.argmax_hinge(hf, t, he).mean()
-            rw = getattr(self.cfg, 'amp_reg_weight', 0.0)
-            if rw > 0 and hasattr(self.lm_head, 'code_reg'):
-                ce_loss = ce_loss + rw * self.lm_head.code_reg(hf, t, he).mean()
+            if getattr(self.cfg, 'amp_obj', 'mh') == 'ce':
+                ce_loss = self.lm_head.ce_loss(hf, t, he).mean()
+            else:
+                margin = self.lm_head.margin_loss(hf, t, he)
+                ce_loss = margin.mean()
+                hw = getattr(self.cfg, 'amp_hinge_weight', 1.0)
+                if hw > 0 and hasattr(self.lm_head, 'argmax_hinge'):
+                    ce_loss = ce_loss + hw * self.lm_head.argmax_hinge(hf, t, he).mean()
+                rw = getattr(self.cfg, 'amp_reg_weight', 0.0)
+                if rw > 0 and hasattr(self.lm_head, 'code_reg'):
+                    ce_loss = ce_loss + rw * self.lm_head.code_reg(hf, t, he).mean()
         elif hasattr(self.lm_head, 'log_probs_for_target'):
             B, L, D = h.shape
             log_probs = self.lm_head.log_probs_for_target(

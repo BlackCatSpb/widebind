@@ -303,6 +303,22 @@ class SignedAmpHead(nn.Module):
         den = z.sum(-1).clamp_min(1.0)
         return num / den
 
+    def ce_loss(self, h, targets, h_emb=None):
+        """(N,) — CE по факторизованному счёту: logΣ_v exp(s_v) − s_y за O(V·K).
+
+        Математика: CE = hinge-soft ≥ argmax_hinge (доминирует борьбу с
+        argmax-конкурентом) и CE = margin + [logΣexp(s) − E_q s] ≥ margin
+        (добавляет требование остроты — член ≥ 0 по неравенству log-sum-exp).
+        Одна цель вместо пары margin+hinge: нет hinge_weight, нет E_q-машинерии,
+        один forward вместо forward+E_q.
+        """
+        N, D = h.shape
+        logits = self.forward(h.reshape(1, N, D),
+                              None if h_emb is None else h_emb.reshape(1, N, D))
+        idx = torch.arange(N, device=logits.device)
+        s_y = logits[0, idx, targets]
+        return torch.logsumexp(logits[0], dim=-1) - s_y
+
     def argmax_hinge(self, h, targets, h_emb=None):
         """(N,) — шарнир против ИСТИННОГО argmax-конкурента (не среднего).
 

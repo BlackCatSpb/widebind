@@ -115,7 +115,7 @@ def csm_top1(model):
 
 csm_cfg = WideBindConfig(D=896, n_layers=4, mlp_groups=8, seq_len=64, batch_size=1,
                          lr=2e-4, amp_codec=True, vocab=64,
-                         amp_pred=True, amp_reg_weight=0.5)
+                         amp_pred=True, amp_obj='ce')
 torch.manual_seed(123)
 csm = WideBindStack(csm_cfg).to(device)
 torch.manual_seed(123)
@@ -138,7 +138,7 @@ print('  PASS: W_pred init ~ identity (diff < 0.05)')
 
 csm_opt = AmpAdam(build_amp_groups(csm, lr=2e-4, head_scale=1.0, embed_scale=0.5))
 csm_state, csm_gs, cx = None, None, None
-csm_nan, m1, h1 = False, None, None
+csm_nan, c1 = False, None
 for step in range(100):
     x, y = csm_sample(cx)
     cx = x[0, -1:]
@@ -147,11 +147,10 @@ for step in range(100):
     out, st, gl = csm(he, state=csm_state, global_state=csm_gs)
     mh = csm.lm_head
     hf, t, hef = out.reshape(-1, csm_cfg.D), y.reshape(-1), he.reshape(-1, csm_cfg.D)
-    margin = mh.margin_loss(hf, t, hef)
-    hinge = mh.argmax_hinge(hf, t, hef)
-    loss = margin.mean() + hinge.mean() + csm_cfg.amp_reg_weight * mh.code_reg(hf, t, hef).mean()
+    ce = mh.ce_loss(hf, t, hef)
+    loss = ce.mean()
     if step == 0:
-        m1, h1 = margin.mean().item(), hinge.mean().item()
+        c1 = ce.mean().item()
     if not torch.isfinite(loss):
         csm_nan = True
     loss.backward()
@@ -161,17 +160,16 @@ for step in range(100):
         csm_state = [(s[0].detach(), s[1].detach(), s[2].detach()) if s is not None else None for s in st]
         csm_gs = gl.detach()
 
-m60, h60 = margin.mean().item(), hinge.mean().item()
+c100 = ce.mean().item()
 son, soff, semb = [s.mean().item() for s in mh._sigmas()]
-acc60 = csm_top1(csm)
+acc100 = csm_top1(csm)
 assert not csm_nan, 'codec loss NaN'
 assert min(son, soff, semb) >= 0.2 - 1e-3, f'sigma floor нарушен: {son:.3f}/{soff:.3f}/{semb:.3f}'
-assert m60 < m1, f'margin не убывает: {m1:.3f} -> {m60:.3f}'
-assert h60 < h1, f'hinge не убывает: {h1:.3f} -> {h60:.3f}'
-assert acc60 > 0.03, f'top1 не поднялся выше шанса (1.56%): {acc60 * 100:.2f}%'
-print(f'  margin {m1:.3f}->{m60:.3f}, hinge {h1:.3f}->{h60:.3f}, '
-      f'top1={acc60 * 100:.2f}% (шанс 1.56%), sigma={son:.3f}/{soff:.3f}/{semb:.3f}')
-print('  PASS: codec учит counter, без NaN, sigma floor соблюдён')
+assert c100 < c1, f'CE не убывает: {c1:.4f} -> {c100:.4f}'
+assert acc100 > 0.03, f'top1 не поднялся выше шанса (1.56%): {acc100 * 100:.2f}%'
+print(f'  CE {c1:.3f}->{c100:.3f}, top1={acc100 * 100:.2f}% (шанс 1.56%), '
+      f'sigma={son:.3f}/{soff:.3f}/{semb:.3f}')
+print('  PASS: codec (CE+pred) учит counter, без NaN, sigma floor соблюдён')
 del csm, csm_plain, csm_opt
 
 # ─── Full checks (--full flag) ─────────────────────────────────────
@@ -362,7 +360,7 @@ for tag, kw in [('phasor', dict(amp_phasor=True)),
     del cm9
 
 # ─── Check 10: code_reg wiring via compute_losses ───
-print('\n--- Check 10: compute_losses == margin + hinge + reg (manual) ---')
+print('\n--- Check 10: compute_losses == margin + hinge + reg (manual), CE path ---')
 cc10 = WideBindConfig(D=256, n_layers=2, mlp_groups=4, seq_len=16, batch_size=1,
                       vocab=64, amp_codec=True, amp_pred=True, amp_reg_weight=0.5)
 cm10 = WideBindStack(cc10).to(device)
@@ -377,9 +375,17 @@ with torch.no_grad():
     manual10 = cm10.lm_head.margin_loss(hf10, t10, hef10).mean()
     manual10 = manual10 + cc10.amp_hinge_weight * cm10.lm_head.argmax_hinge(hf10, t10, hef10).mean()
     manual10 = manual10 + cc10.amp_reg_weight * cm10.lm_head.code_reg(hf10, t10, hef10).mean()
-check('compute_losses == margin+hinge+reg manual', abs(ce10.item() - manual10.item()) < 1e-4,
+check('compute_losses(mh) == margin+hinge+reg manual', abs(ce10.item() - manual10.item()) < 1e-4,
       f'ce={ce10.item():.4f} manual={manual10.item():.4f}')
-del cm10
+cc10ce = d_replace(cc10, amp_obj='ce')
+cm10ce = WideBindStack(cc10ce).to(device)
+cm10ce.eval()
+with torch.no_grad():
+    ce10c, _ = cm10ce.compute_losses(out10, x10, h_emb=he10)
+    manual10c = cm10ce.lm_head.ce_loss(hf10, t10, hef10).mean()
+check('compute_losses(ce) == ce_loss manual', abs(ce10c.item() - manual10c.item()) < 1e-4,
+      f'ce={ce10c.item():.4f} manual={manual10c.item():.4f}')
+del cm10, cm10ce
 
 # ─── Summary ───
 print(f'\n{"="*40}')

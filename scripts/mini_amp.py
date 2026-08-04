@@ -45,6 +45,10 @@ parser.add_argument('--sigma-min', type=float, default=None,
                     help='нижняя граница σ (cfg.amp_sigma_min, по умолчанию 0.2)')
 parser.add_argument('--freeze-backbone', action='store_true',
                     help='train только lm_head + embed (проверка: читаемо ли код из h_L)')
+parser.add_argument('--obj', choices=['mh', 'ce'], default='mh',
+                    help='mh = margin+hinge(+reg);  ce = одна CE-цель (S1 упрощение)')
+parser.add_argument('--no-echo', action='store_true',
+                    help='отключить код-канал (эхо записи) в счёте (S2 абляция)')
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -82,7 +86,7 @@ def top1(model, cfg, state=None):
         x, y = sample(args.task, cfg)
         h_emb = model.embed_tokens(x)
         out, st, gl = model(h_emb, state=state, global_state=None)
-        logits = model.lm_head(out, h_emb=h_emb)
+        logits = model.lm_head(out, None if args.no_echo else h_emb)
         acc = (logits.argmax(-1).reshape(-1) == y.reshape(-1)).float().mean().item()
     model.train()
     if args.recipe == 'carry' and st is not None:
@@ -134,6 +138,7 @@ def run(seed):
                          lr=args.lr, amp_codec=True, vocab=args.vocab,
                          amp_scale=args.amp_scale, amp_pred=args.pred_w,
                          amp_phasor=args.phasor, amp_hybrid=args.hybrid,
+                         amp_obj=args.obj,
                          amp_sigma_min=args.sigma_min if args.sigma_min is not None else 0.2)
     model = WideBindStack(cfg).to(device)
     if args.freeze_backbone:
@@ -167,14 +172,20 @@ def run(seed):
         hf = out.reshape(-1, cfg.D)
         t = y.reshape(-1)
         he = h.reshape(-1, cfg.D)
-        margin = mh.margin_loss(hf, t, he)
-        hinge = mh.argmax_hinge(hf, t, he)
-        loss = margin.mean() + args.hinge_weight * hinge.mean()
-        if args.reg_w > 0:
-            reg = mh.code_reg(hf, t, he)
-            loss = loss + args.reg_w * reg.mean()
+        hem = None if args.no_echo else he
+        if args.obj == 'ce':
+            ce = mh.ce_loss(hf, t, hem)
+            loss = ce.mean()
+            margin = hinge = reg = None
         else:
-            reg = None
+            margin = mh.margin_loss(hf, t, hem)
+            hinge = mh.argmax_hinge(hf, t, hem)
+            loss = margin.mean() + args.hinge_weight * hinge.mean()
+            if args.reg_w > 0:
+                reg = mh.code_reg(hf, t, hem)
+                loss = loss + args.reg_w * reg.mean()
+            else:
+                reg = None
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         if not torch.isfinite(loss):
@@ -192,7 +203,8 @@ def run(seed):
             gs = gl.detach()
         else:
             state, gs = None, None
-        mv = margin.mean().item()
+        mv = ce.mean().item() if args.obj == 'ce' else margin.mean().item()
+        metric = 'ce' if args.obj == 'ce' else 'margin'
         margin_min, margin_max = min(margin_min, mv), max(margin_max, mv)
         checks += 1
         if checks % 100 == 0 or step < 3:
@@ -200,7 +212,8 @@ def run(seed):
             d = head_diag(model)
             cf = code_fidelity(model, h, out, y)
             rv = reg.mean().item() if reg is not None else float('nan')
-            print(f'  step {step+1:5d}  margin={mv:8.3f} hinge={hinge.mean().item():6.3f} reg={rv:6.3f}  top1={acc*100:6.2f}%  '
+            hv = hinge.mean().item() if hinge is not None else float('nan')
+            print(f'  step {step+1:5d}  {metric}={mv:8.3f} hinge={hv:6.3f} reg={rv:6.3f}  top1={acc*100:6.2f}%  '
                   f'gnorm h/e/b={gn.get("head",0):.2f}/{gn.get("embed",0):.2f}/{gn.get("backbone",0):.2f}  '
                   f'son={d["son"]:.3f} soff={d["soff"]:.3f} semb={d["s_emb"]:.3f} '
                   f'gain=[{d["gain_min"]:.2f},{d["gain_max"]:.2f}] '
@@ -210,7 +223,7 @@ def run(seed):
     acc, _ = top1(model, cfg, est)
     d = head_diag(model)
     print(f'  time {dt:.1f}s ({args.steps/dt:.1f} steps/s)')
-    print(f'  FINAL top1={acc*100:.2f}%  margin range=[{margin_min:.3f}, {margin_max:.3f}]  nan={nan_flag}')
+    print(f'  FINAL top1={acc*100:.2f}%  {metric} range=[{margin_min:.3f}, {margin_max:.3f}]  nan={nan_flag}')
     print(f'  diag: son={d["son"]:.3f} soff={d["soff"]:.3f} semb={d["s_emb"]:.3f} '
           f'gain=[{d["gain_min"]:.2f},{d["gain_max"]:.2f}] gain_emb={d["gain_emb"]:.2f} '
           f'bias_max={d["bias_max"]:.2f} alpha_std={d["alpha_std"]:.3f} o_std={d["o_std"]:.3f}')

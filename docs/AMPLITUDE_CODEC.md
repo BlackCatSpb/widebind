@@ -73,10 +73,45 @@
    дрейфует вниз (0.115→0.061 за 2500) — для очень длинных прогонов желателен
    нижний предел амплитуды кода (TODO).
 
+## Математическое упрощение (2026-08-04): одна цель CE вместо margin+hinge+reg
+
+Структура факторизованного счёта: `s(v) = Σ_k[z·logN(a;α_vk,σon)+(1−z)·logN(a;o,σoff)] + эхо + bias(v)`.
+Три кандидата-цели:
+
+- margin = E_q[s] − s(y)  (зазор до среднего)
+- hinge  = max(0, s(w*) − s(y)), w*=argmax_{v≠y}  (зазор до argmax)
+- **CE = logΣexp(s) − s(y)**
+
+Тождества: `CE = hinge + log(1+Σ_{v≠w*}e^{s(v)−s(w*)}) ≥ hinge`, и
+`CE = margin + [logΣexp(s) − E_q s] ≥ margin` (неравенство log-sum-exp). CE
+доминирует обе цели: борется с argmax-конкурентом И требует остроты (член ≥ 0 —
+именно его не хватало margin-only, из-за чего коллапсил α). CE ≥ 0 всегда
+(нормировка мягкая), admissibility-ограничение σ не нужно, O(V·K) — без удорожания.
+
+**Батарея CE (counter V=64, 1500 шагов):**
+
+| Цель | 400/1500 top1 |
+|---|---|
+| margin+hinge+pred+reg (старый победитель) | 26.6% / 85.9% |
+| CE base | — / **85.9%** (без pred = старый трёхцелевой!) |
+| CE + pred | 35.9% / **93.75%** (mh+pred+reg достигал этого только к 2500) |
+| CE + pred + reg | 93.75% (reg нейтрален — не нужен) |
+| CE + pred, без эхо | 90.6% (эхо даёт +3pt — мягкий якорь счёта) |
+
+Перенос: **copy V=1024, 600 шагов: CE+pred = 96.88%** против mh+pred+reg = 93.75%.
+
+**Что упрощается:** одна цель `ce_loss` вместо margin_loss+argmax_hinge(+code_reg);
+нет hinge_weight; избыточная E_q-машинерия (μ,ν,p-статистики) не нужна для обучения;
+σ при CE РАСТЁТ (0.31→0.34 — острота идёт из счёта, а не из дрейфа σ). Сбоку:
+`project_mean` в AmpAdam избыточен (центрирование bias в forward уже обнуляет
+среднее градиента по цепному правилу), σ/gain-коробки уже head-side (в `_sigmas`/
+`_amps` на time forward), поэтому кодек совместим с любым Adam-оптимизатором.
+
 ## Рекомендуемая конфигурация (кодек)
 
 ```
-amp_codec=True, amp_pred=True, amp_reg_weight=0.5, amp_hinge_weight=1.0,
+amp_codec=True, amp_pred=True, amp_obj='ce',
+amp_hinge_weight=1.0 (для не-ce путей), amp_reg_weight=0.0,
 amp_sigma_min=0.2, amp_phasor=False, amp_hybrid=False
 ```
 
@@ -86,3 +121,4 @@ amp_sigma_min=0.2, amp_phasor=False, amp_hybrid=False
 - `b1e8bbf` — W_pred + code_reg, двухканальное чтение, counter-задача,
   фазоры, σ-пол CLI.
 - `02c6baa` — hybrid-код (отрицательный результат); перенос A+C на V=1024.
+- (далее) — `ce_loss` (S1), флаги `--obj/--no-echo`; симулятор + docs под CE.
