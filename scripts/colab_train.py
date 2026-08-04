@@ -197,7 +197,7 @@ def train(cfg, drive_path=None):
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 h = model.embed_tokens(x)
                 out, state, _ = model(h, state)
-                loss, _, _, _, _ = model.compute_loss(out, y)
+                loss = model.compute_loss(out, y, h_emb=h)
                 loss = loss / accum_steps
 
             if scaler:
@@ -292,7 +292,7 @@ def evaluate(model, streams, cfg, device):
             with torch.cuda.amp.autocast(enabled=device=='cuda'):
                 h = model.embed_tokens(x)
                 out, _, _ = model(h, None, adaptive=False)
-                loss, _, _, _, _ = model.compute_loss(out, y)
+                loss = model.compute_loss(out, y, h_emb=h)
             total_loss += loss.item()
             total_steps += 1
 
@@ -319,12 +319,17 @@ if __name__ == '__main__':
     parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
     parser.add_argument('--private-mem', action='store_true',
                         help='Enable private memory bank, contradiction gate & concept graph')
+    parser.add_argument('--head', type=str, default='partitioned', choices=['partitioned', 'codec'],
+                        help='LM head: partitioned (softmax-CE) or codec (SignedAmpCodec CE + W_pred + echo)')
+    parser.add_argument('--amp-obj', type=str, default='ce', choices=['ce', 'mh'],
+                        help='Codec objective: ce = one CE (confirmed recipe), mh = margin+hinge')
+    parser.add_argument('--no-amp-pred', action='store_true',
+                        help='Disable W_pred transition operator in codec head')
     args = parser.parse_args()
 
     cfg = WideBindConfig(
         D=args.D,
         n_layers=args.n_layers,
-        bottleneck=args.D,      # MLP = D for base bottleneck
         bind_K=args.bind_K,
         mlp_groups=args.mlp_groups,
         mlp_expand=args.mlp_expand,
@@ -342,6 +347,9 @@ if __name__ == '__main__':
         log_dir=args.drive_path or 'logs',
         grad_clip=0.5,
         conv_kernel=48,
+        amp_codec=(args.head == 'codec'),
+        amp_obj=args.amp_obj,
+        amp_pred=not args.no_amp_pred,
     )
 
     train(cfg, drive_path=args.drive_path)

@@ -205,9 +205,23 @@ class WideBindStack(nn.Module):
         """Token indices -> D-space vectors."""
         return self.embed(tokens)
     
-    def compute_loss(self, h, targets, pred_weight=None):
+    def compute_loss(self, h, targets, pred_weight=None, h_emb=None):
         """Returns CE only (aux losses applied via gradient scaling in training step)."""
-        ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight)
+        ce_loss, _ = self.compute_losses(h, targets, pred_weight=pred_weight, h_emb=h_emb)
+        return ce_loss
+
+    def _finalize_ce(self, ce, targets):
+        """Mask PAD/EOS (0, 2) и surprisal-weighting — единый хвост CE."""
+        mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
+        ce_m = ce * mask.float()
+        sw = getattr(self.cfg, 'surprisal_weight', 0.0)
+        if self.training and sw > 0:
+            with torch.no_grad():
+                ce_ratio = ce_m / (ce_m.mean() + 1e-8)
+                w = torch.sigmoid(2.0 * (ce_ratio - 1.0))
+            ce_loss = (ce_m * w).sum() / mask.sum().clamp(min=1)
+        else:
+            ce_loss = ce_m.sum() / mask.sum().clamp(min=1)
         return ce_loss
 
     def compute_losses(self, h, targets, pred_weight=None, h_emb=None):
@@ -230,7 +244,7 @@ class WideBindStack(nn.Module):
             he = None if h_emb is None else h_emb.reshape(-1, D)
             t = targets.reshape(-1)
             if getattr(self.cfg, 'amp_obj', 'mh') == 'ce':
-                ce_loss = self.lm_head.ce_loss(hf, t, he).mean()
+                ce_loss = self._finalize_ce(self.lm_head.ce_loss(hf, t, he), targets)
             else:
                 margin = self.lm_head.margin_loss(hf, t, he)
                 ce_loss = margin.mean()

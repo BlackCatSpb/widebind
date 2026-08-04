@@ -11,3 +11,7 @@ generation_output.txt
 *_report.html
 
 session_backup.json
+
+# Personal data
+eva_ai/
+*.7z

@@ -195,7 +195,7 @@ def train(cfg=None, resume_path=None):
             out, state, gs = model(h, state, global_state=gs, step=step)
             
             # Compute losses (raw, unweighted)
-            ce_loss, aux_dict = model.compute_losses(out, y)
+            ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
             
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
@@ -406,7 +406,7 @@ def evaluate(model, streams, cfg, device):
         x, y = x.to(device), y.to(device)
         h = model.embed_tokens(x)
         out, state, _ = model(h, state)
-        loss = model.compute_loss(out, y)
+        loss = model.compute_loss(out, y, h_emb=h)
         total_loss += loss.item()
         total_steps += 1
     
@@ -434,6 +434,12 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=1000)
     parser.add_argument('--save-interval', type=int, default=5000)
     parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
+    parser.add_argument('--head', type=str, default='partitioned', choices=['partitioned', 'codec'],
+                        help='LM head: partitioned (softmax-CE) or codec (SignedAmpCodec CE + W_pred + echo)')
+    parser.add_argument('--amp-obj', type=str, default='ce', choices=['ce', 'mh'],
+                        help='Codec objective: ce = one CE (confirmed recipe), mh = margin+hinge')
+    parser.add_argument('--no-amp-pred', action='store_true',
+                        help='Disable W_pred transition operator in codec head')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
@@ -453,6 +459,9 @@ if __name__ == '__main__':
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         scheduler=args.scheduler,
+        amp_codec=(args.head == 'codec'),
+        amp_obj=args.amp_obj,
+        amp_pred=not args.no_amp_pred,
     )
     
     train(cfg, resume_path=args.resume)
