@@ -47,6 +47,11 @@ class WideBindConfig:
                                     # требует σ_min > 0 (масштабная инвариантность);
                                     # 0.399 = граница допустимости likelihood для обычного CE
     amp_scale: float = 1.0          # масштаб записи в residual stream
+    amp_pred: bool = False          # механизм A: оператор перехода W_pred (K×K)
+    amp_phasor: bool = False        # «корни из единицы»: плотные cos/sin-коды (переходы = вращения)
+    amp_phase_amp: float = 0.8      # амплитуда фазовых кодов (до tanh)
+    amp_hinge_weight: float = 1.0   # вес argmax-hinge в compute_losses
+    amp_reg_weight: float = 0.0     # вес code_reg (механизм C; 0 = выкл)
     amp_seed: int = 0               # детерминизм базиса/прототипов
 
     # Mirror

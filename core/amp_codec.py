@@ -39,6 +39,35 @@ from .embedding import RotaryEmbedding
 _LOG2PI = math.log(2.0 * math.pi)
 
 
+def _amp_codes_proto(cfg, g):
+    """Коды и прототипы для кодекa.
+
+    Спаrsный режим: sparse_block_codes + случайные proto (значения ±, активность
+    по хеш-позициям). Фазовый режим (amp_phasor, «корни из единицы»): плотные
+    коды, proto = амплитуда cos/sin-пары: α_v,2j = A·cos(2π(j+1)v/V),
+    α_v,2j+1 = A·sin(2π(j+1)v/V). Переход «следующий токен» становится
+    ВРАЩЕНИЕМ пары — линейным в кодовых координатах; оператор W_pred (механика
+    A) может представить его точно. proto обучаем поверх формулы.
+    """
+    K = cfg.code_dim
+    if getattr(cfg, 'amp_phasor', False):
+        assert K % 2 == 0, 'amp_phasor требует чётное code_dim'
+        codes = torch.ones(cfg.vocab, K, dtype=torch.float)
+        pairs = K // 2
+        jj = (torch.arange(pairs, dtype=torch.float) + 1.0)
+        vv = torch.arange(cfg.vocab, dtype=torch.float)
+        phase = 2.0 * math.pi * torch.outer(vv, jj) / cfg.vocab
+        A = math.atanh(min(getattr(cfg, 'amp_phase_amp', 0.8), 0.999))
+        prot = torch.empty(cfg.vocab, K)
+        prot[:, 0::2] = A * torch.cos(phase)
+        prot[:, 1::2] = A * torch.sin(phase)
+        return codes, prot
+    codes = sparse_block_codes(cfg.vocab, K=K, S=cfg.code_sparsity)
+    init = getattr(cfg, 'amp_proto_init', 0.2)
+    prot = (torch.rand(cfg.vocab, K, generator=g) - 0.5) * 2 * init
+    return codes, prot
+
+
 class SignedAmpEmbedding(nn.Module):
     """Запись: токен -> D-вектор как сумма подписанных амплитуд по K осям.
 
@@ -49,24 +78,23 @@ class SignedAmpEmbedding(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
+        g = torch.Generator().manual_seed(getattr(cfg, 'amp_seed', 0))
+        codes, prot = _amp_codes_proto(cfg, g)
         self.K = codes.shape[1]
         self.S = cfg.code_sparsity
         self.register_buffer('codes', codes)
         D = cfg.D
         assert D % self.K == 0, f'D={D} must be divisible by K={self.K}'
         d = D // self.K
-        g = torch.Generator().manual_seed(getattr(cfg, 'amp_seed', 0))
         b = torch.randn(self.K, d, generator=g) * 0.5 / math.sqrt(d)
         # Единичные нормы строк: ⟨basis_k, basis_k⟩ = 1, поэтому прямое считывание
         # записанного кода равно α_k (без аттенюации на ‖basis‖²) при единичном
         # масштабе записи.
         b = b / b.norm(dim=-1, keepdim=True)
         self.basis = nn.Parameter(b)
-        init = getattr(cfg, 'amp_proto_init', 0.2)
         # proto хранит raw-логит; амплитуда α = tanh(raw) ∈ (−1,1) — ограничена,
         # поэтому квадратичный штраф (a−α)² ограничен: loss не может убежать.
-        self.proto = nn.Parameter((torch.rand(cfg.vocab, self.K, generator=g) - 0.5) * 2 * init)
+        self.proto = nn.Parameter(prot)
         self._scale = getattr(cfg, 'amp_scale', 1.0)
         self.rope = RotaryEmbedding(D,
                                     theta=getattr(cfg, 'rope_theta', 1000000.0),
@@ -90,7 +118,8 @@ class SignedAmpHead(nn.Module):
     def __init__(self, cfg, embed_basis=None, embed_proto=None):
         super().__init__()
         self.cfg = cfg
-        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
+        g = torch.Generator().manual_seed(getattr(cfg, 'amp_seed', 0))
+        codes, prot = _amp_codes_proto(cfg, g)
         self.K = codes.shape[1]
         self.register_buffer('codes', codes)
         if embed_basis is not None:
@@ -106,8 +135,7 @@ class SignedAmpHead(nn.Module):
             self._proto_ref = [embed_proto]
         else:
             g = torch.Generator().manual_seed(getattr(cfg, 'amp_seed', 0) + 2)
-            init = getattr(cfg, 'amp_proto_init', 0.2)
-            self._proto_ref = [nn.Parameter((torch.rand(cfg.vocab, self.K, generator=g) - 0.5) * 2 * init)]
+            self._proto_ref = [nn.Parameter(prot)]
         # gain стартует в 0.5: проекции стека большие (std ~1), раннее
         # насыщение tanh убило бы градиент; модель сама заостряет gain.
         self.log_gain = nn.Parameter(torch.full((self.K,), math.log(getattr(cfg, 'amp_gain_init', 0.5))))
@@ -118,6 +146,12 @@ class SignedAmpHead(nn.Module):
         # кода (std ~0.1), общий tanh утопил бы код. Поэтому каналы складываются
         # НА УРОВНЕ СЧЁТА (факторизованные лог-вероятности — аддитивны).
         self.log_gain_emb = nn.Parameter(torch.full((self.K,), math.log(getattr(cfg, 'amp_gain_init', 0.5))))
+        # Механизм A — оператор перехода в кодовом пространстве: контекстное
+        # чтение проходит через W_pred (K,K) перед gain. Для copy W_pred → I
+        # (init = I + ε); для переходов со структурой в кодах (напр. фазовые
+        # сдвиги) W_pred учит линейный оператор «код(t) → код(t+1)». Включается
+        # cfg.amp_pred; иначе применяется как есть (I).
+        self.pred_w = nn.Parameter(torch.eye(self.K) + 0.01 * torch.randn(self.K, self.K))
         self.o = nn.Parameter(torch.zeros(self.K))
         s0 = math.log(getattr(cfg, 'amp_sigma_init', 0.3))
         self.log_sigma_on = nn.Parameter(torch.full((self.K,), s0))
@@ -140,9 +174,13 @@ class SignedAmpHead(nn.Module):
 
     def _amps(self, h_g):
         # Контекстный канал: gain ограничен сверху — насыщение tanh гасит
-        # градиент, а не убегает.
+        # градиент, а не убегает. Если включён механизм A (amp_pred), чтение
+        # проходит через оператор перехода W_pred в кодовом пространстве.
+        z = self._proj(h_g)
+        if getattr(self.cfg, 'amp_pred', False):
+            z = torch.einsum('...k,kj->...j', z, self.pred_w)
         T = torch.exp(self.log_gain).clamp(0.1, 4.0)
-        z = self._proj(h_g) * T
+        z = z * T
         return torch.tanh(z), z
 
     def _code(self, h_emb_g):
@@ -226,6 +264,23 @@ class SignedAmpHead(nn.Module):
             code = -0.5 * ((pe - alpha) / semb) ** 2 - torch.log(semb) - 0.5 * _LOG2PI
             logp = logp + (z * code).sum(-1)
         return logp
+
+    def code_reg(self, h, targets, h_emb=None):
+        """(N,) — механизм C: регрессия контекстного чтения на код ЦЕЛИ.
+
+        ‖a − α_y‖² по активным позициям цели. В отличие от margin, здесь нет
+        компенсирующего члена E_q (который тянет a к среднему μ и ослабляет
+        градиент стека): чистое плотное притяжение чтения к коду следующего
+        токена. Учивает «переход»: для copy a→α_y=α_x; для counter/shift
+        a→α_{x+1} (стек должен преобразовать состояние).
+        """
+        N, D = h.shape
+        a, _ = self._amps(h.reshape(N, self.K, -1))
+        z = self.codes[targets].float()
+        alpha = torch.tanh(self.proto[targets]) * z
+        num = ((a - alpha) ** 2 * z).sum(-1)
+        den = z.sum(-1).clamp_min(1.0)
+        return num / den
 
     def argmax_hinge(self, h, targets, h_emb=None):
         """(N,) — шарнир против ИСТИННОГО argmax-конкурента (не среднего).

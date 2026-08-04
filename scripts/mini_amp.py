@@ -23,7 +23,7 @@ from core.amp_optim import build_amp_groups, AmpAdam
 parser = argparse.ArgumentParser()
 parser.add_argument('--steps', type=int, default=2000)
 parser.add_argument('--vocab', type=int, default=1024)
-parser.add_argument('--task', choices=['copy', 'shift', 'rand'], default='shift')
+parser.add_argument('--task', choices=['copy', 'shift', 'rand', 'counter'], default='shift')
 parser.add_argument('--recipe', choices=['carry', 'fresh'], default='carry')
 parser.add_argument('--seeds', type=int, default=1)
 parser.add_argument('--lr', type=float, default=2e-4)
@@ -33,6 +33,14 @@ parser.add_argument('--amp-scale', type=float, default=1.0,
                     help='масштаб записи кода в эмбеддинг (cfg.amp_scale)')
 parser.add_argument('--hinge-weight', type=float, default=1.0,
                     help='вес шарнира против истинного argmax-конкурента')
+parser.add_argument('--pred-w', action='store_true',
+                    help='механизм A: оператор перехода W_pred в кодовом пространстве')
+parser.add_argument('--phasor', action='store_true',
+                    help='«корни из единицы»: плотные cos/sin-коды (переходы = вращения)')
+parser.add_argument('--reg-w', type=float, default=0.0,
+                    help='механизм C: вес регрессии чтения на код цели')
+parser.add_argument('--sigma-min', type=float, default=None,
+                    help='нижняя граница σ (cfg.amp_sigma_min, по умолчанию 0.2)')
 parser.add_argument('--freeze-backbone', action='store_true',
                     help='train только lm_head + embed (проверка: читаемо ли код из h_L)')
 args = parser.parse_args()
@@ -46,7 +54,16 @@ print(f'head_scale={args.head_scale} embed_scale={args.embed_scale} '
 B, L = 1, 64
 
 
-def sample(task, cfg):
+def sample(task, cfg, prev=None):
+    if task == 'counter':
+        # Детерминированный ход по словарю: x_{t+1} = x_t + 1. Цель — НАСТОЯЩИЙ
+        # next-token: y_t = x_{t+1}. У перехода есть структура, выучить её можно
+        # и небольшим числом параметров (в отличие от shift-random, где y=x+1
+        # при случайном x — это словарь на V записей).
+        x0 = prev if prev is not None else torch.randint(0, cfg.vocab, (B, 1), device=device)
+        x = (x0 + torch.arange(L, device=device).unsqueeze(0)) % cfg.vocab
+        y = (x + 1) % cfg.vocab
+        return x, y
     x = torch.randint(0, cfg.vocab, (B, L), device=device)
     if task == 'copy':
         y = x.clone()
@@ -113,7 +130,9 @@ def run(seed):
     torch.manual_seed(seed)
     cfg = WideBindConfig(D=896, n_layers=4, mlp_groups=8, seq_len=L, batch_size=B,
                          lr=args.lr, amp_codec=True, vocab=args.vocab,
-                         amp_scale=args.amp_scale)
+                         amp_scale=args.amp_scale, amp_pred=args.pred_w,
+                         amp_phasor=args.phasor,
+                         amp_sigma_min=args.sigma_min if args.sigma_min is not None else 0.2)
     model = WideBindStack(cfg).to(device)
     if args.freeze_backbone:
         for name, p in model.named_parameters():
@@ -129,13 +148,16 @@ def run(seed):
 
     state, gs = None, None
     est = None
+    cx = None
     t0 = time.time()
     margin_min, margin_max = 1e9, -1e9
     nan_flag = False
     at_bound = {'sigma': 0, 'gain': 0, 'bias': 0}
     checks = 0
     for step in range(args.steps):
-        x, y = sample(args.task, cfg)
+        x, y = sample(args.task, cfg, cx)
+        if args.task == 'counter':
+            cx = x[0, -1:]  # продолжение счётчика между батчами
         opt.zero_grad()
         h = model.embed_tokens(x)
         out, st, gl = model(h, state=state, global_state=gs)
@@ -146,6 +168,11 @@ def run(seed):
         margin = mh.margin_loss(hf, t, he)
         hinge = mh.argmax_hinge(hf, t, he)
         loss = margin.mean() + args.hinge_weight * hinge.mean()
+        if args.reg_w > 0:
+            reg = mh.code_reg(hf, t, he)
+            loss = loss + args.reg_w * reg.mean()
+        else:
+            reg = None
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         if not torch.isfinite(loss):
@@ -170,7 +197,8 @@ def run(seed):
             acc, est = top1(model, cfg, est)
             d = head_diag(model)
             cf = code_fidelity(model, h, out, y)
-            print(f'  step {step+1:5d}  margin={mv:8.3f} hinge={hinge.mean().item():6.3f}  top1={acc*100:6.2f}%  '
+            rv = reg.mean().item() if reg is not None else float('nan')
+            print(f'  step {step+1:5d}  margin={mv:8.3f} hinge={hinge.mean().item():6.3f} reg={rv:6.3f}  top1={acc*100:6.2f}%  '
                   f'gnorm h/e/b={gn.get("head",0):.2f}/{gn.get("embed",0):.2f}/{gn.get("backbone",0):.2f}  '
                   f'son={d["son"]:.3f} soff={d["soff"]:.3f} semb={d["s_emb"]:.3f} '
                   f'gain=[{d["gain_min"]:.2f},{d["gain_max"]:.2f}] '
