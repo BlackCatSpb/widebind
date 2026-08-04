@@ -37,6 +37,8 @@ parser.add_argument('--pred-w', action='store_true',
                     help='механизм A: оператор перехода W_pred в кодовом пространстве')
 parser.add_argument('--phasor', action='store_true',
                     help='«корни из единицы»: плотные cos/sin-коды (переходы = вращения)')
+parser.add_argument('--hybrid', action='store_true',
+                    help='hybrid: sparse-позиции (разделение) + cos/sin (вращение)')
 parser.add_argument('--reg-w', type=float, default=0.0,
                     help='механизм C: вес регрессии чтения на код цели')
 parser.add_argument('--sigma-min', type=float, default=None,
@@ -131,7 +133,7 @@ def run(seed):
     cfg = WideBindConfig(D=896, n_layers=4, mlp_groups=8, seq_len=L, batch_size=B,
                          lr=args.lr, amp_codec=True, vocab=args.vocab,
                          amp_scale=args.amp_scale, amp_pred=args.pred_w,
-                         amp_phasor=args.phasor,
+                         amp_phasor=args.phasor, amp_hybrid=args.hybrid,
                          amp_sigma_min=args.sigma_min if args.sigma_min is not None else 0.2)
     model = WideBindStack(cfg).to(device)
     if args.freeze_backbone:

@@ -63,6 +63,27 @@ def _amp_codes_proto(cfg, g):
         prot[:, 1::2] = A * torch.sin(phase)
         return codes, prot
     codes = sparse_block_codes(cfg.vocab, K=K, S=cfg.code_sparsity)
+    if getattr(cfg, 'amp_hybrid', False):
+        assert K % 2 == 0, 'amp_hybrid требует чётное code_dim'
+        Ks = getattr(cfg, 'amp_hybrid_s', 6)   # sparse-позиции (разделение)
+        Kp = K - Ks                            # фазовые позиции (вращение)
+        assert Kp % 2 == 0 and Kp > 0, 'amp_hybrid: K-amp_hybrid_s должно быть чётным > 0'
+        gs = torch.Generator().manual_seed(getattr(cfg, 'amp_seed', 0) + 7)
+        codes = torch.zeros(cfg.vocab, K, dtype=torch.float)
+        for v in range(cfg.vocab):
+            idx = torch.randperm(Ks, generator=gs)[:cfg.code_sparsity]
+            codes[v, idx] = 1.0
+        pairs = Kp // 2
+        jj = (torch.arange(pairs, dtype=torch.float) + 1.0)
+        vv = torch.arange(cfg.vocab, dtype=torch.float)
+        phase = 2.0 * math.pi * torch.outer(vv, jj) / cfg.vocab
+        A = math.atanh(min(getattr(cfg, 'amp_phase_amp', 0.8), 0.999))
+        init = getattr(cfg, 'amp_proto_init', 0.2)
+        prot = torch.empty(cfg.vocab, K)
+        prot[:, :Ks] = (torch.rand(cfg.vocab, Ks, generator=g) - 0.5) * 2 * init
+        prot[:, Ks::2] = A * torch.cos(phase)
+        prot[:, Ks + 1::2] = A * torch.sin(phase)
+        return codes, prot
     init = getattr(cfg, 'amp_proto_init', 0.2)
     prot = (torch.rand(cfg.vocab, K, generator=g) - 0.5) * 2 * init
     return codes, prot
