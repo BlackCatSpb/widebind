@@ -13,13 +13,27 @@ from compression import FCF_CPR
 
 
 def load_russian_tokenizer(path=None):
-    """Load BPE tokenizer from russian_tokenizer/tokenizer.json."""
-    if path is None:
-        path = os.path.join(os.path.dirname(__file__), '..', '..', 'fcp')
-    tok_file = os.path.join(path, 'russian_tokenizer', 'tokenizer.json')
-    if not os.path.exists(tok_file):
-        tok_file = os.path.join(os.path.dirname(__file__), '..', 'fcp', 'russian_tokenizer', 'tokenizer.json')
-    if os.path.exists(tok_file):
+    """Load BPE tokenizer from russian_tokenizer/tokenizer.json.
+
+    Resolution order (first match wins):
+      1. explicit path
+      2. <repo>/wb/russian_tokenizer/tokenizer.json (65k vocab, current)
+      3. <repo>/wb/russian_tokenizer/tokenizer_v65536.json (65k, fallback)
+      4. <repo>/fcp/russian_tokenizer/tokenizer.json
+      5. ../fcp/russian_tokenizer/tokenizer.json
+    """
+    if path is not None:
+        tok_file = os.path.join(path, 'russian_tokenizer', 'tokenizer.json')
+    else:
+        repo = os.path.join(os.path.dirname(__file__), '..')
+        candidates = [
+            os.path.join(repo, 'wb', 'russian_tokenizer', 'tokenizer.json'),
+            os.path.join(repo, 'wb', 'russian_tokenizer', 'tokenizer_v65536.json'),
+            os.path.join(repo, 'fcp', 'russian_tokenizer', 'tokenizer.json'),
+            os.path.join(os.path.dirname(__file__), '..', '..', 'fcp', 'russian_tokenizer', 'tokenizer.json'),
+        ]
+        tok_file = next((p for p in candidates if os.path.exists(p)), None)
+    if tok_file and os.path.exists(tok_file):
         tok = Tokenizer.from_file(tok_file)
         tok.enable_padding(pad_id=0, pad_token='<|pad|>')
         tok.enable_truncation(max_length=512)
