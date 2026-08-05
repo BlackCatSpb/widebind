@@ -3,7 +3,7 @@ WideBind text generation.
 Uses HuggingFace tokenizer from the training data directory.
 """
 
-import os, sys, math, torch, json
+import os, sys, math, torch, json, inspect
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch.nn.functional as F
 from tokenizers import Tokenizer
@@ -54,6 +54,11 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     mind_log = []
     
     recent = set()
+    head = model.lm_head
+    try:
+        h_emb_ok = 'h_emb' in inspect.signature(head.forward).parameters
+    except (TypeError, ValueError):
+        h_emb_ok = False
     for step in range(max_new_tokens):
         ctx = tokens[-L:].unsqueeze(0)
         
@@ -70,7 +75,10 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
                       f'w_help={info.get("w_help",0):.4f} '
                       f'trust_diag={info.get("trust_diag_mean",0):.4f}')
         
-        logits = model.lm_head(out[:, -1:, :])[0, 0]
+        if h_emb_ok:
+            logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
+        else:
+            logits = head(out[:, -1:, :])[0, 0]
         logits = logits / temperature
         
         # Repetition penalty: subtract fixed penalty (sign-safe)
