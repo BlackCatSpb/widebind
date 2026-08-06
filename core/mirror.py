@@ -498,9 +498,9 @@ class GroupedCognitiveMirror(nn.Module):
         skip_alpha = torch.exp(self.log_skip_alpha).view(1, 1, G, 1)
         mirror = torch.tanh(linear) + skip_alpha * linear
         # Adaptive scale: prevents saturation when delta is large
-        delta_norm = delta.norm(dim=-1, keepdim=True).mean(dim=(0, 1), keepdim=True).detach().clamp(min=1e-8)
-        adapt_scale = 1.0 / (1.0 + 0.1 * delta_norm.squeeze(-1))
-        mirror = mirror * torch.exp(self.log_scale) * adapt_scale.unsqueeze(0).unsqueeze(0)
+        delta_norm = delta.norm(dim=-1).mean(dim=(0, 1)).detach().clamp(min=1e-8)  # (G,)
+        adapt_scale = (1.0 / (1.0 + 0.1 * delta_norm)).view(1, 1, -1, 1)  # (1, 1, G, 1)
+        mirror = mirror * torch.exp(self.log_scale) * adapt_scale
         
         # ─── K-Space Gate (per-token, per-expert) ───
         gate_signal = torch.abs(pred_error)  # (B, L, G, k)
