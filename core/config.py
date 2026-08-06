@@ -79,6 +79,7 @@ class WideBindConfig:
     # in-place updates; zero learnable parameters; the readout (if enabled) is
     # detached from autograd so NO gradient ever flows through this layer.
     collective_layer: bool = False
+    collective_layer_idx: int = None  # None = all layers
     collective_read_out: bool = False   # True = also add a (detached) memory read into the block signal
     collective_S: int = 8               # number of shared concept slots per layer
     collective_write_delay: int = 5000  # skip mining during warmup steps
