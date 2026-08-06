@@ -211,4 +211,152 @@ def _fibonacci_shifts(K: int, S: int) -> list:
     return shifts
 
 
+class SpiralBind(nn.Module):
+    def __init__(self, D, K, cfg):
+        super().__init__()
+        self.D, self.K = D, K
+        self.S = int(getattr(cfg, "bind_twist_S", 4))
+        self.W_proj = nn.Linear(D, K, bias=True)
+        self.w_bind_bias = nn.Parameter(torch.zeros(K))
+        if getattr(cfg, "bind_qk_norm", False):
+            self.hp_norm = nn.RMSNorm(K)
+        else:
+            self.hp_norm = nn.Identity()
+        self.w_u_re = nn.Parameter(torch.randn(self.S, K) * 0.3)
+        self.w_u_im = nn.Parameter(torch.zeros(self.S, K))
+        self.w_v_re = nn.Parameter(torch.randn(self.S, K) * 0.3)
+        self.w_v_im = nn.Parameter(torch.zeros(self.S, K))
+        tau_init = torch.log(torch.arange(1, K + 1, dtype=torch.float32) / K).unsqueeze(0).expand(self.S, -1).clone()
+        self.W_freq = nn.Parameter(tau_init)
+        self.W_phase = nn.Parameter(torch.randn(self.S, K) * 0.1)
+        self.W_out = nn.Parameter(torch.empty(2 * K, D))
+        nn.init.xavier_uniform_(self.W_out, gain=0.5)
+        self._tied = False
+
+    def forward(self, h):
+        hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
+        K = self.K
+        out_acc = None
+        for s in range(self.S):
+            freq = torch.exp(self.W_freq[s]).unsqueeze(0).unsqueeze(0)
+            phase = self.W_phase[s].unsqueeze(0).unsqueeze(0)
+            theta = freq * hp + phase
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            u_re = hp * self.w_u_re[s].unsqueeze(0).unsqueeze(0)
+            u_im = hp * self.w_u_im[s].unsqueeze(0).unsqueeze(0)
+            v_re = hp * self.w_v_re[s].unsqueeze(0).unsqueeze(0)
+            v_im = hp * self.w_v_im[s].unsqueeze(0).unsqueeze(0)
+            vr_re = v_re * cos_t - v_im * sin_t
+            vr_im = v_re * sin_t + v_im * cos_t
+            prod_re = u_re * vr_re - u_im * vr_im
+            prod_im = u_re * vr_im + u_im * vr_re
+            out_s = torch.cat([prod_re, prod_im], dim=-1)
+            out_acc = out_s if out_acc is None else out_acc + out_s
+        return out_acc @ self.W_out
+
+
+def _fib_sequence(n_max):
+    fibs = [1, 2]
+    while fibs[-1] + fibs[-2] < n_max:
+        fibs.append(fibs[-1] + fibs[-2])
+    return fibs
+
+
+def _zeckendorf_levels(t, max_levels=6):
+    fibs = _fib_sequence(100)[:max_levels]
+    weights = []
+    prev = -2
+    remaining = t
+    for f in fibs:
+        if f <= remaining and f > prev + 1:
+            weights.append(1.0 / f)
+            prev = f
+            remaining -= f
+        else:
+            weights.append(0.0)
+    w = torch.tensor(weights[:max_levels], dtype=torch.float32)
+    return w / (w.sum() + 1e-8)
+
+
+class TrajectorySpiralBind(nn.Module):
+    def __init__(self, D, K, cfg):
+        super().__init__()
+        self.D, self.K = D, K
+        self.S = int(getattr(cfg, "bind_twist_S", 4))
+        self.n_dims = int(getattr(cfg, "bind_traj_dims", 3))
+        self.W_proj = nn.Linear(D, K, bias=True)
+        self.w_bind_bias = nn.Parameter(torch.zeros(K))
+        if getattr(cfg, "bind_qk_norm", False):
+            self.hp_norm = nn.RMSNorm(K)
+        else:
+            self.hp_norm = nn.Identity()
+        self.w_u_re = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.3)
+        self.w_u_im = nn.Parameter(torch.zeros(self.S, self.n_dims, K))
+        self.w_v_re = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.3)
+        self.w_v_im = nn.Parameter(torch.zeros(self.S, self.n_dims, K))
+        tau_init = torch.log(torch.arange(1, K + 1, dtype=torch.float32) / K).unsqueeze(0).unsqueeze(0).expand(self.S, self.n_dims, -1).clone()
+        self.W_freq = nn.Parameter(tau_init)
+        self.W_phase = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.1)
+        self.register_buffer('_step_count', torch.zeros(1, dtype=torch.long))
+        self.hybrid_alpha_max = getattr(cfg, 'hybrid_alpha_max', 0.7)
+        self.hybrid_alpha_min = getattr(cfg, 'hybrid_alpha_min', 0.3)
+        self.W_out = nn.Parameter(torch.empty(self.n_dims * 2 * K, D))
+        nn.init.xavier_uniform_(self.W_out, gain=0.5)
+        self._tied = False
+
+    def _hybrid_alpha(self):
+        t = min(1.0, self._step_count.item() / 5000.0)
+        return self.hybrid_alpha_min + (self.hybrid_alpha_max - self.hybrid_alpha_min) * math.exp(-2.0 * t)
+
+    def _hrr_bind(self, a, b):
+        fa = torch.fft.rfft(a, dim=-1)
+        fb = torch.fft.rfft(b, dim=-1)
+        return torch.fft.irfft(fa * fb, n=a.shape[-1], dim=-1)
+
+    def _hybrid_bind(self, a, b):
+        alpha = self._hybrid_alpha()
+        hrr = self._hrr_bind(a, b)
+        ewise = a * b
+        return alpha * hrr + (1 - alpha) * ewise
+
+    def forward(self, h, traj_state=None):
+        if h.dim() == 2:
+            h = h.unsqueeze(0)
+        hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
+        B, L, K = hp.shape
+        self._step_count += 1
+        if traj_state is None or len(traj_state) < self.n_dims - 1:
+            n_have = 0 if traj_state is None else len(traj_state)
+            padding = [torch.zeros_like(hp) for _ in range(self.n_dims - 1 - n_have)]
+            traj = [hp] + (list(traj_state) if traj_state else []) + padding
+        else:
+            traj = [hp] + list(traj_state[:self.n_dims - 1])
+        out_acc = None
+        for s in range(self.S):
+            dim_outputs = []
+            for d in range(self.n_dims):
+                freq = torch.exp(self.W_freq[s, d]).unsqueeze(0).unsqueeze(0)
+                phase = self.W_phase[s, d].unsqueeze(0).unsqueeze(0)
+                theta = freq * hp + phase
+                cos_t = torch.cos(theta)
+                sin_t = torch.sin(theta)
+                u_re = hp * self.w_u_re[s, d].unsqueeze(0).unsqueeze(0)
+                u_im = hp * self.w_u_im[s, d].unsqueeze(0).unsqueeze(0)
+                v_re = traj[d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
+                v_im = traj[d] * self.w_v_im[s, d].unsqueeze(0).unsqueeze(0)
+                vr_re = v_re * cos_t - v_im * sin_t
+                vr_im = v_re * sin_t + v_im * cos_t
+                prod_re = u_re * vr_re - u_im * vr_im
+                prod_im = u_re * vr_im + u_im * vr_re
+                hybrid = self._hybrid_bind(u_re, v_re)
+                prod_re = prod_re + 0.1 * hybrid
+                dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
+            out_s = torch.cat(dim_outputs, dim=-1)
+            out_acc = out_s if out_acc is None else out_acc + out_s
+        result = out_acc @ self.W_out
+        new_traj = traj[1:]
+        return result, new_traj
+
+
 # ─── WideBind Block ────────────────────────────────────────────────────

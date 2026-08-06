@@ -155,7 +155,8 @@ class GroupedCognitiveMirror(nn.Module):
                 self.register_buffer('_prev_trust_matrix', torch.eye(G) * 0.5, persistent=False)
                 self.register_buffer('_meta_private_mem', torch.zeros(G), persistent=False)
         self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
-        self.register_buffer('_delta_var', torch.zeros(G), persistent=False)  # running EMA of delta var
+        self.register_buffer('_delta_var', torch.zeros(G), persistent=False)
+        self.register_buffer('_fwd_count', torch.zeros(1, dtype=torch.long), persistent=False)
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
@@ -465,27 +466,13 @@ class GroupedCognitiveMirror(nn.Module):
                 self._delta_var.mul_(ema_alpha).add_(dvar * (1.0 - ema_alpha))
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
         
-        # ─── Self-organizing usefulness (sigmoid + adaptive threshold) ───
-        # Каждый эксперт предсказывает свою полезность по delta (K-space correction).
-        # Sigmoid + median threshold: конкуренция без zero-sum (sum≠1).
-        # Эксперты выше медианы получают >0.5, ниже — <0.5.
-        usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)  # (B, L, G)
-        temp = self._usefulness_temp.clamp(min=0.1)
+        usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)
+        self._fwd_count += 1
+        prog = 1.0 - math.exp(-self._fwd_count.item() / 200.0)
+        temp = max(0.3, 3.0 * math.exp(-prog * 2.0))
         with torch.no_grad():
-            threshold = usefulness_logits.median(dim=-1, keepdim=True).values  # (B, L, 1)
+            threshold = usefulness_logits.median(dim=-1, keepdim=True).values
         usefulness = torch.sigmoid((usefulness_logits - threshold) / temp)
-        # Homeostatic temperature (after warmup): бинарная энтропия управляет остротой
-        if self.training:
-            with torch.no_grad():
-                override = self._alpha_override.item()
-                if override < 0.1:
-                    u_ent = -(usefulness * torch.log(usefulness + 1e-10) +
-                              (1 - usefulness) * torch.log(1 - usefulness + 1e-10))
-                    u_ent_mean = u_ent.sum(dim=-1).mean()
-                    target_ent = 0.75 * G * 0.693  # ~0.75*G*log(2)
-                    temp_err = u_ent_mean - target_ent
-                    self._usefulness_temp.data.add_(-0.001 * temp_err * self._usefulness_temp.data)
-                    self._usefulness_temp.data.clamp_(min=0.3, max=4.0)
 
 
         

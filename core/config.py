@@ -33,7 +33,8 @@ class WideBindConfig:
     # Zeckendorf Readout (experimental)
     zeckendorf_readout: bool = False  # True = replace LM head with Zeckendorf tree
 
-    # Embed
+    head_mode: str = "sigmoid_coded"
+    head_normalize: bool = True
     code_dim: int = 32
     code_sparsity: int = 6
 
@@ -57,13 +58,13 @@ class WideBindConfig:
     amp_obj: str = 'ce'             # 'ce' = одна CE (подтверждённый рецепт); 'mh' = margin+hinge(+reg)
     amp_seed: int = 0               # детерминизм базиса/прототипов
 
-    # Mirror
     mirror_k: int = 32
     mirror_k_staircase: bool = True  # True = k_l∈{8,16,32} по третям глубины
+    w_pred_scale_init: float = 3.0
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
     mlp_expand: int = 4
-    private_mem: bool = False  # cross-expert private memory bank (meta-cognitive layer)
+    private_mem: bool = True  # cross-expert private memory bank (meta-cognitive layer)
 
     # ─── Spec 1: Asymmetric expert init ───
     expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert
@@ -74,22 +75,16 @@ class WideBindConfig:
     # ─── Spec 3: Recursive meta-trust ───
     meta_trust: bool = True  # track trust dynamics, penalize unstable experts (requires private_mem)
 
-    # ─── Spec 4: Collective Concept Layer (memory of the expert collective) ───
-    # Pure memory: experiments are mined into shared slot banks via detached
-    # in-place updates; zero learnable parameters; the readout (if enabled) is
-    # detached from autograd so NO gradient ever flows through this layer.
-    collective_layer: bool = False
-    collective_layer_idx: int = None  # None = all layers
-    collective_read_out: bool = False   # True = also add a (detached) memory read into the block signal
-    collective_S: int = 8               # number of shared concept slots per layer
-    collective_write_delay: int = 5000  # skip mining during warmup steps
-    collective_maturity_warmup: int = 5000  # steps before bank maturity unlocks writes
-    collective_uncert_theta: float = 0.005  # uncertainty gate: above ⇒ too noisy to mine
-    collective_uncert_kappa: float = 0.10   # novelty gate: below ⇒ too well-known to mine
-    collective_contrast_thresh: float = 0.92  # contrastive rewrite if sim in [0.5, thresh]
-    collective_contrast_gain: float = 1.0
-    collective_birth_gap: float = 0.55   # eviction similarity gap vs mature slot
-    collective_maturity_frac: float = 0.85
+    collective_layer: bool = True
+    collective_layer_idx: int = None
+    collective_read_out: bool = False
+    collective_S: int = 8
+    collective_uncert_theta: float = 0.5
+    collective_uncert_kappa: float = 3.0
+    collective_contra_thresh: float = -0.1
+    collective_contra_gain: float = 6.0
+    collective_birth_gap: float = 0.55
+    collective_maturity_thresh: float = 0.12
 
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
     div_weight: float = 50.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
@@ -177,12 +172,14 @@ class WideBindConfig:
     rope_scaling: float = 1.0            # RoPE scaling factor (linear)
     mlp_swiglu: bool = True              # SwiGLU gate_proj parallel to up_proj (Qwen3-style)
 
-    # BottleneckBind twist: inter-channel bilinear mixing via golden-angle shifts
-    bind_twist_mode: str = "shift"        # "off" | "shift" | "cascade"
-    bind_twist_S: int = 4                # number of shifts (1 when mode=off)
-    bind_twist_ocular: str = "tied"      # "tied" | "multi" — per-shift W_out
-    bind_twist_scheme: str = "golden"    # "golden" | "fibonacci"
-    bind_twist_gate: bool = False        # per-token adaptive aperture via hp
+    bind_twist_mode: str = "trajectory_spiral"
+    bind_twist_S: int = 4
+    bind_traj_dims: int = 3
+    hybrid_alpha_max: float = 0.7
+    hybrid_alpha_min: float = 0.3
+    bind_twist_ocular: str = "tied"
+    bind_twist_scheme: str = "golden"
+    bind_twist_gate: bool = False
 
     # Gradient accumulation
     accum_steps: int = 1  # effective batch = batch_size * seq_len * accum_steps

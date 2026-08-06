@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .block import WideBindBlock
-from .embedding import ZeckendorfEmbedding, PartitionedEmbedding, LmHead, PartitionedHead
+from .embedding import ZeckendorfEmbedding, PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 from .zeckendorf_readout import ZeckendorfReadout
 from .amp_codec import SignedAmpEmbedding, SignedAmpHead
@@ -24,8 +24,14 @@ class WideBindStack(nn.Module):
                                          embed_proto=self.embed.proto)
         else:
             self.embed = PartitionedEmbedding(cfg)
+            head_mode = getattr(cfg, 'head_mode', 'partitioned')
             if getattr(cfg, 'zeckendorf_readout', False):
                 self.lm_head = ZeckendorfReadout(cfg)
+            elif head_mode == 'sigmoid_coded':
+                self.lm_head = SigmoidCodedHead(cfg, embed_basis=self.embed.basis)
+            elif head_mode == 'cognitive_coded':
+                self.lm_head = CognitiveCodedHead(cfg, embed_basis=self.embed.basis,
+                                                  k_mirror=cfg.mirror_k)
             else:
                 self.lm_head = PartitionedHead(cfg, embed_basis=self.embed.basis)
         

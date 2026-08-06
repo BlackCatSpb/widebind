@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
-from .bind import BottleneckBind
+from .bind import BottleneckBind, SpiralBind, TrajectorySpiralBind
 from .mirror import GroupedCognitiveMirror
 from .concept_layer import CollectiveConceptLayer
 from .mlp import GroupedMLP
@@ -36,8 +36,13 @@ class WideBindBlock(nn.Module):
         self.register_buffer('pre_ln_w', torch.ones(cfg.D))
         self.total_layers = cfg.n_layers
         
-        # ─── Bind: Fibonacci-twisted bottleneck ───
-        self.bind = BottleneckBind(cfg.D, cfg.bind_K, cfg)
+        bind_mode = getattr(cfg, "bind_twist_mode", "shift")
+        if bind_mode == "trajectory_spiral":
+            self.bind = TrajectorySpiralBind(cfg.D, cfg.bind_K, cfg)
+        elif bind_mode == "spiral":
+            self.bind = SpiralBind(cfg.D, cfg.bind_K, cfg)
+        else:
+            self.bind = BottleneckBind(cfg.D, cfg.bind_K, cfg)
 
         # Cognitive Mirror (32 эксперта, grouped K-space)
         if getattr(cfg, 'mirror_k_staircase', False):
@@ -120,23 +125,20 @@ class WideBindBlock(nn.Module):
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
                               swiglu=getattr(cfg, 'mlp_swiglu', True))
 
-        # ─── Collective Concept Layer (expert-memory bank, zero params) ───
         self.collective = None
         col_idx = getattr(cfg, 'collective_layer_idx', None)
         if getattr(cfg, 'collective_layer', False) and (col_idx is None or layer_idx == col_idx):
             self.collective = CollectiveConceptLayer(
                 cfg.D, self.mirror.k,
                 S=getattr(cfg, 'collective_S', 8),
-                write_delay=getattr(cfg, 'collective_write_delay', 5000),
-                maturity_warmup=getattr(cfg, 'collective_maturity_warmup', 5000),
-                uncert_theta=getattr(cfg, 'collective_uncert_theta', 0.005),
-                uncert_kappa=getattr(cfg, 'collective_uncert_kappa', 0.10),
-                contrast_thresh=getattr(cfg, 'collective_contrast_thresh', 0.92),
-                contrast_gain=getattr(cfg, 'collective_contrast_gain', 1.0),
+                uncert_theta=getattr(cfg, 'collective_uncert_theta', 0.5),
+                uncert_kappa=getattr(cfg, 'collective_uncert_kappa', 3.0),
+                contra_thresh=getattr(cfg, 'collective_contra_thresh', -0.1),
+                contra_gain=getattr(cfg, 'collective_contra_gain', 6.0),
                 birth_gap=getattr(cfg, 'collective_birth_gap', 0.55),
-                maturity_frac=getattr(cfg, 'collective_maturity_frac', 0.85),
-                read_out=getattr(cfg, 'collective_read_out', False),
+                maturity_thresh=getattr(cfg, 'collective_maturity_thresh', 0.12),
                 seed=7 * (layer_idx + 1),
+                cfg=cfg,
             )
     
     def forward(self, h, state=None, global_state=None,
@@ -191,8 +193,18 @@ class WideBindBlock(nn.Module):
         if _chk(h, 'conv'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         self._cache_conv_out = h_conv  # for branch_loss (with grad)
         
-        # ─── BottleneckBind (Fibonacci-twisted) ───
-        bind_out = self.bind(h)  # (B, L, D)
+        if isinstance(self.bind, TrajectorySpiralBind):
+            traj_state = getattr(self, '_traj_state', None)
+            bind_out, new_traj = self.bind(h, traj_state)
+            if traj_state is None:
+                self._traj_state = [t.detach() for t in new_traj]
+            else:
+                self._traj_state = [
+                    0.9 * old.detach() + 0.1 * new.detach()
+                    for old, new in zip(traj_state, new_traj)
+                ]
+        else:
+            bind_out = self.bind(h)
         if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
@@ -353,14 +365,13 @@ class WideBindBlock(nn.Module):
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
         if self.collective is not None:
-            # Collective memory: reads are DETACHED constants added to the
-            # residual; writes are no_grad in-place. No gradient through it.
             hp_c = self.mirror._cached_hp
             pen_c = self.mirror._cached_pred_error_norm
-            if hp_c is not None and pen_c is not None and self.training:
+            if hp_c is not None and pen_c is not None:
                 col_out = self.collective(
-                    h, hp_c, pen_c, resvar=self.mirror._residual_var_ema.mean().item(),
-                    allow_write=True, step=step)
+                    h, hp_c, pen_c,
+                    resvar=self.mirror._residual_var_ema.mean().item(),
+                    allow_write=self.training)
                 if col_out is not None:
                     enhanced = enhanced + col_out
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)

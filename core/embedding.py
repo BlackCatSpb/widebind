@@ -160,4 +160,213 @@ class PartitionedHead(nn.Module):
         return scores @ self.codes.T + self.token_bias.unsqueeze(0).unsqueeze(0)
 
 
+class SigmoidCodedHead(nn.Module):
+    def __init__(self, cfg, embed_basis=None):
+        super().__init__()
+        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
+        self.K = codes.shape[1]
+        self.S = cfg.code_sparsity
+        self.register_buffer('codes', codes)
+        D = cfg.D
+        assert D % self.K == 0
+        d = D // self.K
+        if embed_basis is not None:
+            self.readout = embed_basis
+        else:
+            self.readout = nn.Parameter(torch.randn(self.K, d))
+            nn.init.xavier_uniform_(self.readout, gain=0.5)
+        prop = codes.mean(dim=0)
+        self.register_buffer('_prop', prop)
+        self.bit_bias = nn.Parameter(torch.zeros(self.K))
+        self.log_temp = nn.Parameter(torch.zeros(self.K))
+        self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
+        self.normalize = bool(getattr(cfg, 'head_normalize', True))
+
+    def _gates(self, h, temp_factor=None):
+        if h.dim() == 2:
+            h = h.unsqueeze(1)
+            squeeze = True
+        else:
+            squeeze = False
+        B, L, D = h.shape
+        h_g = h.reshape(B, L, self.K, -1)
+        z = torch.einsum('blkd,kd->blk', h_g, self.readout)
+        T = torch.exp(self.log_temp).clamp_min(0.1)
+        if temp_factor is not None:
+            T = T * temp_factor
+        zt = z / T + self.bit_bias
+        if squeeze:
+            zt = zt.squeeze(1)
+        return zt
+
+    def _su(self, zt):
+        sig = torch.sigmoid(zt)
+        ls = torch.log(sig.clamp_min(1e-9))
+        lms = torch.log((1 - sig).clamp_min(1e-9))
+        u = ls - lms
+        base = lms.sum(-1)
+        return u, base
+
+    def forward(self, h):
+        if h.dim() == 2:
+            h = h.unsqueeze(1)
+            squeeze = True
+        else:
+            squeeze = False
+        u, base = self._su(self._gates(h))
+        logits = u @ self.codes.T + base[..., None] + self.token_bias
+        if self.normalize:
+            logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+        if squeeze:
+            logits = logits.squeeze(1)
+        return logits
+
+    def log_probs_for_target(self, h, targets):
+        if h.dim() == 2:
+            h_2d = True
+            h_in = h.unsqueeze(1)
+        else:
+            h_2d = False
+            h_in = h
+        if self.normalize:
+            raw = self.forward(h_in)
+            if h_2d:
+                return raw[0, 0, targets] + self.token_bias[targets]
+            idx = torch.arange(raw.shape[1], device=raw.device)
+            return raw[:, idx, targets] + self.token_bias[targets]
+        zt = self._gates(h_in)
+        sig = torch.sigmoid(zt)
+        ls = torch.log(sig.clamp_min(1e-9))
+        lms = torch.log((1 - sig).clamp_min(1e-9))
+        c = self.codes[targets].float()
+        if h_2d:
+            c = c.unsqueeze(1)
+        logp = (c * ls).sum(-1) + ((1 - c) * lms).sum(-1)
+        return logp + self.token_bias[targets]
+
+
+class CognitiveCodedHead(nn.Module):
+    def __init__(self, cfg, embed_basis=None, k_mirror=32):
+        super().__init__()
+        codes = sparse_block_codes(cfg.vocab, K=cfg.code_dim, S=cfg.code_sparsity)
+        self.K = codes.shape[1]
+        self.S = cfg.code_sparsity
+        self.d = cfg.D // self.K
+        self.vocab = cfg.vocab
+        self.normalize = bool(getattr(cfg, 'head_normalize', True))
+        self._k_mirror = k_mirror
+        self.register_buffer('codes', codes)
+        if embed_basis is not None:
+            self.readout = embed_basis
+            self.tie_readout = True
+        else:
+            self.readout = nn.Parameter(torch.randn(self.K, self.d))
+            nn.init.xavier_uniform_(self.readout, gain=0.5)
+            self.tie_readout = False
+        self.log_temp_base = nn.Parameter(torch.zeros(self.K))
+        self.w_res = nn.Parameter(torch.tensor(0.5))
+        self.w_stab = nn.Parameter(torch.tensor(0.1))
+        prop = codes.float().mean(dim=0).clamp(1e-7, 1 - 1e-7)
+        self.bit_bias = nn.Parameter(torch.log(prop / (1 - prop)))
+        self.W_q_prior = nn.Parameter(torch.randn(self.d, 1) * 0.01)
+        self.W_k_prior = nn.Parameter(torch.randn(k_mirror, 1) * 0.01)
+        self.alpha_prior = nn.Parameter(torch.tensor(0.2))
+        self.w_prior_scale = nn.Parameter(torch.ones(1))
+        self.beta_social = nn.Parameter(torch.tensor(0.1))
+        self.w_energy = nn.Parameter(torch.tensor(0.1))
+        self.resonance_floor = 0.5
+        self.gamma = nn.Parameter(torch.tensor(0.1))
+        self.W_code_mod = nn.Parameter(torch.randn(self.K, self.d, 1) * 0.01)
+        self.token_shift_embed = nn.Embedding(cfg.vocab, 8)
+        self.proj_shift = nn.Linear(8, self.K, bias=False)
+        nn.init.normal_(self.token_shift_embed.weight, std=0.01)
+        self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
+        self._pred_error = None
+        self._private_mem = None
+        self._trust_matrix = None
+        self._contra_graph = None
+        self._dominance = None
+
+    def set_cognitive_state(self, pred_error=None, private_mem=None,
+                            trust_matrix=None, contra_graph=None, dominance=None):
+        self._pred_error = pred_error
+        self._private_mem = private_mem
+        self._trust_matrix = trust_matrix
+        self._contra_graph = contra_graph
+        self._dominance = dominance
+
+    def _compute_z(self, h, B, L, device):
+        h_g = h.reshape(B, L, self.K, self.d)
+        z_raw = torch.einsum('blkd,kd->blk', h_g, self.readout)
+        if self._pred_error is not None:
+            pe = self._pred_error.float()
+            e_pred = pe.mean(dim=(0, 1)) if pe.ndim > 1 else pe
+        else:
+            e_pred = torch.zeros(self.K, device=device, dtype=h.dtype)
+        if self._private_mem is not None and self._private_mem.shape[1] == self._k_mirror:
+            stab = self._private_mem.float().var(dim=1)
+        else:
+            stab = torch.zeros(self.K, device=device, dtype=h.dtype)
+        tau = self.log_temp_base + self.w_res * e_pred - self.w_stab * stab
+        T = torch.exp(tau).clamp(0.3, 5.0)
+        if self._private_mem is not None and self._private_mem.shape[1] == self._k_mirror:
+            pm = self._private_mem.float()
+        else:
+            pm = torch.zeros(self.K, self._k_mirror, device=device, dtype=h.dtype)
+        key = pm @ self.W_k_prior
+        query = torch.einsum('blkd,dq->blk', h_g, self.W_q_prior).squeeze(-1)
+        attn = torch.einsum('blk,km->blm', query, key).squeeze(-1)
+        prior = self.bit_bias + self.alpha_prior * torch.tanh(attn.unsqueeze(-1) * self.w_prior_scale)
+        if self._dominance is not None:
+            dom = self._dominance.float()
+        else:
+            dom = torch.ones(self.K, device=device, dtype=h.dtype)
+        if self._contra_graph is not None:
+            contra_avg = self._contra_graph.float().mean(dim=1)
+        else:
+            contra_avg = torch.zeros(self.K, device=device, dtype=h.dtype)
+        social_bias = torch.tanh(self.beta_social * (dom - contra_avg))
+        if self.tie_readout and self.readout.ndim == 2 and self.readout.shape[-1] == self.d:
+            wb = self.readout.detach()
+            energy = ((h_g - wb.unsqueeze(0).unsqueeze(0)) ** 2).sum(dim=-1)
+            res = (1.0 + self.w_energy * torch.tanh(-energy)).clamp(self.resonance_floor, 2.0)
+        else:
+            res = 1.0
+        ctx = torch.tanh(torch.einsum('blkd,kdm->blk', h_g, self.W_code_mod))
+        z = z_raw * res
+        z = z / T.unsqueeze(0).unsqueeze(0)
+        z = z * (1.0 + self.gamma * ctx)
+        z = z + prior + social_bias.unsqueeze(0).unsqueeze(0)
+        base = F.logsigmoid(-z).sum(dim=-1)
+        return z, base
+
+    def _shift_all(self):
+        delta = self.proj_shift(self.token_shift_embed.weight)
+        return (self.codes * delta).sum(dim=1)
+
+    def _shift_targets(self, token_ids):
+        delta = self.proj_shift(self.token_shift_embed(token_ids))
+        c = self.codes[token_ids]
+        return (c * delta).sum(dim=-1)
+
+    def forward(self, h):
+        B, L, _ = h.shape
+        z, base = self._compute_z(h, B, L, h.device)
+        raw = z @ self.codes.T + base.unsqueeze(-1) + self.token_bias + self._shift_all()
+        if self.normalize:
+            raw = raw - raw.logsumexp(dim=-1, keepdim=True)
+        return raw
+
+    def log_probs_for_target(self, h, targets):
+        B, L, _ = h.shape
+        z, base = self._compute_z(h, B, L, h.device)
+        c = self.codes[targets]
+        score = (c * z).sum(dim=-1) + base + self.token_bias[targets] + self._shift_targets(targets)
+        if not self.normalize:
+            return score
+        raw = self.forward(h)
+        logZ = raw.logsumexp(dim=-1)
+        return score - logZ
+
+
 # ─── Grouped Cognitive Mirror (32 эксперта) ────────────────────────────
