@@ -494,8 +494,20 @@ class WideBindStack(nn.Module):
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
+        pred_w_loss = 0.0
+        n_pred_w = 0
+        head = getattr(self, 'lm_head', None)
+        if head is not None and hasattr(head, 'pred_w'):
+            pw = head.pred_w
+            if pw.ndim == 2:
+                pred_w_loss = F.mse_loss(pw, torch.eye(pw.shape[0], device=pw.device))
+                n_pred_w += 1
+
         aux_dict = {}
         w_pred = getattr(self.cfg, 'pred_weight', 0.0) or 0.01
+        w_pred_w = getattr(self.cfg, 'pred_w_weight', 0.01)
+        if pred_w_loss != 0 and w_pred_w > 0:
+            aux_dict['pred_w'] = pred_w_loss * w_pred_w
         if pred_loss != 0:
             aux_dict['pred'] = pred_loss * w_pred
         w_gate = getattr(self.cfg, 'gate_l1_weight', 0.0001)
@@ -630,7 +642,7 @@ class WideBindStack(nn.Module):
                                               '.log_grad_mod_scale', '.grad_mod_bias']):
                     # Mirror projections, alpha, gates -> mirror LR (1.84x)
                     # alpha_diag is gate-like (G,K) diagonal -> never weight-decayed
-                    k = 'mirror_wd' if (p.ndim >= 2 and '.alpha_diag' not in name) else 'mirror'
+                    k = 'mirror_wd' if (p.ndim >= 2 and '.alpha_diag' not in name and '.log_scale' not in name) else 'mirror'
                     groups[k]['params'].append(p)
                 elif '.mlp.' in name or '.bind.W_proj.weight' in name or name.endswith('.W_out') or name.endswith('.W_proj'):
                     # Block-level W_proj/W_out (not mirror, caught above) -> mlp speed (0.54x)
@@ -954,15 +966,21 @@ class MirrorLRScheduler:
         pass
 
     def report_val_loss(self, val_loss):
-        """Report validation loss — halve _loss_lr_factor when val loss regresses >2%.
-        This implements ReduceLROnPlateau semantics on top of the mirror-based schedule."""
+        """Adaptive LR: λ_d-scaled thresholds, EMA-based improvement detection."""
         if not hasattr(self, '_best_val_loss'):
             self._best_val_loss = val_loss
             self._loss_lr_factor = 1.0
-        if val_loss < self._best_val_loss * 0.998:
+            self._loss_ema = val_loss
+        if not hasattr(self, '_loss_ema'):
+            self._loss_ema = val_loss
+        self._loss_ema = 0.9 * self._loss_ema + 0.1 * val_loss
+        lam = getattr(self.cfg, 'lambda_d', 3)
+        improve_thresh = 1.0 - 1.0 / (lam ** 2)
+        regress_thresh = 1.0 + 1.0 / (lam ** 4)
+        if val_loss < self._best_val_loss * improve_thresh:
             self._best_val_loss = val_loss
-            self._loss_lr_factor = min(1.0, self._loss_lr_factor * 1.1)
-        elif val_loss > self._best_val_loss * 1.02:
+            self._loss_lr_factor = min(1.0, self._loss_lr_factor * 1.05)
+        elif val_loss > self._loss_ema * regress_thresh:
             self._loss_lr_factor = max(0.05, self._loss_lr_factor * 0.5)
 
     def step(self):

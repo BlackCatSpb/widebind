@@ -200,7 +200,10 @@ class SignedAmpHead(nn.Module):
         z = self._proj(h_g)
         if getattr(self.cfg, 'amp_pred', False):
             z = torch.einsum('...k,kj->...j', z, self.pred_w)
-        T = torch.exp(self.log_gain).clamp(0.1, 4.0)
+        # Adaptive gain: scale inversely with pre-activation magnitude (anti-saturation)
+        z_abs_mean = z.abs().mean().detach()
+        adapt_gain = 1.0 / (1.0 + z_abs_mean)
+        T = torch.exp(self.log_gain).clamp(0.1, 4.0) * adapt_gain
         z = z * T
         return torch.tanh(z), z
 
@@ -209,16 +212,30 @@ class SignedAmpHead(nn.Module):
         T = torch.exp(self.log_gain_emb).clamp(0.1, 4.0)
         return self._proj(h_emb_g) * T
 
+    def _uncertainty_gate(self):
+        """Adaptive uncertainty: high loss variance -> high sigma (exploration)."""
+        if not hasattr(self, '_loss_ema'):
+            self.register_buffer('_loss_ema', torch.ones(1))
+            self.register_buffer('_loss_var', torch.ones(1))
+        mean_unc = self._loss_var.item() / (self._loss_ema.item() + 1e-8)
+        base = F.softplus(self.log_sigma_on) + 0.05
+        return torch.clamp(base * (1.0 + 0.5 * mean_unc), min=0.2, max=1.0)
+
+    def update_uncertainty(self, per_token_loss):
+        """Call after loss computation to update adaptive sigma."""
+        if not hasattr(self, '_loss_ema'):
+            self.register_buffer('_loss_ema', torch.ones(1))
+            self.register_buffer('_loss_var', torch.ones(1))
+        batch_mean = per_token_loss.mean().detach()
+        batch_var = per_token_loss.var().detach()
+        self._loss_ema.mul_(0.99).add_(batch_mean, alpha=0.01)
+        self._loss_var.mul_(0.99).add_(batch_var, alpha=0.01)
+
     def _sigmas(self):
-        # σ ограничена [σ_min, 1.0]. Для обычного likelihood нужна допустимость
-        # правдоподобия: σ ≥ 1/√(2π) ≈ 0.399, иначе пик N > 1 и logP цели может
-        # стать положительным (читерский CE<0). Для маржинальной цели
-        # масштабная инвариантность сама гасит инфляцию, нужен только σ_min > 0
-        # (иначе margin → −∞ при σ→0). Меньший σ_min = острее ранжирование.
+        """Adaptive sigma: scales with prediction uncertainty."""
+        s_base = self._uncertainty_gate()
         s_min = getattr(self.cfg, 'amp_sigma_min', 0.2)
-        return (torch.clamp(F.softplus(self.log_sigma_on) + 0.05, min=s_min, max=1.0),
-                torch.clamp(F.softplus(self.log_sigma_off) + 0.05, min=s_min, max=1.0),
-                torch.clamp(F.softplus(self.log_sigma_emb) + 0.05, min=s_min, max=1.0))
+        return (s_base, s_base.clone(), torch.clamp(F.softplus(self.log_sigma_emb) + 0.05, min=s_min, max=1.0))
 
     def _bias(self):
         # центрирование по всем токенам (убирает свободный сдвиг log-счёта)

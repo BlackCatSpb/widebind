@@ -122,7 +122,8 @@ class WideBindBlock(nn.Module):
 
         # ─── Collective Concept Layer (expert-memory bank, zero params) ───
         self.collective = None
-        if getattr(cfg, 'collective_layer', False):
+        col_idx = getattr(cfg, 'collective_layer_idx', None)
+        if getattr(cfg, 'collective_layer', False) and (col_idx is None or layer_idx == col_idx):
             self.collective = CollectiveConceptLayer(
                 cfg.D, self.mirror.k,
                 S=getattr(cfg, 'collective_S', 8),

@@ -155,6 +155,8 @@ class WideBindConfig:
     nuclear_weight: float = 1e-5  # stochastic ||W||_* weight (0=disabled)
     # Orthogonality regularization for bottleneck bind
     orth_weight: float = 1e-4  # ||Ŵ^TŴ - I||² weight (0=disabled)
+    pred_w_weight: float = 0.01  # MSE(pred_w, I) weight (prevents diagonal decay)
+    amp_proto_lr_mult: float = 5.0  # LR multiplier for proto (sparse updates)
     # Surprisal-weighted loss: focus on informative tokens
     surprisal_weight: float = 0.0  # γ, 0=disabled, 0.5=mild, 1.0=aggressive
 
