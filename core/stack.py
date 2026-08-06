@@ -928,6 +928,7 @@ class MirrorLRScheduler:
                  target_var=0.161, mag_threshold=0.296, lr_min_ratio=0.026,
                  max_decay_steps=2584, var_min_for_lr_decay=0.008,
                  cfg=None):
+        self.cfg = cfg
         if cfg is not None:
             base_lr = base_lr or cfg.lr
             warmup = getattr(cfg, 'warmup_steps', warmup)
