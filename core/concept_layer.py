@@ -49,6 +49,7 @@ class CollectiveConceptLayer(nn.Module):
         self.register_buffer('_mature', torch.zeros(1))
         self.register_buffer('_gate_u', torch.zeros(1))
         self.register_buffer('_gate_c', torch.zeros(1))
+        self._last_write_step = -1
 
         self.W_o = nn.Linear(S * k, D, bias=False)
         nn.init.orthogonal_(self.W_o.weight)
@@ -98,6 +99,7 @@ class CollectiveConceptLayer(nn.Module):
         conf = torch.sigmoid(-pen)
         conf_thresh = conf.median().clamp(min=0.01)
 
+        did_write = False
         for s in range(self.S):
             mask = (best == s) & (conf >= conf_thresh)
             if mask.any():
@@ -109,6 +111,7 @@ class CollectiveConceptLayer(nn.Module):
                     self.M.data[s] = F.normalize(
                         self.M[s] * (1 - alpha) + upd * alpha, dim=-1)
                 self.N_s[s] += mask.sum().item()
+                did_write = True
 
         empty = torch.nonzero(self.N_s == 0)
         novel = (d_min > self._birth_gap * 0.2) & (conf >= conf_thresh)
@@ -116,11 +119,16 @@ class CollectiveConceptLayer(nn.Module):
             idx = empty[0].item()
             self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
             self.N_s[idx] += 1
+            did_write = True
         elif empty.numel() == 0 and novel.any():
             evict = int(torch.argmin(self.U_s).item())
             self.M.data[evict] = F.normalize(shared[novel].mean(dim=0), dim=-1)
             self.N_s[evict] = 1
             self.U_s[evict] = 0.0
+            did_write = True
+
+        if did_write:
+            self._last_write_step = int(self._step.item())
 
         occ = torch.zeros(self.S)
         for s in range(self.S):
