@@ -326,12 +326,20 @@ class TrajectorySpiralBind(nn.Module):
         hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
         B, L, K = hp.shape
         self._step_count += 1
+
+        # Build trajectory: use traj_state only if sequence length matches
+        if traj_state is not None:
+            state_L = traj_state[0].shape[1]
+            if state_L != L:
+                traj_state = None
+
         if traj_state is None or len(traj_state) < self.n_dims - 1:
             n_have = 0 if traj_state is None else len(traj_state)
             padding = [torch.zeros_like(hp) for _ in range(self.n_dims - 1 - n_have)]
             traj = [hp] + (list(traj_state) if traj_state else []) + padding
         else:
             traj = [hp] + list(traj_state[:self.n_dims - 1])
+
         out_acc = None
         for s in range(self.S):
             dim_outputs = []
