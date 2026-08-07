@@ -4,35 +4,21 @@ sys.path.insert(0, '.')
 from core import WideBindConfig, WideBindStack
 
 ckpt = torch.load('checkpoints/best.pt', map_location='cpu', weights_only=False)
-old_cfg = ckpt['cfg']
+cfg = ckpt['cfg']
 
-print('=== Old checkpoint config ===')
-print(f'D={old_cfg.D}, L={old_cfg.n_layers}, bind_K={old_cfg.bind_K}')
-print(f'vocab={old_cfg.vocab}, mlp_groups={old_cfg.mlp_groups}')
-print(f'amp_codec={old_cfg.amp_codec}')
-print(f'head_mode: {getattr(old_cfg, "head_mode", "N/A")}')
-print(f'bind_twist_mode: {getattr(old_cfg, "bind_twist_mode", "N/A")}')
-print(f'private_mem={old_cfg.private_mem}')
-print(f'collective_layer={old_cfg.collective_layer}')
+print(f"step={ckpt.get('step')}, val_loss={ckpt.get('best_val_loss'):.4f}")
+print(f"Config: D={cfg.D}, L={cfg.n_layers}, bind_K={cfg.bind_K}, vocab={cfg.vocab}")
+print(f"head_mode={cfg.head_mode}, bind_twist_mode={cfg.bind_twist_mode}")
+print(f"collective_layer={cfg.collective_layer}, private_mem={cfg.private_mem}")
 
-cfg = WideBindConfig(
-    D=2560, n_layers=24, bind_K=32, vocab=65536, mlp_groups=32,
-    mlp_expand=4, seq_len=128, lr=3e-4, max_steps=300000,
-    warmup_steps=101, scheduler='mirror', private_mem=True,
-    expert_asymmetry=True, meta_trust=True, grad_clip=0.5,
-    head_mode='sigmoid_coded', head_normalize=True,
-    bind_twist_mode='trajectory_spiral', bind_traj_dims=3,
-    hybrid_alpha_max=0.7, hybrid_alpha_min=0.3, w_pred_scale_init=3.0,
-    collective_layer=True, collective_uncert_theta=0.5,
-    collective_uncert_kappa=3.0, collective_contra_thresh=-0.1,
-    collective_contra_gain=6.0, collective_maturity_thresh=0.12,
-)
-cfg.lambda_d_enabled = False
+# Try loading
+model = WideBindStack(cfg)
+n_params = sum(p.numel() for p in model.parameters())
+print(f"\nModel params: {n_params:,} ({n_params/1e6:.2f}M)")
 
-new_model = WideBindStack(cfg)
-
+# Check state dict compatibility
 old_sd = ckpt['model']
-new_sd = new_model.state_dict()
+new_sd = model.state_dict()
 
 old_keys = set(old_sd.keys())
 new_keys = set(new_sd.keys())
@@ -41,35 +27,31 @@ only_old = old_keys - new_keys
 only_new = new_keys - old_keys
 common = old_keys & new_keys
 
-print(f'\n=== State dict comparison ===')
-print(f'Old keys: {len(old_keys)}')
-print(f'New keys: {len(new_keys)}')
-print(f'Common: {len(common)}')
-print(f'Only in old: {len(only_old)}')
-print(f'Only in new: {len(only_new)}')
+print(f"\nState dict:")
+print(f"  Old keys: {len(old_keys)}")
+print(f"  New keys: {len(new_keys)}")
+print(f"  Common: {len(common)}")
+print(f"  Only in old: {len(only_old)}")
+print(f"  Only in new: {len(only_new)}")
 
-print(f'\n=== Only in old checkpoint (will be skipped) ===')
-for k in sorted(only_old)[:15]:
-    print(f'  {k}: {old_sd[k].shape}')
-if len(only_old) > 15:
-    print(f'  ... and {len(only_old)-15} more')
+if only_old:
+    print(f"\n  Only in old (sample): {sorted(list(only_old))[:5]}")
+if only_new:
+    print(f"  Only in new (sample): {sorted(list(only_new))[:5]}")
 
-print(f'\n=== Only in new model (will be randomly initialized) ===')
-for k in sorted(only_new)[:15]:
-    print(f'  {k}: {new_sd[k].shape}')
-if len(only_new) > 15:
-    print(f'  ... and {len(only_new)-15} more')
-
-shape_mismatch = []
+# Check shape mismatches
+mismatch = 0
 for k in common:
     if old_sd[k].shape != new_sd[k].shape:
-        shape_mismatch.append((k, old_sd[k].shape, new_sd[k].shape))
+        mismatch += 1
+print(f"  Shape mismatches: {mismatch}")
 
-print(f'\n=== Shape mismatches in common keys: {len(shape_mismatch)} ===')
-for k, old_shape, new_shape in shape_mismatch[:10]:
-    print(f'  {k}: old={old_shape} new={new_shape}')
-
-missing, unexpected = new_model.load_state_dict(old_sd, strict=False)
-print(f'\n=== Load result ===')
-print(f'Missing (not in ckpt): {len(missing)}')
-print(f'Unexpected (in ckpt but not model): {len(unexpected)}')
+# Try loading
+if mismatch == 0:
+    missing, unexpected = model.load_state_dict(old_sd, strict=False)
+    print(f"\nCheckpoint COMPATIBLE!")
+    print(f"  Loaded: {len(old_sd) - len(unexpected)}/{len(old_sd)} keys")
+    print(f"  Skipped (old buffers): {len(unexpected)}")
+    print(f"  Missing (new): {len(missing)}")
+else:
+    print(f"\nCheckpoint has {mismatch} shape mismatches, {len(only_new)} new keys")

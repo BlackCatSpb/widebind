@@ -45,9 +45,6 @@ class WideBindConfig:
     # ─── Spec 1: Asymmetric expert init ───
     expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert
 
-    # ─── Spec 2: External mirror (auxiliary world model) ───
-    aux_mirror_weight: float = 0.0  # 0=off, 0.1=aux cosine loss weight
-
     # ─── Spec 3: Recursive meta-trust ───
     meta_trust: bool = True  # track trust dynamics, penalize unstable experts (requires private_mem)
 
@@ -125,10 +122,7 @@ class WideBindConfig:
     diversity_weight: float = 0.001  # ||cov - I||² weight (0=disabled)
     # Nuclear norm regularization for bind W_proj
     nuclear_weight: float = 1e-5  # stochastic ||W||_* weight (0=disabled)
-    # Orthogonality regularization for bottleneck bind
     orth_weight: float = 1e-4  # ||Ŵ^TŴ - I||² weight (0=disabled)
-    pred_w_weight: float = 0.01  # MSE(pred_w, I) weight (prevents diagonal decay)
-    amp_proto_lr_mult: float = 5.0  # LR multiplier for proto (sparse updates)
     # Surprisal-weighted loss: focus on informative tokens
     surprisal_weight: float = 0.0  # γ, 0=disabled, 0.5=mild, 1.0=aggressive
 
