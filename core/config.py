@@ -26,37 +26,13 @@ class WideBindConfig:
     lambda_d: int = 3            # dimension of generalized golden ratio
     lambda_d_enabled: bool = True  # True = apply λ_d derivation in __post_init__
 
-    # Symmetry constraints
     tie_bind: bool = True  # True = W_out = W_proj^T (autoencoder bind bottleneck)
     tie_mirror_proj: bool = True  # True = mirror W_out = W_proj^T (per-expert K-space AE)
-
-    # Zeckendorf Readout (experimental)
-    zeckendorf_readout: bool = False  # True = replace LM head with Zeckendorf tree
 
     head_mode: str = "sigmoid_coded"
     head_normalize: bool = True
     code_dim: int = 32
     code_sparsity: int = 6
-
-    # ─── SignedAmpCodec (эксперимент: читаем подписанные амплитуды, без softmax) ───
-    amp_codec: bool = False         # True = SignedAmpEmbedding/SignedAmpHead вместо Partitioned
-    amp_proto_init: float = 0.2     # разброс прототипов амплитуд α_vk
-    amp_gain_init: float = 0.5      # стартовый gain чтения (против насыщения tanh)
-    amp_w_init: float = 0.5         # стартовое двухконечное чтение: вес собственного кода
-    amp_sigma_init: float = 0.3     # стартовая неопределённость позиций (до sqrt-ish)
-    amp_sigma_min: float = 0.2      # нижняя граница σ: для маржинальной цели ограниченность
-                                    # требует σ_min > 0 (масштабная инвариантность);
-                                    # 0.399 = граница допустимости likelihood для обычного CE
-    amp_scale: float = 1.0          # масштаб записи в residual stream
-    amp_pred: bool = True           # механизм A: оператор перехода W_pred (K×K)
-    amp_phasor: bool = False        # «корни из единицы»: плотные cos/sin-коды (переходы = вращения)
-    amp_hybrid: bool = False        # hybrid: sparse-позиции (разделение) + cos/sin (вращение)
-    amp_hybrid_s: int = 6           # кол-во sparse-позиций в hybrid-коде
-    amp_phase_amp: float = 0.8      # амплитуда фазовых кодов (до tanh)
-    amp_hinge_weight: float = 1.0   # вес argmax-hinge в compute_losses (для amp_obj='mh')
-    amp_reg_weight: float = 0.0     # вес code_reg (механизм C; 0 = выкл)
-    amp_obj: str = 'ce'             # 'ce' = одна CE (подтверждённый рецепт); 'mh' = margin+hinge(+reg)
-    amp_seed: int = 0               # детерминизм базиса/прототипов
 
     mirror_k: int = 32
     mirror_k_staircase: bool = True  # True = k_l∈{8,16,32} по третям глубины
