@@ -276,9 +276,14 @@ class WideBindBlock(nn.Module):
         # Dynamic write modulation (per-expert K-space conditioning)
         hp_cached = self.mirror._cached_hp
         if hp_cached is not None and self.training:
-            write_mod = torch.einsum('blgk,gkd->blgd', hp_cached, self.w_i_dyn)
-            write_mod = torch.sigmoid(write_mod / math.sqrt(self.mirror.k))
-            mem_input = (h.reshape(B, L, self.mirror.G, self.mirror.d) * write_mod).reshape(B, L, D) * i_gate
+            g = self.mirror.G
+            d = self.mirror.d
+            k = self.mirror.k
+            BL = B * L
+            hp_g = hp_cached.permute(2, 0, 1, 3).reshape(g, BL, k)  # batched matmul (stable under AMP)
+            wm = torch.matmul(hp_g, self.w_i_dyn)  # (g, BL, d)
+            write_mod = torch.sigmoid(wm.permute(1, 0, 2).view(B, L, g, d) / math.sqrt(k))
+            mem_input = (h.reshape(B, L, g, d) * write_mod).reshape(B, L, D) * i_gate
         else:
             mem_input = h * i_gate  # (B, L, D)
 
@@ -398,8 +403,10 @@ class WideBindBlock(nn.Module):
         # Per-expert dynamic read (K-space conditioned memory gating)
         hp = self.mirror._cached_hp
         if hp is not None:
-            read_mod = torch.einsum('blgk,gkd->blgd', hp, self.w_q_dyn)
-            read_mod = torch.sigmoid(read_mod / math.sqrt(self.mirror.k))
+            BL = B * L
+            hp_g = hp.permute(2, 0, 1, 3).reshape(g, BL, self.mirror.k)  # batched matmul (stable under AMP)
+            read_mod = torch.matmul(hp_g, self.w_q_dyn)  # (g, BL, d)
+            read_mod = torch.sigmoid(read_mod.permute(1, 0, 2).view(B, L, g, d) / math.sqrt(self.mirror.k))
             mem_read_g = mem_read.reshape(B, L, g, d)
             mem_expert = mem_read_g * read_mod
             mem_modulated = (mem_expert * mm).reshape(B, L, D)

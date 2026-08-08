@@ -100,9 +100,10 @@ class PartitionedEmbedding(nn.Module):
     def forward(self, tokens):
         codes = self.codes[tokens]  # (B, L, K), sparse binary
         # Dense mixing: sigmoid(scale · M · codes) → каждый бит влияет на все сегменты
-        codes = torch.sigmoid(torch.einsum('blk,kj->blj', codes, self.embed_mix) * self._mix_scale)
+        codes = torch.sigmoid(codes @ self.embed_mix * self._mix_scale)
         B, L = tokens.shape
-        out = torch.einsum('blk,kd->blkd', codes, self.basis).reshape(B, L, -1)
+        # Внешнее произведение вместо einsum (стабильно под AMP на любых GPU)
+        out = (codes.unsqueeze(-1) * self.basis.view(1, 1, self.K, -1)).reshape(B, L, -1)
         out = self.rope(out)
         return out
 
@@ -156,7 +157,7 @@ class PartitionedHead(nn.Module):
     def forward(self, h):
         B, L, D = h.shape
         h_g = h.reshape(B, L, self.K, -1)  # (B, L, K, d)
-        scores = torch.einsum('blkd,kd->blk', h_g, self.readout)
+        scores = (h_g * self.readout.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
         return scores @ self.codes.T + self.token_bias.unsqueeze(0).unsqueeze(0)
 
 
@@ -190,7 +191,7 @@ class SigmoidCodedHead(nn.Module):
             squeeze = False
         B, L, D = h.shape
         h_g = h.reshape(B, L, self.K, -1)
-        z = torch.einsum('blkd,kd->blk', h_g, self.readout)
+        z = (h_g * self.readout.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
         T = torch.exp(self.log_temp).clamp_min(0.1)
         if temp_factor is not None:
             T = T * temp_factor
@@ -297,7 +298,7 @@ class CognitiveCodedHead(nn.Module):
 
     def _compute_z(self, h, B, L, device):
         h_g = h.reshape(B, L, self.K, self.d)
-        z_raw = torch.einsum('blkd,kd->blk', h_g, self.readout)
+        z_raw = (h_g * self.readout.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
         if self._pred_error is not None:
             pe = self._pred_error.float()
             e_pred = pe.mean(dim=(0, 1)) if pe.ndim > 1 else pe
@@ -314,8 +315,8 @@ class CognitiveCodedHead(nn.Module):
         else:
             pm = torch.zeros(self.K, self._k_mirror, device=device, dtype=h.dtype)
         key = pm @ self.W_k_prior
-        query = torch.einsum('blkd,dq->blk', h_g, self.W_q_prior).squeeze(-1)
-        attn = torch.einsum('blk,km->blm', query, key).squeeze(-1)
+        query = torch.matmul(h_g, self.W_q_prior).squeeze(-1)
+        attn = torch.matmul(query, key).squeeze(-1)
         prior = self.bit_bias + self.alpha_prior * torch.tanh(attn.unsqueeze(-1) * self.w_prior_scale)
         if self._dominance is not None:
             dom = self._dominance.float()
@@ -332,7 +333,7 @@ class CognitiveCodedHead(nn.Module):
             res = (1.0 + self.w_energy * torch.tanh(-energy)).clamp(self.resonance_floor, 2.0)
         else:
             res = 1.0
-        ctx = torch.tanh(torch.einsum('blkd,kdm->blk', h_g, self.W_code_mod))
+        ctx = torch.tanh((h_g * self.W_code_mod.squeeze(-1).unsqueeze(0).unsqueeze(0)).sum(dim=-1))
         z = z_raw * res
         z = z / T.unsqueeze(0).unsqueeze(0)
         z = z * (1.0 + self.gamma * ctx)

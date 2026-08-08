@@ -45,13 +45,20 @@ class GroupedMLP(nn.Module):
         B, L, D = h.shape
         h = F.rms_norm(h, (D,), self.norm_w)
         h = h.reshape(B, L, self.G, self.d)
+        BL = B * L
+        # Батч-матмул вместо einsum: под autocast einsum(fp16) падает на
+        # некоторых GPU (CUBLAS_STATUS_NOT_SUPPORTED), matmul — нет.
+        hg = h.permute(2, 0, 1, 3).reshape(self.G, BL, self.d)  # (G, BL, d)
         if self.swiglu:
-            gate = F.silu(torch.einsum('blgd,gdf->blgf', h, self.W_gate))
-            up = torch.einsum('blgd,gdf->blgf', h, self.W_up)
-            h = gate * up
+            gate = F.silu(torch.matmul(hg, self.W_gate))  # (G, BL, f)
+            up = torch.matmul(hg, self.W_up)              # (G, BL, f)
+            hf = (gate * up).permute(1, 0, 2).reshape(B, L, self.G, -1)
         else:
-            h = F.silu(torch.einsum('blgd,gdf->blgf', h, self.W_up))
-        h = torch.einsum('blgf,gfd->blgd', h, self.W_down)
+            h = F.silu(torch.matmul(hg, self.W_up))       # (G, BL, f)
+            hf = h.permute(1, 0, 2).reshape(B, L, self.G, -1)
+        hg2 = hf.permute(2, 0, 1, 3).reshape(self.G, BL, -1)  # (G, BL, f)
+        h = torch.matmul(hg2, self.W_down)                # (G, BL, d)
+        h = h.permute(1, 0, 2).view(B, L, self.G, self.d)
         self._cached_group_out = h  # (B, L, G, d)
         return h.reshape(B, L, D)
 
