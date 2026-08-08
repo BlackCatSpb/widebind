@@ -65,6 +65,13 @@ class WideBindStack(nn.Module):
         if state is None:
             state = [None] * len(self.layers)
         B, L, D = h.shape
+        # Батч-несовпадение состояния с входом (e.g. resume при другом batch):
+        # сброс всех внутренних состояний (иначе device-side assert / shape miss)
+        if state is not None and any(s is not None for s in state):
+            s0 = next(s for s in state if s is not None)
+            sB = s0.shape[0] if isinstance(s0, torch.Tensor) else -1
+            if sB != B:
+                state = [None] * len(self.layers)
         
         # ─── Learnable VSA scales (Idea 1) — moved before AdaptiveController loop ───
         vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0

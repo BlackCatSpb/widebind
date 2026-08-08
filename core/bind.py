@@ -330,7 +330,7 @@ class TrajectorySpiralBind(nn.Module):
         # Build trajectory: use traj_state only if sequence length matches
         if traj_state is not None:
             state_L = traj_state[0].shape[1]
-            if state_L != L:
+            if state_L != L or traj_state[0].shape[0] != B:
                 traj_state = None
 
         if traj_state is None or len(traj_state) < self.n_dims - 1:
@@ -339,11 +339,6 @@ class TrajectorySpiralBind(nn.Module):
             traj = [hp] + (list(traj_state) if traj_state else []) + padding
         else:
             traj = [hp] + list(traj_state[:self.n_dims - 1])
-
-        if not getattr(self, '_dbg_traj', False):
-            self._dbg_traj = True
-            print(f"DBG bind K={K} n_dims={self.n_dims} traj_shapes={[tuple(t.shape) for t in traj]} "
-                  f"W_freq={tuple(self.W_freq.shape)}", flush=True)
 
         out_acc = None
         for s in range(self.S):
@@ -365,12 +360,7 @@ class TrajectorySpiralBind(nn.Module):
                 hybrid = self._hybrid_bind(u_re, v_re)
                 prod_re = prod_re + 0.1 * hybrid
                 dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
-            try:
-                out_s = torch.cat(dim_outputs, dim=-1)
-            except RuntimeError:
-                print(f"CAT FAIL K={K} n_dims={self.n_dims} traj={[tuple(t.shape) for t in traj]} "
-                      f"outs={[tuple(t.shape) for t in dim_outputs]}", flush=True)
-                raise
+            out_s = torch.cat(dim_outputs, dim=-1)
             out_acc = out_s if out_acc is None else out_acc + out_s
         result = out_acc @ self.W_out
         new_traj = traj[1:]

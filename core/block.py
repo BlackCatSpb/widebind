@@ -232,7 +232,8 @@ class WideBindBlock(nn.Module):
         
         if isinstance(self.bind, TrajectorySpiralBind):
             traj_state = getattr(self, '_traj_state', None)
-            if traj_state is not None and traj_state[0].shape[1] != L:
+            if traj_state is not None and (traj_state[0].shape[1] != L
+                                           or traj_state[0].shape[0] != B):
                 traj_state = None
             bind_out, new_traj = self.bind(h, traj_state)
             if traj_state is None:
