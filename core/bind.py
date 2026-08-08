@@ -365,7 +365,12 @@ class TrajectorySpiralBind(nn.Module):
                 hybrid = self._hybrid_bind(u_re, v_re)
                 prod_re = prod_re + 0.1 * hybrid
                 dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
-            out_s = torch.cat(dim_outputs, dim=-1)
+            try:
+                out_s = torch.cat(dim_outputs, dim=-1)
+            except RuntimeError:
+                print(f"CAT FAIL K={K} n_dims={self.n_dims} traj={[tuple(t.shape) for t in traj]} "
+                      f"outs={[tuple(t.shape) for t in dim_outputs]}", flush=True)
+                raise
             out_acc = out_s if out_acc is None else out_acc + out_s
         result = out_acc @ self.W_out
         new_traj = traj[1:]
