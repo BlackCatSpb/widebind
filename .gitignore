@@ -1,17 +1,40 @@
-checkpoints/
-logs/
+# Build & Cache
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
+.pytest_cache/
+
+# Checkpoints & Models
+checkpoints/
 *.pt
 *.pth
 *.bin
-tokenizer/
-generation_output.txt
-*_report.html
+*.safetensors
 
-session_backup.json
+# Logs
+logs/
+*.log
+
+# Tokenizer (large binary files)
+wb/russian_tokenizer/*.json
+
+# Archive
+archive/
+docs/archive/
+core/archive/
+scripts/archive/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Personal data
 eva_ai/
 *.7z
+session_backup.json
+
+# Temp files
+generation_output.txt
+*_report.html
+eva_monitor*.txt
+gen_*.txt
