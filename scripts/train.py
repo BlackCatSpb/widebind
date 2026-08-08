@@ -452,6 +452,11 @@ if __name__ == '__main__':
                         help='Codec objective: ce = one CE (confirmed recipe), mh = margin+hinge')
     parser.add_argument('--no-amp-pred', action='store_true',
                         help='Disable W_pred transition operator in codec head')
+    parser.add_argument('--traj-manifold', action='store_true',
+                        help='Trajectory: манифолд переходов (TrajectoryManifoldBind)')
+    parser.add_argument('--traj-beams', type=int, default=0, help='Manifold: число лучей (0 = авто = ceil(sqrt(buffer)))')
+    parser.add_argument('--traj-buffer', type=int, default=1024, help='Manifold: буфер переходов')
+    parser.add_argument('--traj-gain', type=float, default=0.05, help='Manifold: масштаб вклада')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
@@ -474,6 +479,10 @@ if __name__ == '__main__':
         amp_codec=(args.head == 'codec'),
         amp_obj=args.amp_obj,
         amp_pred=not args.no_amp_pred,
+        traj_manifold=args.traj_manifold,
+        traj_beams=args.traj_beams,
+        traj_buffer_size=args.traj_buffer,
+        traj_gain=args.traj_gain,
     )
     
     train(cfg, resume_path=args.resume)

@@ -162,6 +162,14 @@ class WideBindConfig:
     bind_twist_scheme: str = "golden"
     bind_twist_gate: bool = False
 
+    # Trajectory manifold (FCF): beams + Zeckendorf decay on trajectory bind
+    traj_manifold: bool = False        # clever wrap: TrajectoryManifoldBind instead of Spiral
+    traj_beams: int = 0                # число лучей: 0 = авто ceil(sqrt(buffer))
+    traj_buffer_size: int = 1024       # буфер переходов (Mini: 512; 1024→32 луча автоматом)
+    traj_cos_threshold: float = 0.5    # cos-порог кластеризации лучей
+    traj_rebuild_interval: int = 128   # пересборка лучей каждые N переходов
+    traj_gain: float = 0.05            # масштаб вклада манифолда
+
     # Gradient accumulation
     accum_steps: int = 1  # effective batch = batch_size * seq_len * accum_steps
 

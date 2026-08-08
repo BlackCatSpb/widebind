@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
-from .bind import BottleneckBind, SpiralBind, TrajectorySpiralBind
+from .bind import BottleneckBind, SpiralBind, TrajectorySpiralBind, TrajectoryManifoldBind
 from .mirror import GroupedCognitiveMirror
 from .concept_layer import CollectiveConceptLayer
 from .mlp import GroupedMLP
@@ -64,7 +64,11 @@ class WideBindBlock(nn.Module):
         
         bind_mode = getattr(cfg, "bind_twist_mode", "shift")
         if bind_mode == "trajectory_spiral":
-            self.bind = TrajectorySpiralBind(cfg.D, cfg.bind_K, cfg)
+            if getattr(cfg, "traj_manifold", False):
+                # FCF-манифолд: лучи переходов + Zeckendorf (fp32-стабильный)
+                self.bind = TrajectoryManifoldBind(cfg.D, cfg.bind_K, cfg)
+            else:
+                self.bind = TrajectorySpiralBind(cfg.D, cfg.bind_K, cfg)
         elif bind_mode == "spiral":
             self.bind = SpiralBind(cfg.D, cfg.bind_K, cfg)
         else:
@@ -370,10 +374,17 @@ class WideBindBlock(nn.Module):
         if _chk(mem_read, 'mem_read'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── Mirror (self-consistency: local + global) ───
-        mirror, mlp_mod, mem_mod = self.mirror(
-            h, mem_all, global_state=global_state, diff=diff,
-            tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-            context_mem=context_mem, allow_write=allow_write)
+        # fp32-якорь: exp/log/softmax в mirror переполняются в fp16 под AMP
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            _gs = global_state.float() if isinstance(global_state, torch.Tensor) else global_state
+            _ctx = context_mem.float() if isinstance(context_mem, torch.Tensor) else context_mem
+            mirror, mlp_mod, mem_mod = self.mirror(
+                h.float(), mem_all.float(), global_state=_gs, diff=diff,
+                tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
+                context_mem=_ctx, allow_write=allow_write)
+            mirror = mirror.to(h.dtype)
+            mlp_mod = mlp_mod.to(h.dtype) if isinstance(mlp_mod, torch.Tensor) else mlp_mod
+            mem_mod = mem_mod.to(h.dtype) if isinstance(mem_mod, torch.Tensor) else mem_mod
         if _chk(mirror, 'mirror'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         if _chk(mem_mod, 'mem_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
@@ -417,17 +428,22 @@ class WideBindBlock(nn.Module):
 
         # ─── Variable Precision Memory ───
         if self.variable_precision:
-            precision = self.precision_gate(h)
-            if precision.mean() > self.precision_threshold:
-                exact = self.exact_memory(h)
-                h = h + precision * exact
+            # fp32-якорь: softmax в exact_memory переполняется в fp16 под AMP
+            with torch.autocast(device_type=h.device.type, enabled=False):
+                precision = self.precision_gate(h.float())
+                if precision.mean() > self.precision_threshold:
+                    exact = self.exact_memory(h.float())
+                    h = h + (precision * exact).to(h.dtype)
             self._precision_mean = precision.mean().item()
 
-        if _chk(h, 'post_precision'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h, 'vpm'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
-        h_dct = h @ self.V_dct.T
-        h = h + (h_dct * self.lambda_k * spectral_mod) @ self.V_dct
+        # fp32-якорь: DCT-базис даёт -inf в fp16 под AMP
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            h_dct = h.float() @ self.V_dct.T
+            h_dct = h_dct * self.lambda_k.float() * float(spectral_mod)
+            h = h + (h_dct @ self.V_dct).to(h.dtype)
         if _chk(h, 'spectral'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── MLP (per-group modulation by mlp_mod) ───

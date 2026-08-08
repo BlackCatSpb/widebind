@@ -367,4 +367,193 @@ class TrajectorySpiralBind(nn.Module):
         return result, new_traj
 
 
+class TrajectoryManifoldBind(TrajectorySpiralBind):
+    """Спиральная траектория + манифолд переходов, масштабированные для большой
+    WideBind (D=4096, K=64): всё то же самое, но масштаб буфера √-законом удвоен.
+
+    Три механики дополняют друг друга (FCF-гибрид):
+      1. Спиральный bind (max_phase) — локальное скрещивание hp ↔ траектория
+         (VSA-память + mirror), как в TrajectorySpiralBind.
+      2. Манифолд переходов T = unbind(hp_t, hp_{t-1}), кластеризованный
+         в лучи (центроиды) — «факел»: ближний контекст освещается
+         лучами, а не полной памятью.
+      3. Zeckendorf-затухание по возрасту луча (len(zeckendorf(age)))
+         вместо свободного τ — иерархический распад.
+    Чтение — VSA-бандл: sigmoid-гейты по схожести query↔луч, без квадратичной
+    матрицы попарных вниманий (нет softmax-конкуренции).
+    """
+
+    def __init__(self, D, K, cfg):
+        super().__init__(D, K, cfg)
+        self.buffer_size = int(getattr(cfg, "traj_buffer_size", 1024))
+        # Число лучей — производное от буфера (ceil(√buffer)); свободных τ нет:
+        # в φ-траектории число различимых кластеров — геометрическая середина
+        # шкалы буфера. Большая: буфер 1024 → 32 луча (Mini: 512 → 23).
+        beams_explicit = int(getattr(cfg, "traj_beams", 0) or 0)
+        self.n_beams = beams_explicit if beams_explicit > 0 else int(math.ceil(
+            self.buffer_size ** 0.5))
+        self.cos_threshold = float(getattr(cfg, "traj_cos_threshold", 0.5))
+        self.rebuild_interval = int(getattr(cfg, "traj_rebuild_interval", 128))
+        self.gain = float(getattr(cfg, "traj_gain", 0.05))
+
+        # Неперсистентные (сбрасываются на загрузке чекпоинта) буферы манифолда
+        self.register_buffer("beam_centers", torch.zeros(self.n_beams, self.K),
+                             persistent=False)
+        self.register_buffer("beam_counts", torch.zeros(self.n_beams, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("beam_age", torch.zeros(self.n_beams, dtype=torch.long),
+                             persistent=False)
+        self.register_buffer("trans_buf", torch.zeros(self.buffer_size, self.K),
+                             persistent=False)
+        self.register_buffer("_trans_idx", torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer("_total", torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer("_warmz", torch.zeros(1, dtype=torch.float32), persistent=False)
+
+        self.W_man = nn.Parameter(torch.empty(self.K, D))
+        nn.init.xavier_uniform_(self.W_man, gain=0.25)
+        self._fib_cache = self._fib_list(self.buffer_size + 1)
+
+        # наклон sigmoid-гейтов чтения (обучаемый, VSA — без softmax/T)
+        self.logit_gain = nn.Parameter(torch.tensor(3.0))
+
+    @staticmethod
+    def _fib_list(max_n):
+        fibs = [1, 2]
+        while fibs[-1] <= max_n:
+            fibs.append(fibs[-1] + fibs[-2])
+        return fibs
+
+    @staticmethod
+    def _zlen(fibs, n):
+        if n <= 0:
+            return 0
+        cnt, i = 0, len(fibs) - 1
+        while n > 0 and i >= 0:
+            if fibs[i] <= n:
+                n -= fibs[i]
+                cnt += 1
+            i -= 1
+        return cnt
+
+    def _hrr_unbind(self, a, b):
+        fa = torch.fft.rfft(a, dim=-1)
+        fb = torch.fft.rfft(b, dim=-1)
+        return torch.fft.irfft(fa * torch.conj(fb), n=a.shape[-1], dim=-1)
+
+    def _hybrid_unbind(self, a, b):
+        alpha = self._hybrid_alpha()
+        return alpha * self._hrr_unbind(a, b) + (1.0 - alpha) * (a * b)
+
+    # ── персист-обновление лучей (no_grad) ─────────────────────────
+
+    def _push_transitions(self, hp):
+        """Записать переходы unbind(hp_t, hp_{t-1}) в кольцевой буфер."""
+        if hp.shape[1] < 2:
+            return
+        hp = hp.float()  # манифолд всегда в fp32 (буферы fp32, FFT стабильна)
+        T = self._hybrid_unbind(hp[:, 1:], hp[:, :-1])  # (B, L-1, K)
+        flat = T.reshape(-1, self.K)
+        n = flat.shape[0]
+        if n == 0:
+            return
+        with torch.no_grad():
+            n_t = int(self._trans_idx.item())
+            space = self.buffer_size - (n_t % self.buffer_size)
+            first = flat[:min(n, space)]
+            self.trans_buf[n_t % self.buffer_size:n_t % self.buffer_size + first.shape[0]] = first
+            if n > space:
+                second = flat[space:]
+                self.trans_buf[:second.shape[0]] = second
+            self._trans_idx += n
+            self._total += n
+            if int(self._total.item()) % self.rebuild_interval == 0:
+                self._rebuild_beams()
+
+    def _rebuild_beams(self):
+        """Жадная VSA-кластеризация переходов в лучи (как FCF)."""
+        n_valid = min(int(self._total.item()), self.buffer_size)
+        if n_valid < 2:
+            return
+        samples = self.trans_buf[:n_valid].clone().float()
+        norms = samples.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        samples = samples / norms
+        perm = torch.randperm(n_valid, device=samples.device)
+        centers, counts, ages = [], [], []
+        for idx in perm.tolist():
+            v = samples[idx]
+            if v.abs().sum() < 1e-10:
+                continue
+            best, best_sim = -1, -1.0
+            for i, c in enumerate(centers):
+                sim = (v * c).sum().item()
+                if sim > best_sim:
+                    best, best_sim = i, sim
+            if best_sim > self.cos_threshold and best >= 0:
+                cnt = counts[best]
+                nv = centers[best] * cnt + v
+                centers[best] = nv / nv.norm().clamp(min=1e-10)
+                counts[best] = cnt + 1
+            elif len(centers) < self.n_beams:
+                centers.append(v)
+                counts.append(1.0)
+                ages.append(int(self._trans_idx.item()))
+        if centers:
+            n_beams = len(centers)
+            self.beam_centers = torch.zeros(self.n_beams, self.K, device=samples.device)
+            self.beam_centers.data[:n_beams] = torch.stack(centers)
+            self.beam_counts.zero_()
+            self.beam_counts.data[:n_beams] = torch.tensor(counts, dtype=torch.float32,
+                                                           device=samples.device)
+            self.beam_age.zero_()
+            if ages:
+                self.beam_age.data[:len(ages)] = torch.tensor(
+                    ages, dtype=torch.long, device=samples.device)
+        else:
+            self.beam_centers.zero_()
+            self.beam_counts.zero_()
+            self.beam_age.zero_()
+
+    # ── Zeck-распад возраста луча ─────────────────────────────────
+
+    def _zeck_weight(self, age):
+        """theta = 1 / (1 + len(zeckendorf(age))) — нет свободного τ."""
+        if age <= 0:
+            return 1.0
+        return 1.0 / (1.0 + self._zlen(self._fib_cache, int(age)))
+
+    def _manifold_read(self, hp):
+        """Бандл-чтение: sigmoid-гейты по сходству q↔beam · Zeck-затухание.
+
+        Никакого softmax: каждый луч гейтируется независимо (своя сила),
+        сумма нормируется — но это не конкурентная нормировка, а VSA-бандл.
+        """
+        B, L, K = hp.shape
+        beam = self.beam_centers  # (n_beams, K)
+        n_eff = int(self.beam_counts.clamp(min=0).gt(0).sum().item())
+        if n_eff == 0:
+            return torch.zeros(B, L, K, device=hp.device, dtype=hp.dtype)
+        hp = hp.float()  # fp32-прецизия для стабильных sigmoid-гейтов
+        beam = beam[:n_eff] / beam[:n_eff].norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        qnorm = hp.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        sims = (hp / qnorm) @ beam.T  # (B, L, n_beams)
+        logit_gain = self.logit_gain.clamp(min=0.1)
+        w = torch.sigmoid(sims * logit_gain)  # (B, L, n_beams) независимые гейты
+        now = int(self._trans_idx.item())
+        ages = [max(0, now - int(a)) for a in self.beam_age[:n_eff].tolist()]
+        decay = torch.tensor([self._zeck_weight(a) for a in ages],
+                             device=hp.device, dtype=hp.dtype).view(1, 1, -1)
+        w = w * decay
+        w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+        return w @ beam  # (B, L, K)
+
+    def forward(self, h, traj_state=None):
+        if h.dim() == 2:
+            h = h.unsqueeze(0)
+        result, new_traj = super().forward(h, traj_state)
+        hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
+        self._push_transitions(hp)
+        man = self._manifold_read(hp).float()
+        return result + self.gain * (man @ self.W_man).clamp(-8.0, 8.0), new_traj
+
+
 # ─── WideBind Block ────────────────────────────────────────────────────
