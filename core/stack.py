@@ -353,16 +353,17 @@ class WideBindStack(nn.Module):
         
         orth_loss = 0.0
         n_orth = 0
-        for layer in self.layers:
-            bind_W = None
-            if hasattr(layer, 'bind') and hasattr(layer.bind, 'W_proj'):
-                bind_W = layer.bind.W_proj.weight
-            if bind_W is not None and bind_W.ndim == 2:
-                W_hat = bind_W / bind_W.norm(dim=0, keepdim=True).clamp(min=1e-8)
-                gram = W_hat.T @ W_hat
-                orth = F.mse_loss(gram, torch.eye(gram.shape[0], device=gram.device))
-                orth_loss = orth_loss + orth
-                n_orth = n_orth + 1
+        if getattr(self.cfg, 'orth_weight', 1e-4) > 0:
+            for layer in self.layers:
+                bind_W = None
+                if hasattr(layer, 'bind') and hasattr(layer.bind, 'W_proj'):
+                    bind_W = layer.bind.W_proj.weight
+                if bind_W is not None and bind_W.ndim == 2:
+                    W_hat = bind_W / bind_W.norm(dim=0, keepdim=True).clamp(min=1e-8)
+                    gram = W_hat.T @ W_hat
+                    orth = F.mse_loss(gram, torch.eye(gram.shape[0], device=gram.device))
+                    orth_loss = orth_loss + orth
+                    n_orth = n_orth + 1
         if n_orth > 0:
             orth_loss = orth_loss / n_orth
         
