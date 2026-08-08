@@ -340,6 +340,11 @@ class TrajectorySpiralBind(nn.Module):
         else:
             traj = [hp] + list(traj_state[:self.n_dims - 1])
 
+        if not getattr(self, '_dbg_traj', False):
+            self._dbg_traj = True
+            print(f"DBG bind K={K} n_dims={self.n_dims} traj_shapes={[tuple(t.shape) for t in traj]} "
+                  f"W_freq={tuple(self.W_freq.shape)}", flush=True)
+
         out_acc = None
         for s in range(self.S):
             dim_outputs = []
