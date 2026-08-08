@@ -71,6 +71,7 @@ class WideBindConfig:
     collective_maturity_thresh: float = 0.12
 
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
+    orth_weight: float = 0.0  # ortho-gran loss; 0=off (32x D²=4096² gram graphs cost 2GB+ VRAM)
     div_weight: float = 50.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
     ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
     gate_repulse_weight: float = 0.3  # push gate variance up (inverse of balance, bypasses spectral)
