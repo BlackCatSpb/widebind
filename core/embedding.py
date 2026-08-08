@@ -98,6 +98,8 @@ class PartitionedEmbedding(nn.Module):
         self.rope = RotaryEmbedding(D, theta=self._rope_theta, scaling=self._rope_scaling)
     
     def forward(self, tokens):
+        # Защита от токенов ≥ vocab (device-side assert в gather): фон-клип
+        tokens = tokens.clamp(0, self.codes.shape[0] - 1)
         codes = self.codes[tokens]  # (B, L, K), sparse binary
         # Dense mixing: sigmoid(scale · M · codes) → каждый бит влияет на все сегменты
         codes = torch.sigmoid(codes @ self.embed_mix * self._mix_scale)

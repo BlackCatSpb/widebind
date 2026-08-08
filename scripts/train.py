@@ -1,4 +1,4 @@
-"""
+﻿"""
 WideBind training: streaming from token_stream_{GENRE}.bin files.
 """
 
@@ -24,11 +24,15 @@ class TokenStream:
     def __init__(self, path):
         self.data = np.memmap(path, dtype=np.uint16, mode='r')
         self.len = len(self.data)
-    def get_batch(self, seq_len, batch_size, offset):
+    def get_batch(self, seq_len, batch_size, offset, vocab=50000):
         needed = batch_size * seq_len + 1
         if offset + needed > self.len:
             offset = 0
         chunk = self.data[offset:offset + needed]
+        if vocab is not None:
+            # uint16-С„Р°Р№Р»С‹ РјРѕРіСѓС‚ СЃРѕРґРµСЂР¶Р°С‚СЊ С‚РѕРєРµРЅС‹ в‰Ґ vocab в†’ device-side assert
+            # РІ codes[tokens] (index out of bounds); РєР»РёРїР°РµРј РґРѕ Р±РµР·РѕРїР°СЃРЅРѕСЃС‚Рё.
+            chunk = np.clip(chunk, 0, vocab - 1)
         x = torch.from_numpy(chunk[:batch_size * seq_len].reshape(batch_size, seq_len).copy())
         y = torch.from_numpy(chunk[1:batch_size * seq_len + 1].reshape(batch_size, seq_len).copy())
         return x.long(), y.long(), offset + batch_size * seq_len
@@ -67,7 +71,7 @@ def train(cfg=None, resume_path=None):
     total_tokens = sum(s.len for s in streams)
     print(f'Found {len(streams)} files, {total_tokens:,} total tokens')
     
-    # Model (retry once on OOM — transient CUDA context cleanup)
+    # Model (retry once on OOM вЂ” transient CUDA context cleanup)
     try:
         model = WideBindStack(cfg).to(device)
     except RuntimeError as e:
@@ -137,7 +141,7 @@ def train(cfg=None, resume_path=None):
             if sched_sd.get('type') == 'MirrorLRScheduler':
                 scheduler.load_state_dict(sched_sd)
             elif cfg.scheduler == 'mirror':
-                # Switching from cosine to mirror — use step only
+                # Switching from cosine to mirror вЂ” use step only
                 scheduler._step = ckpt['step']
                 print(f'  Switched to MirrorLRScheduler at step {ckpt["step"]}')
             else:
@@ -173,7 +177,7 @@ def train(cfg=None, resume_path=None):
         for step in range(start_step, cfg.max_steps):
             model.train()
             
-            # ─── Mixed stream sampling: pick a random position in a random stream ───
+            # в”Ђв”Ђв”Ђ Mixed stream sampling: pick a random position in a random stream в”Ђв”Ђв”Ђ
             # When offset reaches end of current stream, randomly pick next stream
             # This keeps state continuity within a stream while mixing genres
             # at stream boundaries (FANTASY~82%, ADVENTUR~18% of batches)
@@ -183,21 +187,21 @@ def train(cfg=None, resume_path=None):
                 state = None  # reset state on stream switch (document boundary)
                 gs = None
             
-            # ─── Multi-scale seq curriculum: чередование длины батча по октавам τ ───
-            # L=64 (τ≤32, октавы 0–13): 7/9 шагов
-            # L=256 (τ≤92, октавы 14–23): 1/9 шагов
-            # L=512 (τ≤149, октавы 24–31): 1/9 шагов
+            # в”Ђв”Ђв”Ђ Multi-scale seq curriculum: С‡РµСЂРµРґРѕРІР°РЅРёРµ РґР»РёРЅС‹ Р±Р°С‚С‡Р° РїРѕ РѕРєС‚Р°РІР°Рј П„ в”Ђв”Ђв”Ђ
+            # L=64 (П„в‰¤32, РѕРєС‚Р°РІС‹ 0вЂ“13): 7/9 С€Р°РіРѕРІ
+            # L=256 (П„в‰¤92, РѕРєС‚Р°РІС‹ 14вЂ“23): 1/9 С€Р°РіРѕРІ
+            # L=512 (П„в‰¤149, РѕРєС‚Р°РІС‹ 24вЂ“31): 1/9 С€Р°РіРѕРІ
             seq_pool = [64, 64, 64, 64, 64, 64, 64, 256, 512]
             seq_len = seq_pool[step % len(seq_pool)]
             
             stream = streams[stream_idx]
-            x, y, offset = stream.get_batch(seq_len, cfg.batch_size, offset)
+            x, y, offset = stream.get_batch(seq_len, cfg.batch_size, offset, cfg.vocab)
             if offset == 0:
                 continue  # retry with new random stream
             
             x, y = x.to(device), y.to(device)
             
-            # ─── Forward (with optional AMP) ───
+            # в”Ђв”Ђв”Ђ Forward (with optional AMP) в”Ђв”Ђв”Ђ
             with autocast('cuda', enabled=use_amp):
                 h = model.embed_tokens(x)
                 out, state, gs = model(h, state, global_state=gs, step=step)
@@ -329,7 +333,7 @@ def train(cfg=None, resume_path=None):
             
             current_lr = scheduler.get_last_lr()[0]
             
-            # ─── Soft EOS-aware state reset: затухание вместо обнуления ───
+            # в”Ђв”Ђв”Ђ Soft EOS-aware state reset: Р·Р°С‚СѓС…Р°РЅРёРµ РІРјРµСЃС‚Рѕ РѕР±РЅСѓР»РµРЅРёСЏ в”Ђв”Ђв”Ђ
             if (y[:, -1] == 2).any():
                 if state is not None:
                     state = tuple(s * 0.1 for s in state)
@@ -412,7 +416,7 @@ def evaluate(model, streams, cfg, device):
     offset = max(len(stream) // 2, cfg.batch_size * cfg.seq_len + 1)
     
     for _ in range(min(100, stream.len // (cfg.batch_size * cfg.seq_len))):
-        x, y, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, offset)
+        x, y, offset = stream.get_batch(cfg.seq_len, cfg.batch_size, offset, cfg.vocab)
         if offset == 0:
             break
         x, y = x.to(device), y.to(device)
@@ -453,10 +457,10 @@ if __name__ == '__main__':
     parser.add_argument('--no-amp-pred', action='store_true',
                         help='Disable W_pred transition operator in codec head')
     parser.add_argument('--traj-manifold', action='store_true',
-                        help='Trajectory: манифолд переходов (TrajectoryManifoldBind)')
-    parser.add_argument('--traj-beams', type=int, default=0, help='Manifold: число лучей (0 = авто = ceil(sqrt(buffer)))')
-    parser.add_argument('--traj-buffer', type=int, default=1024, help='Manifold: буфер переходов')
-    parser.add_argument('--traj-gain', type=float, default=0.05, help='Manifold: масштаб вклада')
+                        help='Trajectory: РјР°РЅРёС„РѕР»Рґ РїРµСЂРµС…РѕРґРѕРІ (TrajectoryManifoldBind)')
+    parser.add_argument('--traj-beams', type=int, default=0, help='Manifold: С‡РёСЃР»Рѕ Р»СѓС‡РµР№ (0 = Р°РІС‚Рѕ = ceil(sqrt(buffer)))')
+    parser.add_argument('--traj-buffer', type=int, default=1024, help='Manifold: Р±СѓС„РµСЂ РїРµСЂРµС…РѕРґРѕРІ')
+    parser.add_argument('--traj-gain', type=float, default=0.05, help='Manifold: РјР°СЃС€С‚Р°Р± РІРєР»Р°РґР°')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
