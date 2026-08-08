@@ -37,6 +37,9 @@ class WideBindConfig:
     explicit_reasoning: bool = False  # True = enable thinking tokens and reasoning memory
     reasoning_max_steps: int = 8  # max reasoning steps in chain-of-thought
 
+    # AMP (Automatic Mixed Precision)
+    use_amp: bool = False  # True = mixed precision (requires CUDA, ~2x speed)
+
     head_mode: str = "sigmoid_coded"
     head_normalize: bool = True
     code_dim: int = 32

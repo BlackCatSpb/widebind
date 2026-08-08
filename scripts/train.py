@@ -5,6 +5,7 @@ WideBind training: streaming from token_stream_{GENRE}.bin files.
 import os, sys, math, time, json, glob, pickle
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
+from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
 import numpy as np
 from torch.serialization import add_safe_globals
@@ -90,7 +91,13 @@ def train(cfg=None, resume_path=None):
     # Optimizer
     param_groups = model.param_groups()
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
-    
+
+    # AMP (Automatic Mixed Precision)
+    use_amp = getattr(cfg, 'use_amp', False) and device == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    if use_amp:
+        print('  AMP: ON (mixed precision)')
+
     # Scheduler: mirror-adaptive or cosine
     if cfg.scheduler == 'mirror':
         scheduler = MirrorLRScheduler(model, optimizer, cfg.lr,
@@ -190,12 +197,11 @@ def train(cfg=None, resume_path=None):
             
             x, y = x.to(device), y.to(device)
             
-            # ─── Forward ───
-            h = model.embed_tokens(x)
-            out, state, gs = model(h, state, global_state=gs, step=step)
-            
-            # Compute losses (raw, unweighted)
-            ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
+            # ─── Forward (with optional AMP) ───
+            with autocast('cuda', enabled=use_amp):
+                h = model.embed_tokens(x)
+                out, state, gs = model(h, state, global_state=gs, step=step)
+                ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
             
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
@@ -309,9 +315,15 @@ def train(cfg=None, resume_path=None):
             
             # Clip gradients
             if cfg.grad_clip > 0:
+                if use_amp:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            
-            optimizer.step()
+
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             
