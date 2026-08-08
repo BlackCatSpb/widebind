@@ -5,8 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
-from .block import WideBindBlock
+from .block import WideBindBlock, PrecisionGate, ExactSequenceMemory
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
+from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 
 class WideBindStack(nn.Module):
@@ -30,7 +31,13 @@ class WideBindStack(nn.Module):
         self.layers = nn.ModuleList([
             WideBindBlock(cfg, i) for i in range(cfg.n_layers)
         ])
-        
+
+        # ─── Explicit Reasoning ───
+        self.explicit_reasoning = getattr(cfg, 'explicit_reasoning', False)
+        if self.explicit_reasoning:
+            self.reasoning_memory = ReasoningMemory(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8))
+            self.thinking_head = ThinkingTokenHead(cfg.D)
+
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
@@ -197,8 +204,20 @@ class WideBindStack(nn.Module):
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
                     self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
         
-        return F.rms_norm(h, (self.cfg.D,), self.final_norm_w), new_state, global_state
-    
+        h = F.rms_norm(h, (self.cfg.D,), self.final_norm_w)
+
+        # ─── Explicit Reasoning ───
+        if self.explicit_reasoning and hasattr(self, '_reasoning_buffer'):
+            reasoning_out, self._reasoning_buffer = self.reasoning_memory(
+                h, self._reasoning_buffer)
+            h = h + reasoning_out.unsqueeze(1)
+
+        return h, new_state, global_state
+
+    def reset_reasoning(self):
+        """Reset reasoning buffer (call at start of new sequence)."""
+        self._reasoning_buffer = None
+
     def embed_tokens(self, tokens):
         """Token indices -> D-space vectors."""
         return self.embed(tokens)

@@ -29,6 +29,14 @@ class WideBindConfig:
     tie_bind: bool = True  # True = W_out = W_proj^T (autoencoder bind bottleneck)
     tie_mirror_proj: bool = True  # True = mirror W_out = W_proj^T (per-expert K-space AE)
 
+    # Variable Precision Memory
+    variable_precision: bool = False  # True = add exact sequence memory on top of VSA
+    precision_threshold: float = 0.3  # gate threshold to activate exact memory
+
+    # Explicit Reasoning (chain-of-thought)
+    explicit_reasoning: bool = False  # True = enable thinking tokens and reasoning memory
+    reasoning_max_steps: int = 8  # max reasoning steps in chain-of-thought
+
     head_mode: str = "sigmoid_coded"
     head_normalize: bool = True
     code_dim: int = 32

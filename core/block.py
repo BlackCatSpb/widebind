@@ -11,6 +11,32 @@ from .concept_layer import CollectiveConceptLayer
 from .mlp import GroupedMLP
 from .vsa_utils import dct_basis, fib_sigmoid_init
 
+
+class PrecisionGate(nn.Module):
+    def __init__(self, D):
+        super().__init__()
+        self.gate = nn.Linear(D, 1)
+
+    def forward(self, h):
+        return torch.sigmoid(self.gate(h))
+
+
+class ExactSequenceMemory(nn.Module):
+    def __init__(self, D, k):
+        super().__init__()
+        self.query = nn.Linear(D, k)
+        self.key = nn.Linear(D, k)
+        self.value = nn.Linear(D, k)
+        self.proj = nn.Linear(k, D)
+        self.k = k
+
+    def forward(self, h):
+        q = self.query(h)
+        k = self.key(h)
+        v = self.value(h)
+        attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.k), dim=-1)
+        return self.proj(attn @ v)
+
 class WideBindBlock(nn.Module):
     """
     Hybrid block: D -> K (bottleneck bind) + VSA memory + Conv + Spectral + MLP.
@@ -124,6 +150,13 @@ class WideBindBlock(nn.Module):
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
                               swiglu=getattr(cfg, 'mlp_swiglu', True))
+
+        # ─── Variable Precision Memory ───
+        self.precision_gate = PrecisionGate(cfg.D)
+        exact_k = min(64, cfg.D // 4)
+        self.exact_memory = ExactSequenceMemory(cfg.D, exact_k)
+        self.variable_precision = getattr(cfg, 'variable_precision', False)
+        self.precision_threshold = getattr(cfg, 'precision_threshold', 0.3)
 
         self.collective = None
         col_idx = getattr(cfg, 'collective_layer_idx', None)
@@ -381,6 +414,16 @@ class WideBindBlock(nn.Module):
         self._cache_mirror_out = mirror  # for branch_loss (with grad)
         h = h + enhanced
         if _chk(h, 'post_enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+
+        # ─── Variable Precision Memory ───
+        if self.variable_precision:
+            precision = self.precision_gate(h)
+            if precision.mean() > self.precision_threshold:
+                exact = self.exact_memory(h)
+                h = h + precision * exact
+            self._precision_mean = precision.mean().item()
+
+        if _chk(h, 'post_precision'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
         h_dct = h @ self.V_dct.T
