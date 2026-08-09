@@ -662,7 +662,7 @@ WideBind/
 │   ├── colab.ipynb             # канонический ноутбук (D2560/24L, T4)
 │   └── widebind_colab.ipynb    # вариант D4096/16L (24GB+ вариант)
 │
-├── docs/                       # детальные документы (часть устарела)
+├── docs/                       # документы; TRAINING_JOURNAL.md — журнал обучения best.pt
 ├── checkpoints/                # сохранённые чекпоинты (best.pt, step_N.pt)
 ├── wb/                         # BPE-токенизатор
 ├── tests/                      # smoke-тесты
@@ -694,6 +694,8 @@ print(model.param_count())   # 138,369,232 (138.37M)
 - **Тренировка**: `python scripts/train.py --data-dir <dir> --save-dir …`
   (см. argparse в train.py) либо ноутбук `colab.ipynb`;
 - **Анализ чекпоинта**: `python scripts/analyze_checkpoint.py checkpoints/best.pt`.
+- **Журнал наблюдений за обучением**: `docs/TRAINING_JOURNAL.md` — динамика валидации,
+  фазы обучения, сравнение чекпоинтов, гипотезы (резервуар, эксперты-предикторы), watchlist.
 
 ---
 
