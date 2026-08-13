@@ -89,6 +89,21 @@ def main(path):
     flag = 'WAKE' if dev > 0.001 else ('WATCH' if dev > 0.0005 else 'PASS')
     verdict(report, flag, [], f"MLP W_std vs decay curve (marker #1, dev {dev:+.4f})")
 
+    per_layer = [(i, mlp_wstd[i] - expected) for i in range(n_layers)]
+    per_layer.sort(key=lambda t: -t[1])
+    top = per_layer[:3]
+    assert_flag = 'WAKE' if top[0][1] > 0.002 else ('WATCH' if top[0][1] > 0.001 else 'PASS')
+    hits = [f"L{li}: W_std dev {d:+.5f} (gate {torch.sigmoid(model.layers[li].mirror.mod_scale_mlp.data).mean().item():.3f})" for li, d in top]
+    verdict(report, assert_flag, hits, f"per-layer W_std deviation (marker #1b, worst {top[0][1]:+.5f})")
+
+    gmlp_all = [torch.sigmoid(l.mirror.mod_scale_mlp.data) for l in model.layers]
+    g_max = [(i, g.max().item()) for i, g in enumerate(gmlp_all)]
+    g_max.sort(key=lambda t: -t[1])
+    gtop = g_max[:3]
+    gflag = 'WAKE' if gtop[0][1] > 0.75 else ('WATCH' if gtop[0][1] > 0.72 else 'PASS')
+    ghit = [f"L{li}: gate max {v:.3f} mean {torch.sigmoid(model.layers[li].mirror.mod_scale_mlp.data).mean().item():.3f}" for li, v in gtop]
+    verdict(report, gflag, ghit, f"per-layer gate max (marker #2b, worst {gtop[0][1]:.3f}, wake >0.75)")
+
     g_mlp = sum(gate_mlp) / len(gate_mlp)
     g_mem = sum(gate_mem) / len(gate_mem) if gate_mem else float('nan')
     report.append(f"  sigmoid(mod_scale_mlp) mean={g_mlp:.3f}  sigmoid(mod_scale_mem) mean={g_mem:.3f}")
