@@ -283,6 +283,10 @@ if __name__ == '__main__':
     cfg = state.get('cfg', WideBindConfig())
     model = WideBindStack(cfg).to(device)
     model.load_state_dict(state['model'], strict=False)
+    if model.explicit_reasoning:
+        model.reasoning_enabled_step = int(state.get('reasoning_enabled_step', 0))
+        print(f'Reasoning: enabled, ramp t={model.reasoning_enabled_step} '
+              f'scale={model.reasoning_scale:.4f}')
     
     print(f'Loaded checkpoint: step={state.get("step", "?")}  params={model.param_count():,}')
     

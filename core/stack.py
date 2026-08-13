@@ -37,6 +37,9 @@ class WideBindStack(nn.Module):
         if self.explicit_reasoning:
             self.reasoning_memory = ReasoningMemory(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8))
             self.thinking_head = ThinkingTokenHead(cfg.D)
+            self._reasoning_buffer = None
+            self.reasoning_enabled_step = 0
+            self.reasoning_scale_override = None
 
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
         # ─── Idea 1: Learnable VSA timescales ───
@@ -214,12 +217,22 @@ class WideBindStack(nn.Module):
         h = F.rms_norm(h, (self.cfg.D,), self.final_norm_w)
 
         # ─── Explicit Reasoning ───
-        if self.explicit_reasoning and hasattr(self, '_reasoning_buffer'):
+        if self.explicit_reasoning:
             reasoning_out, self._reasoning_buffer = self.reasoning_memory(
                 h, self._reasoning_buffer)
-            h = h + reasoning_out.unsqueeze(1)
+            s = self.reasoning_scale
+            if s > 0.0:
+                h = h + s * reasoning_out.unsqueeze(1)
 
         return h, new_state, global_state
+
+    @property
+    def reasoning_scale(self):
+        if self.reasoning_scale_override is not None:
+            return self.reasoning_scale_override
+        k = max(getattr(self.cfg, 'reasoning_ramp_steps', 1000), 1)
+        t = self.reasoning_enabled_step
+        return max(1.0 - math.exp(-t / k), 1e-3)
 
     def reset_reasoning(self):
         """Reset reasoning buffer (call at start of new sequence)."""

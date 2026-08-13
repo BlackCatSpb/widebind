@@ -155,6 +155,7 @@ def train(cfg=None, resume_path=None):
                     pg['lr'] = lr
         start_step = ckpt['step']
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
+    reasoning_enabled_step = ckpt.get('reasoning_enabled_step', 0) if resume_path and os.path.exists(resume_path) else 0
     
     # State for recurrent layers
     state = None
@@ -176,6 +177,8 @@ def train(cfg=None, resume_path=None):
     try:
         for step in range(start_step, cfg.max_steps):
             model.train()
+            if model.explicit_reasoning:
+                model.reasoning_enabled_step = reasoning_enabled_step
             
             # в”Ђв”Ђв”Ђ Mixed stream sampling: pick a random position in a random stream в”Ђв”Ђв”Ђ
             # When offset reaches end of current stream, randomly pick next stream
@@ -186,6 +189,8 @@ def train(cfg=None, resume_path=None):
                 offset = 0
                 state = None  # reset state on stream switch (document boundary)
                 gs = None
+                if model.explicit_reasoning:
+                    model.reset_reasoning()  # new document: new chain
             
             # в”Ђв”Ђв”Ђ Multi-scale seq curriculum: С‡РµСЂРµРґРѕРІР°РЅРёРµ РґР»РёРЅС‹ Р±Р°С‚С‡Р° РїРѕ РѕРєС‚Р°РІР°Рј П„ в”Ђв”Ђв”Ђ
             # L=64 (П„в‰¤32, РѕРєС‚Р°РІС‹ 0вЂ“13): 7/9 С€Р°РіРѕРІ
@@ -330,6 +335,8 @@ def train(cfg=None, resume_path=None):
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+            if model.explicit_reasoning:
+                reasoning_enabled_step += 1
             
             current_lr = scheduler.get_last_lr()[0]
             
@@ -368,6 +375,7 @@ def train(cfg=None, resume_path=None):
                         'scheduler': scheduler.state_dict(),
                         'best_val_loss': best_val_loss,
                         'cfg': cfg,
+                        'reasoning_enabled_step': reasoning_enabled_step,
                     }, save_path)
                     print(f'  Saved best model to {save_path}')
                     generate_report(save_path)
@@ -382,6 +390,7 @@ def train(cfg=None, resume_path=None):
                     'scheduler': scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                     'cfg': cfg,
+                    'reasoning_enabled_step': reasoning_enabled_step,
                 }, save_path)
                 print(f'  Saved checkpoint to {save_path}')
                 generate_report(save_path)
@@ -395,6 +404,7 @@ def train(cfg=None, resume_path=None):
             'scheduler': scheduler.state_dict(),
             'best_val_loss': best_val_loss,
             'cfg': cfg,
+            'reasoning_enabled_step': reasoning_enabled_step,
         }, save_path)
         print(f'[WideBind] Saved interrupt checkpoint to {save_path}')
         generate_report(save_path)
@@ -407,6 +417,8 @@ def train(cfg=None, resume_path=None):
 @torch.no_grad()
 def evaluate(model, streams, cfg, device):
     model.eval()
+    if getattr(model, 'explicit_reasoning', False):
+        model.reset_reasoning()
     total_loss = 0.0
     total_steps = 0
     state = None
