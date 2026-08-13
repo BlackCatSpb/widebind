@@ -12,6 +12,130 @@ from core import WideBindConfig, WideBindStack
 from compression import FCF_CPR
 
 
+class AdaptiveSampler:
+    """Self-governing sampling in the spirit of the project's adaptive controllers.
+
+    No static knobs — every parameter follows the model's own state:
+      - softmax entropy H of the *raw* head logits is the genuine uncertainty signal;
+        H above its own EMA -> distribution is flat -> EXPLORE (warm, wide nucleus),
+        H below EMA -> sharp -> EXPLOIT (cool, narrow nucleus). Mirrors the
+        exploration_threshold semantics of AdaptiveController (stack.py:717).
+      - the head already flattens by exp(log_temp) inside (embedding.py:197); the
+        sampler normalizes generation temperature against it so base_temp means
+        the same thing across checkpoints.
+      - repetition escalator: repeated n-grams raise an alarm state E; penalty
+        strength grows with E and temperature is nudged up to break the loop
+        (the model's own restarts heal themselves the same way — no interventions).
+    """
+
+    def __init__(self, base_temp=0.8, top_k=40, base_top_p=0.90,
+                 rep_penalty=2.0, rep_window=5, rep_ngram=3,
+                 alarm_window=16, temp_range=(0.40, 1.60), p_range=(0.80, 0.99),
+                 ema_alpha=0.92, esc_growth=0.5, esc_decay=0.25,
+                 log_temp_ref=0.0, norm_log_temp=True, verbose=False):
+        self.base_temp = base_temp
+        self.top_k = top_k
+        self.base_top_p = base_top_p
+        self.rep_penalty = rep_penalty
+        self.rep_window = rep_window
+        self.rep_ngram = rep_ngram
+        self.alarm_window = alarm_window
+        self.temp_range = temp_range
+        self.p_range = p_range
+        self.ema_alpha = ema_alpha
+        self.esc_growth = esc_growth
+        self.esc_decay = esc_decay
+        self.log_temp_ref = log_temp_ref
+        self.norm_log_temp = norm_log_temp
+        self.verbose = verbose
+        self.mode = 'exploit'
+        self._H_ema = None
+        self._E = 0.0
+        self._last = []
+        self._log = []
+
+    def _run_entropy(self, logits):
+        probs = torch.softmax(logits.double(), dim=-1)
+        return -(probs * torch.log(probs.clamp_min(1e-12))).sum().item()
+
+    def _stuck_state(self):
+        hits = 0
+        n = self.rep_ngram
+        w = self._last[-self.alarm_window:]
+        if len(w) >= n + 1:
+            for i in range(len(w) - n):
+                for j in range(i + 1, len(w) - n + 1):
+                    if w[i:i + n] == w[j:j + n]:
+                        hits += 2
+        counts = {}
+        for t in w:
+            counts[t] = counts.get(t, 0) + 1
+        top = max(counts.values()) if counts else 0
+        if top >= 3:
+            hits += 1
+        return hits
+
+    def sample(self, logits, temp_factor_ext=None):
+        """Mature the raw head logits into the next token + decision record."""
+        H = self._run_entropy(logits)
+        if self._H_ema is None:
+            self._H_ema = H
+        self._H_ema = self.ema_alpha * self._H_ema + (1 - self.ema_alpha) * H
+        d = (H - self._H_ema) / max(self._H_ema, 1e-9)
+
+        # exploration / exploitation: flat -> explore, sharp -> exploit
+        f_t = 1.0 + 0.5 * math.tanh(2.0 * d)
+        p_eff = max(self.p_range[0], min(self.p_range[1],
+                                         self.base_top_p + 0.1 * math.tanh(3.0 * d)))
+
+        # repetition escalator
+        hits = self._stuck_state()
+        if hits >= 2:
+            self._E = min(self._E + self.esc_growth, 3.0)
+        else:
+            self._E = max(self._E - self.esc_decay, 0.0)
+        penalty = self.rep_penalty * (1.0 + 0.6 * self._E)
+        if self._E >= 1.0:
+            f_t = max(f_t, 1.0 + 0.2 * min(self._E, 2.0))
+
+        # temperature normalization against the head's learned log_temp
+        t = self.base_temp
+        if temp_factor_ext is not None:
+            t = t * temp_factor_ext
+        if self.norm_log_temp:
+            t = t / math.exp(max(self.log_temp_ref, -10.0))
+        t_eff = max(self.temp_range[0], min(self.temp_range[1], t * f_t))
+
+        z = logits / t_eff
+        for rid in list(self._last)[-self.rep_window:]:
+            z[rid] -= penalty
+        if self.top_k > 0:
+            vals, _ = torch.topk(z, self.top_k)
+            z[z < vals[-1:]] = -float('inf')
+        if p_eff < 1.0:
+            probs = torch.softmax(z, dim=-1)
+            sp, si = torch.sort(probs, dim=-1, descending=True)
+            cum = torch.cumsum(sp, dim=-1)
+            keep = cum <= p_eff
+            keep[..., 0] = True
+            mask = torch.zeros_like(z, dtype=torch.bool)
+            mask.scatter_(-1, si, keep)
+            z = z.masked_fill(~mask, -float('inf'))
+        probs = torch.softmax(z, dim=-1)
+        token = int(torch.multinomial(probs, 1).item())
+
+        self.mode = 'stuck' if self._E >= 1.0 else ('explore' if f_t > 1.02 else 'exploit')
+        self._last.append(token)
+        rec = dict(step=len(self._last), H=H, H_ema=self._H_ema, d=d,
+                   mode=self.mode, t_eff=t_eff, top_p=p_eff, penal=penalty, E=self._E)
+        self._log.append(rec)
+        if self.verbose and len(self._log) % 10 == 0:
+            print(f'  [{rec["mode"]:7s}] step={len(self._last):3d} '
+                  f'H={H:.2f} (ema {self._H_ema:.2f}) t={t_eff:.2f} p={p_eff:.2f} '
+                  f'pen={penalty:.2f} E={self._E:.2f}')
+        return token
+
+
 def load_russian_tokenizer(path=None):
     """Load BPE tokenizer from russian_tokenizer/tokenizer.json.
 
@@ -43,7 +167,8 @@ def load_russian_tokenizer(path=None):
 
 @torch.no_grad()
 def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
-             show_mind=False, continuous_learn=False, context_mem=None):
+             show_mind=False, continuous_learn=False, context_mem=None,
+             sampler=None, rep_penalty=2.0, rep_window=5):
     """Generate tokens from prompt string."""
     model.eval()
     device = next(model.parameters()).device
@@ -93,18 +218,18 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
             logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
         else:
             logits = head(out[:, -1:, :])[0, 0]
-        logits = logits / temperature
-        
-        # Repetition penalty: subtract fixed penalty (sign-safe)
-        for rid in list(recent)[-5:]:
-            logits[rid] -= 2.0
-        
-        if top_k > 0:
-            vals, _ = torch.topk(logits, top_k)
-            logits[logits < vals[-1:]] = -float('inf')
-        
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, 1)
+        if sampler is not None:
+            next_token = torch.tensor([sampler.sample(logits)], device=device)
+        else:
+            logits = logits / temperature
+            # Repetition penalty: subtract fixed penalty (sign-safe)
+            for rid in list(recent)[-rep_window:]:
+                logits[rid] -= rep_penalty
+            if top_k > 0:
+                vals, _ = torch.topk(logits, top_k)
+                logits[logits < vals[-1:]] = -float('inf')
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, 1)
         
         recent.add(next_token.item())
         tokens = torch.cat([tokens, next_token], dim=0)
@@ -131,6 +256,15 @@ if __name__ == '__main__':
     parser.add_argument('--show-mind', action='store_true', help='Log meta-cognitive mirror stats')
     parser.add_argument('--continuous-learn', action='store_true', help='Allow memory writes during generation')
     parser.add_argument('--context-mem', type=str, default='', help='Path to .pt file with context memory tensor (G, k)')
+    parser.add_argument('--static', action='store_true', help='Static sampling (old behavior); default is adaptive')
+    parser.add_argument('--top-p', type=float, default=0.90, help='Nucleus base (adaptive) or fixed width (--static)')
+    parser.add_argument('--rep-penalty', type=float, default=2.0, help='Base repetition penalty')
+    parser.add_argument('--rep-window', type=int, default=5, help='Repetition penalty window')
+    parser.add_argument('--rep-ngram', type=int, default=3, help='Repetition n-gram for escalation')
+    parser.add_argument('--alarm-window', type=int, default=16, help='Escalator observation window (wider than penalty window)')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed (0 = no seeding)')
+    parser.add_argument('--no-log-temp-norm', action='store_true', help='Disable log_temp normalization in adaptive mode')
+    parser.add_argument('--adaptive-verbose', action='store_true', help='Print adaptive sampler decisions every 10 steps')
     args = parser.parse_args()
     
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -155,10 +289,37 @@ if __name__ == '__main__':
         cm = torch.load(args.context_mem, map_location=device, weights_only=True)
         context_mem = cm.to(device)
 
+    if args.seed:
+        torch.manual_seed(args.seed)
+
+    sampler = None
+    if not args.static:
+        sampler = AdaptiveSampler(
+            base_temp=args.temperature, top_k=args.top_k, base_top_p=args.top_p,
+            rep_penalty=args.rep_penalty, rep_window=args.rep_window, rep_ngram=args.rep_ngram,
+            alarm_window=args.alarm_window,
+            norm_log_temp=not args.no_log_temp_norm, verbose=args.adaptive_verbose)
+        log_temp_val = None
+        for name, p in model.lm_head.named_parameters():
+            if 'log_temp' in name:
+                log_temp_val = p.data.mean().item()
+        if log_temp_val is not None:
+            sampler.log_temp_ref = log_temp_val
+            print(f'Adaptive sampler: base_temp={args.temperature} top_p={args.top_p} '
+                  f'rep_pen={args.rep_penalty} w={args.rep_window} ngram={args.rep_ngram} '
+                  f'log_temp_norm={sampler.norm_log_temp} ref={log_temp_val:.4f}')
+        else:
+            print(f'Adaptive sampler: base_temp={args.temperature} top_p={args.top_p} '
+                  f'rep_pen={args.rep_penalty} w={args.rep_window} ngram={args.rep_ngram} '
+                  f'log_temp_norm={sampler.norm_log_temp} (no log_temp in head)')
+    elif args.seed:
+        print(f'Static sampling, seeded: {args.seed}')
+
     if args.prompt:
         text = generate(model, args.prompt, args.tokens, args.temperature, args.top_k,
                         show_mind=args.show_mind, continuous_learn=args.continuous_learn,
-                        context_mem=context_mem)
+                        context_mem=context_mem, sampler=sampler,
+                        rep_penalty=args.rep_penalty, rep_window=args.rep_window)
         print(f'Prompt: {args.prompt}')
         print(f'Generated: {text}')
     else:
@@ -171,7 +332,8 @@ if __name__ == '__main__':
         for p in prompts:
             text = generate(model, p, 100, 0.8, 40,
                             show_mind=args.show_mind, continuous_learn=args.continuous_learn,
-                            context_mem=context_mem)
+                            context_mem=context_mem, sampler=sampler,
+                            rep_penalty=args.rep_penalty, rep_window=args.rep_window)
             print(f'> {p}')
             print(text)
             print()
