@@ -168,7 +168,7 @@ def load_russian_tokenizer(path=None):
 @torch.no_grad()
 def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
              show_mind=False, continuous_learn=False, context_mem=None,
-             sampler=None, rep_penalty=2.0, rep_window=5):
+             sampler=None, rep_penalty=2.0, rep_window=5, reset_reasoning=False):
     """Generate tokens from prompt string."""
     model.eval()
     device = next(model.parameters()).device
@@ -201,6 +201,8 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     for step in range(max_new_tokens):
         ctx = tokens[-L:].unsqueeze(0)
         
+        if reset_reasoning:
+            model.reset_reasoning()
         h = model.embed_tokens(ctx)
         out, state, _ = model(h, state, adaptive=False,
                               context_mem=context_mem, allow_write=allow_write)
@@ -263,6 +265,7 @@ if __name__ == '__main__':
     parser.add_argument('--rep-ngram', type=int, default=3, help='Repetition n-gram for escalation')
     parser.add_argument('--alarm-window', type=int, default=16, help='Escalator observation window (wider than penalty window)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed (0 = no seeding)')
+    parser.add_argument('--reset-reasoning', action='store_true', help='Ablation: reset reasoning buffer before every forward step')
     parser.add_argument('--no-log-temp-norm', action='store_true', help='Disable log_temp normalization in adaptive mode')
     parser.add_argument('--adaptive-verbose', action='store_true', help='Print adaptive sampler decisions every 10 steps')
     args = parser.parse_args()
@@ -319,7 +322,8 @@ if __name__ == '__main__':
         text = generate(model, args.prompt, args.tokens, args.temperature, args.top_k,
                         show_mind=args.show_mind, continuous_learn=args.continuous_learn,
                         context_mem=context_mem, sampler=sampler,
-                        rep_penalty=args.rep_penalty, rep_window=args.rep_window)
+                        rep_penalty=args.rep_penalty, rep_window=args.rep_window,
+                        reset_reasoning=args.reset_reasoning)
         print(f'Prompt: {args.prompt}')
         print(f'Generated: {text}')
     else:
@@ -333,7 +337,8 @@ if __name__ == '__main__':
             text = generate(model, p, 100, 0.8, 40,
                             show_mind=args.show_mind, continuous_learn=args.continuous_learn,
                             context_mem=context_mem, sampler=sampler,
-                            rep_penalty=args.rep_penalty, rep_window=args.rep_window)
+                            rep_penalty=args.rep_penalty, rep_window=args.rep_window,
+                            reset_reasoning=args.reset_reasoning)
             print(f'> {p}')
             print(text)
             print()
