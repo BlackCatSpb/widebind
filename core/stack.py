@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from .config import WideBindConfig
 from .block import WideBindBlock, PrecisionGate, ExactSequenceMemory
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
-from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens
+from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 
 class WideBindStack(nn.Module):
@@ -37,7 +37,11 @@ class WideBindStack(nn.Module):
         if self.explicit_reasoning:
             self.reasoning_memory = ReasoningMemory(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8))
             self.thinking_head = ThinkingTokenHead(cfg.D)
+            self.reasoning_gate = None
+            if getattr(cfg, 'reasoning_adaptive', False):
+                self.reasoning_gate = ReasoningGate(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8), know_dim=8)
             self._reasoning_buffer = None
+            self._reasoning_gates = None
             self.reasoning_enabled_step = 0
             self.reasoning_scale_override = None
 
@@ -75,6 +79,10 @@ class WideBindStack(nn.Module):
             sB = s0.shape[0] if isinstance(s0, torch.Tensor) else -1
             if sB != B:
                 state = [None] * len(self.layers)
+        if self.explicit_reasoning and self._reasoning_buffer:
+            sB = self._reasoning_buffer[0].shape[0]
+            if sB != B:
+                self._reasoning_buffer = None
         
         # ─── Learnable VSA scales (Idea 1) — moved before AdaptiveController loop ───
         vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
@@ -218,13 +226,162 @@ class WideBindStack(nn.Module):
 
         # ─── Explicit Reasoning ───
         if self.explicit_reasoning:
-            reasoning_out, self._reasoning_buffer = self.reasoning_memory(
-                h, self._reasoning_buffer)
             s = self.reasoning_scale
             if s > 0.0:
-                h = h + s * reasoning_out.unsqueeze(1)
+                if self.reasoning_gate is not None:
+                    h = self._adaptive_reasoning(h, s, new_state)
+                else:
+                    reasoning_out, self._reasoning_buffer = self.reasoning_memory(
+                        h, self._reasoning_buffer)
+                    h = h + s * reasoning_out.unsqueeze(1)
 
         return h, new_state, global_state
+
+    def _knowledge_signal(self, h, state=None):
+        """(B, know_dim) — how confident the model is in its own knowledge:
+        top-1/top-2 prob of last position, contradiction margin (top1-top2),
+        entropy of last position, position-averaged top-1/entropy, plus
+        collective-memory agreement and representation activity (experts:
+        specialization/collective memory/concept space).
+        Zero-initialized know_proj keeps resume unchanged."""
+        with torch.no_grad():
+            logits = self.lm_head(h)  # (B, L, V), normalized
+            p = logits.softmax(-1)
+            p1 = p.max(-1).values
+            p2 = p.topk(2, dim=-1).values[..., 1]
+            ent = -(p * p.clamp_min(1e-9).log()).sum(-1)
+            p_last = p[:, -1]
+            ent_last = -(p_last * p_last.clamp_min(1e-9).log()).sum(-1)
+            p1_last = p_last.max(-1).values
+            p2_last = p_last.topk(2, dim=-1).values[..., 1]
+            mem_agr = torch.zeros_like(p1_last)
+            if state is not None and len(state) > 0:
+                s_last = state[-1]
+                if s_last is not None and len(s_last) > 0 and s_last[0] is not None:
+                    mem = s_last[0]  # (B, S*D)
+                    B2 = mem.shape[0]
+                    if mem.numel() > 0 and mem.dim() == 2 and mem.shape[1] >= h.shape[-1] and mem.shape[1] % h.shape[-1] == 0:
+                        S = mem.shape[1] // h.shape[-1]
+                        mem_r = mem.reshape(B2, S, h.shape[-1])
+                        mem_std = mem_r.std(1).mean(1)  # (B,)
+                        mem_norm = mem_r.norm(dim=-1).mean(1).clamp_min(1e-9)
+                        mem_agr = (mem_std / mem_norm).clamp_max(5.0)
+            h_norm = h.norm(dim=-1).mean(1).clamp_max(5.0)
+            know = torch.stack([
+                p1_last, p2_last,
+                (p1_last - p2_last).clamp_min(0.0),
+                ent_last,
+                p1.mean(1),
+                ent.mean(1),
+                mem_agr,
+                h_norm,
+            ], dim=-1)  # (B, 8)
+        return know
+
+    def _last_conf(self, h):
+        """p1 of the last position — confidence of the head on `h`."""
+        with torch.no_grad():
+            logits = self.lm_head(h[:, -1:, :])
+            p = logits.softmax(-1)
+            return p.max(-1).values.squeeze(1)  # (B,)
+
+    def _adaptive_reasoning(self, h, s, state=None):
+        """Adaptive-depth reasoning loop: up to max_steps iterations, each gated
+        by ReasoningGate. Returns updated h and records per-step gates for stats.
+        Pure CE training signal — no aux losses, no conflict with the rest.
+        Gate input = model knowledge (confidence/contradictions) + accumulated
+        reasoning state, so depth adapts to knowledge gaps (uncertainty).
+        Sequential gating: step i executes only if the gate of step i-1 stayed
+        open, so an OFF gate still receives gradient (via the executed previous
+        step) and can open later. On resume the first gate is ~1 (bias +4) and
+        later gates ~0 (bias -8): the loop executes one full step plus one
+        ~zero-contribution step — output matches the old single-step path."""
+        K = getattr(self.cfg, 'reasoning_max_steps', 8)
+        stop_thr = getattr(self.cfg, 'reasoning_gate_stop_threshold', 0.5)
+        know = self._knowledge_signal(h)  # (B, 8)
+        conf_base = know[:, 0]  # head confidence on the raw h (B,)
+        h_acc = h
+        weighted = None   # Σ a_i·r_i — взвешенные знаками вклады (разность pos/neg)
+        denom_accum = 0.0 # Σ |a_i| — нормировка (стабильность масштаба)
+        gates = []
+        buf = self._reasoning_buffer
+        prev_open = 1.0
+        for i in range(K):
+            # Кандидат формализации — что шаг рассуждения предлагает.
+            # Вычисляется ДО гейта: гейт решает «беру/отбрасываю», зная
+            # сам кандидат (связь неизвестного с известным), а не вслепую.
+            # Запись в буфер коммитится только если гейт открыт (вклад ≠ 0):
+            # закрытый шаг не засоряет память (буфер = старое поведение).
+            r_i, buf_tmp = self.reasoning_memory(h, buf, record=True)
+            l_i = self.reasoning_gate.logits(h_acc, know, r_i.unsqueeze(1))[..., i].unsqueeze(-1)
+            a_i = torch.tanh(l_i)
+            if i > 0:
+                # Straight-through для закрытых гейтов (a≈0): обычный градиент
+                # tanh'(0)=1 живой, но при насыщении tanh'≈0 мёртв — через
+                # логит гейт может открыться/закрыться, если это выгодно.
+                a_i = l_i + (a_i - l_i).detach()
+            gates.append(a_i.detach().mean().item())
+            if prev_open < stop_thr:
+                break
+            if a_i.detach().mean().item() >= 0.5:
+                buf = buf_tmp
+            # Вклады шагов глубины нормируются по L2: гейт (tanh ∈ (−1,1))
+            # выбирает знак и силу, но не может через норму r_i взорвать
+            # h_acc — средневзвешенное стабильно при любом числе шагов.
+            # Шаг 0 без нормировки: сохраняет старое одностороннее поведение.
+            r_contrib = r_i.unsqueeze(1)
+            if i > 0:
+                r_contrib = F.normalize(r_contrib, dim=-1)
+            contrib = a_i * r_contrib
+            if i > 0:
+                # Валидация схождения «знание → лакуна → знание»: гейт уже дал
+                # право на вклад, зная кандидата; валидация лишь масштабирует
+                # СИЛУ вклада по реальному приросту уверенности головы. Не
+                # обнуляет градиент гейта: он течёт всегда (по знаку — открыть
+                # полезный шаг / закрыть вредный).
+                with torch.no_grad():
+                    h_n = F.normalize(h.mean(1), dim=-1)  # (B, D)
+                    field = h_n
+                    if state is not None and len(state) > 0:
+                        s_last = state[-1]
+                        if s_last is not None and len(s_last) > 0 and s_last[0] is not None:
+                            mem = s_last[0]
+                            if mem.dim() == 2 and mem.shape[1] % h.shape[-1] == 0:
+                                mem_n = F.normalize(
+                                    mem.reshape(mem.shape[0], -1, h.shape[-1]).mean(1), dim=-1)
+                                field = F.normalize(h_n + mem_n, dim=-1)
+                    r_n = F.normalize(r_i, dim=-1)
+                    sim = (r_n * field).sum(-1)  # (B,) связь с известным
+                    contrib_pre = contrib if weighted is None else weighted + contrib
+                    conf_after = self._last_conf(
+                        h + s * contrib_pre / (denom_accum + a_i.detach().clamp(min=0) + 1e-6))
+                    delta_norm = (conf_after - conf_base) / (conf_base + 1e-6)
+                    # Валидация по среднему батчу (не per-sample): per-sample
+                    # при conf≈0.016 шумит (delta_norm=±0.3), w_soft скачет —
+                    # вклад проходит неровно и дестабилизирует h_acc.
+                    delta_avg = delta_norm.mean().clamp(-1.0, 1.0)
+                    w_soft = torch.sigmoid(20.0 * delta_avg)  # скаляр: сила валидации
+                contrib = contrib * w_soft
+                gates[-1] = gates[-1] * w_soft.item()
+            # Знаменатель — только ВЗЯТЫЕ для рассуждения шаги (a_i > 0):
+            # антизнание (a_i < 0) вычитается в числителе — это концепт в
+            # своём потенциале, он не должен разбавлять нормировку и
+            # ослаблять полезный вклад шага 0.
+            w_i = a_i.detach().clamp(min=0)
+            if i > 0:
+                w_i = w_i * w_soft.item()
+            weighted = contrib if weighted is None else weighted + contrib
+            denom_accum = denom_accum + w_i
+            # Средневзвешенное с учётом разности положительного и
+            # отрицательного: нормировка по Σ|w_i| (фактические веса вкладов,
+            # с учётом валидации) держит масштаб стабильным при любом числе
+            # шагов; сегментированный шаг (w_soft→0) не ослабляет остальные.
+            accum = weighted / (denom_accum + 1e-6)
+            h_acc = h + s * accum
+            prev_open = a_i.detach().mean().item()
+        self._reasoning_buffer = buf
+        self._reasoning_gates = gates
+        return h_acc
 
     @property
     def reasoning_scale(self):
@@ -665,6 +822,10 @@ class WideBindStack(nn.Module):
                     # Block-level W_proj/W_out (not mirror, caught above) -> mlp speed (0.54x)
                     k = 'mlp_wd' if p.ndim >= 2 else 'mlp'
                     groups[k]['params'].append(p)
+                elif 'reasoning_gate' in name:
+                    # Adaptive reasoning gates — gate-like LR (fast adaptation), no decay
+                    k = 'gate' if p.ndim < 2 else 'gate_wd'
+                    groups[k]['params'].append(p)
                 elif any(g in name for g in ['.w_gate', '.b_gate', '.w_delta_gate', '.b_delta_gate',
                                               '.w_i', '.w_d', '.w_q', '.w_q_leaf', '.w_q_ctx', '.w_mem2v',
                                               '.w_k_mu', '.w_q_mu', '.w_mu_mem',
@@ -698,6 +859,8 @@ class WideBindStack(nn.Module):
                                                '.log_dvar_mod_scale', '.dvar_mod_bias',
                                                '.log_grad_mod_scale', '.grad_mod_bias',
                                                '.log_skip_alpha'])
+            if 'reasoning_gate' in name:
+                is_gate = True
             if is_gate:
                 if p.ndim < 2:
                     gate_no_decay.append(p)

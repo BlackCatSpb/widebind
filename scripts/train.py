@@ -353,9 +353,15 @@ def train(cfg=None, resume_path=None):
                 tok_s = tokens_seen / max(dt, 1e-8)
                 lc = getattr(model, '_cached_losses', {})
                 aux_str = ' '.join(f'{k}={v:.4f}' for k, v in lc.items())
+                gate_str = ''
+                rg = getattr(model, 'reasoning_gate', None)
+                if rg is not None:
+                    gates = getattr(model, '_reasoning_gates', None)
+                    if gates:
+                        gate_str = ' gates=' + str([round(g, 3) for g in gates])
                 print(f'  step={step:>6} loss={ce_loss.item():.4f} lr={current_lr:.2e} '
                       f'tok/s={tok_s:.0f} stream={stream_idx} '
-                      f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} | {aux_str}')
+                      f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} | {aux_str}{gate_str}')
             
             # Eval
             if step > 0 and step % cfg.eval_interval == 0:

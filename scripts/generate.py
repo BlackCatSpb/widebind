@@ -168,7 +168,8 @@ def load_russian_tokenizer(path=None):
 @torch.no_grad()
 def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
              show_mind=False, continuous_learn=False, context_mem=None,
-             sampler=None, rep_penalty=2.0, rep_window=5, reset_reasoning=False):
+             sampler=None, rep_penalty=2.0, rep_window=5, reset_reasoning=False,
+             bias_alpha=0.0):
     """Generate tokens from prompt string."""
     model.eval()
     device = next(model.parameters()).device
@@ -194,6 +195,7 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     
     recent = set()
     head = model.lm_head
+    tb = head.token_bias.data
     try:
         h_emb_ok = 'h_emb' in inspect.signature(head.forward).parameters
     except (TypeError, ValueError):
@@ -220,6 +222,8 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
             logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
         else:
             logits = head(out[:, -1:, :])[0, 0]
+        if bias_alpha != 1.0:
+            logits = (logits - tb) + bias_alpha * tb
         if sampler is not None:
             next_token = torch.tensor([sampler.sample(logits)], device=device)
         else:
@@ -253,7 +257,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default='')
     parser.add_argument('--tokens', type=int, default=200)
     parser.add_argument('--temperature', type=float, default=0.8)
-    parser.add_argument('--top-k', type=int, default=40)
+    parser.add_argument('--top-k', type=int, default=0)
     parser.add_argument('--device', type=str, default='')
     parser.add_argument('--show-mind', action='store_true', help='Log meta-cognitive mirror stats')
     parser.add_argument('--continuous-learn', action='store_true', help='Allow memory writes during generation')
@@ -266,9 +270,18 @@ if __name__ == '__main__':
     parser.add_argument('--alarm-window', type=int, default=16, help='Escalator observation window (wider than penalty window)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed (0 = no seeding)')
     parser.add_argument('--reset-reasoning', action='store_true', help='Ablation: reset reasoning buffer before every forward step')
+    parser.add_argument('--reasoning', choices=['natural', 'off', 'full'], default='off',
+                        help='Reasoning scale: natural (learned ramp), off (0.0), full (1.0)')
+    parser.add_argument('--bias-alpha', type=float, default=0.0,
+                        help='Head token_bias weight: logits = (logits - tb) + alpha*tb (0.0 = no bias, best)')
     parser.add_argument('--no-log-temp-norm', action='store_true', help='Disable log_temp normalization in adaptive mode')
     parser.add_argument('--adaptive-verbose', action='store_true', help='Print adaptive sampler decisions every 10 steps')
     args = parser.parse_args()
+
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
     
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -287,6 +300,7 @@ if __name__ == '__main__':
         model.reasoning_enabled_step = int(state.get('reasoning_enabled_step', 0))
         print(f'Reasoning: enabled, ramp t={model.reasoning_enabled_step} '
               f'scale={model.reasoning_scale:.4f}')
+    model.reasoning_scale_override = {'natural': None, 'off': 0.0, 'full': 1.0}[args.reasoning]
     
     print(f'Loaded checkpoint: step={state.get("step", "?")}  params={model.param_count():,}')
     
@@ -327,7 +341,7 @@ if __name__ == '__main__':
                         show_mind=args.show_mind, continuous_learn=args.continuous_learn,
                         context_mem=context_mem, sampler=sampler,
                         rep_penalty=args.rep_penalty, rep_window=args.rep_window,
-                        reset_reasoning=args.reset_reasoning)
+                        reset_reasoning=args.reset_reasoning, bias_alpha=args.bias_alpha)
         print(f'Prompt: {args.prompt}')
         print(f'Generated: {text}')
     else:
@@ -338,11 +352,11 @@ if __name__ == '__main__':
             'Искусственный интеллект',
         ]
         for p in prompts:
-            text = generate(model, p, 100, 0.8, 40,
+            text = generate(model, p, 100, 0.8, 0,
                             show_mind=args.show_mind, continuous_learn=args.continuous_learn,
                             context_mem=context_mem, sampler=sampler,
                             rep_penalty=args.rep_penalty, rep_window=args.rep_window,
-                            reset_reasoning=args.reset_reasoning)
+                            reset_reasoning=args.reset_reasoning, bias_alpha=args.bias_alpha)
             print(f'> {p}')
             print(text)
             print()

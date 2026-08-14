@@ -37,6 +37,8 @@ class WideBindConfig:
     explicit_reasoning: bool = False  # True = enable thinking tokens and reasoning memory
     reasoning_max_steps: int = 8  # max reasoning steps in chain-of-thought
     reasoning_ramp_steps: int = 1000  # exp ramp of block influence: scale = 1 - exp(-t/ramp)
+    reasoning_adaptive: bool = False  # True = per-step gates (adaptive depth); False = old single step
+    reasoning_gate_stop_threshold: float = 0.5  # loop stops when mean gate < threshold
 
     # AMP (Automatic Mixed Precision)
     use_amp: bool = False  # True = mixed precision (requires CUDA, ~2x speed)
