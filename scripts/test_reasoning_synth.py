@@ -145,7 +145,7 @@ def main():
     log('=== Сценарий 3: resume из чекпоинта adaptive (strict=False) ===')
     ckpt_path = os.path.join(args.save_dir, 'adaptive.pt')
     cfg_r = make_cfg(True)
-    model_r, losses_r = run_training(cfg_r, steps=args.steps // 2, seed=99,
+    model_r, losses_r = run_training(cfg_r, steps=args.steps, seed=99,
                                      start_from=ckpt_path, log=log)
     log(f'  RESUME CE start = {losses_r[0]:.4f} | end = {losses_r[-1]:.4f}')
 

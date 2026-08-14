@@ -48,6 +48,52 @@ def create_lr_scheduler(optimizer, warmup, max_steps, lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
 
 
+def _restore_optimizer(optimizer, model, ckpt_opt):
+    """Restore AdamW state by parameter name.
+
+    Survives params added after the checkpoint was saved (reasoning_gate,
+    reasoning_proj): positional load would either fail (group size mismatch)
+    or silently shift state onto the wrong params, so we re-map by name.
+    Checkpoint param order == current order without the new gate params.
+    """
+    flat = [(id(p), tuple(p.shape)) for g in optimizer.param_groups for p in g['params']]
+    names = {id(p): n for n, p in model.named_parameters()}
+    old = ckpt_opt
+    try:
+        optimizer.load_state_dict(old)
+        if all(tuple(sd['exp_avg'].shape) == flat[i][1]
+               for i, sd in optimizer.state_dict()['state'].items()):
+            return True
+    except ValueError:
+        pass
+    new_sd = optimizer.state_dict()
+    new_sd['state'] = {}
+    no_gate = [(names[id(p)], p) for g in optimizer.param_groups for p in g['params']
+               if not names[id(p)].startswith('reasoning_gate.')]
+    pos = {id(p): i for i, (n, p) in enumerate(
+        (names[id(p)], p) for g in optimizer.param_groups for p in g['params'])}
+    moved = skipped = 0
+    for si, (n, p) in enumerate(no_gate):
+        st = old['state'].get(si)
+        if st is None:
+            continue
+        if tuple(st['exp_avg'].shape) != tuple(p.shape):
+            skipped += 1
+            print(f'  Optimizer state shape mismatch at {si} {n}: '
+                  f'{tuple(st["exp_avg"].shape)} vs {tuple(p.shape)}')
+            continue
+        new_sd['state'][pos[id(p)]] = {k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                                       for k, v in st.items()}
+        moved += 1
+    for gi in range(min(len(new_sd['param_groups']), len(old['param_groups']))):
+        if 'lr' in old['param_groups'][gi]:
+            new_sd['param_groups'][gi]['lr'] = old['param_groups'][gi]['lr']
+    optimizer.load_state_dict(new_sd)
+    if skipped:
+        print(f'  WARNING: {skipped} optimizer slots skipped (shape mismatch), {moved} restored')
+    return moved > 0
+
+
 def train(cfg=None, resume_path=None):
     if cfg is None:
         cfg = WideBindConfig()
@@ -135,7 +181,8 @@ def train(cfg=None, resume_path=None):
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
             print(f'  Unexpected keys (old arch): {len(unexpected)}')
-        optimizer.load_state_dict(ckpt['optimizer'])
+        if not _restore_optimizer(optimizer, model, ckpt['optimizer']):
+            print('  WARNING: optimizer state could not be restored (fresh Adam)')
         if 'scheduler' in ckpt:
             sched_sd = ckpt['scheduler']
             if sched_sd.get('type') == 'MirrorLRScheduler':
