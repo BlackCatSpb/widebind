@@ -10,7 +10,7 @@ Checks all watchlist markers from docs/TRAINING_JOURNAL.md §5:
 
 Usage:
   python scripts/check_wake.py <path/to/checkpoint.pt>
-Baselines set at step 10485 (val 8.6706). Verdict:
+Baselines set at step 1398 (fresh run from zero, val 10.9306). Verdict:
   PASS | WATCH | WAKE-CANDIDATE
 """
 import sys, os, io
@@ -22,10 +22,10 @@ from torch.serialization import add_safe_globals
 from core import WideBindConfig, WideBindStack
 add_safe_globals([WideBindConfig])
 
-REF_STEP = 10485
-W_STD_REF = 0.0695          # MLP mean W_std at REF_STEP
+REF_STEP = 1398
+W_STD_REF = 0.0705          # MLP mean W_std at REF_STEP
 DECAY_RATE = 1.6e-6         # empirical per-step decay (wd=0.01, lr_eff~8.9e-5)
-EMPTY_SLOT_LAYERS = {13, 14, 16, 17, 18, 20, 21}
+EMPTY_SLOT_LAYERS = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
 
 SIG = {'PASS': 'PASS ', 'WATCH': 'WATCH', 'WAKE': 'WAKE '}
 
@@ -116,7 +116,7 @@ def main(path):
     full = [i for i, o in slot_occ.items() if o >= 8]
     report.append(f"  slots occupied: {sum(slot_occ.values())}/192, full layers: {len(full)}, births in empty: {births}")
     flag = 'WAKE' if births else 'PASS'
-    verdict(report, flag, [], f"slot births in empty layers L13-14/16-18/20-21: {births or 'none'}")
+    verdict(report, flag, [], f"slot births in empty layers L10-23: {births or 'none'}")
     if temp_vals:
         t_mean = sum(temp_vals) / len(temp_vals)
         report.append(f"  _temp mean={t_mean:.3f}")
@@ -144,7 +144,7 @@ def main(path):
         if 'log_temp' in name:
             log_temp = p.data
     if log_temp is not None:
-        report.append(f"  log_temp mean={log_temp.mean().item():+.4f} (ref +0.1351 at 10485)")
+        report.append(f"  log_temp mean={log_temp.mean().item():+.4f} (ref +0.0188 at 1398)")
         if log_temp.mean().item() > 0.25:
             verdict(report, 'WATCH', [], 'log_temp rising (softmax flattening)')
 
