@@ -143,7 +143,7 @@ class GroupedCognitiveMirror(nn.Module):
         self._pm_write_delay = 5000
         if has_private_mem:
             self.register_buffer('_private_mem', torch.randn(G, self.k) * 0.01)
-            self.register_buffer('_pm_step', torch.zeros(1, dtype=torch.long), persistent=False)
+            self.register_buffer('_pm_step', torch.zeros(1, dtype=torch.long))
             # w_help init = log(3.0) -> sigmoid ~0.75: strong initial presence, prevents cold-start suppression
             self.w_help = nn.Parameter(torch.full((G, 1), math.log(3.0)))  # per-expert scale for recalled help
             self.w_contra = nn.Parameter(torch.full((G,), 0.01))  # small positive: disagreement opens gate by default
