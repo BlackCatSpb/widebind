@@ -295,6 +295,23 @@ def run_wake(model, ckpt):
     for line in report:
         print(line)
 
+    return {
+        'verdict': hdr,
+        'report': report,
+        'step': step,
+        'mlp_wstd': mlp_wstd,
+        'gate_mlp_mean': gate_mlp,
+        'gate_max_layers': [i for i, _ in g_max],
+        'gate_max': [v for _, v in g_max],
+        'dev_layers': [i for i, _ in per_layer],
+        'dev': [d for _, d in per_layer],
+        'wstd': wstd, 'expected': expected, 'dev_mean': dev,
+        'g_mlp': g_mlp, 'g_mem': g_mem,
+        'slots': sum(slot_occ.values()), 'full': len(full), 'births': births,
+        'temp_mean': (sum(temp_vals) / len(temp_vals)) if temp_vals else None,
+        'mat_locked': n_zero if mat_counts else None,
+    }
+
 
 # ─────────────────────────── LIVE ───────────────────────────
 
@@ -321,10 +338,23 @@ def run_live(model, cfg, batch=1, seq=128):
           f'{"w_delta":>7s}'
     print(hdr)
     print('-' * len(hdr))
+    rows = []
     for i, layer in enumerate(model.layers):
         m = layer.mirror
         hp = m._cached_hp
         pk = m._cached_pred_k
+        rows.append({
+            'layer': i, 'hp': hp.norm(dim=-1).mean().item(),
+            'predMSE': F.mse_loss(pk, hp.detach()).item(),
+            'mirror': m._last_magnitude.item(),
+            'gate': m._cached_gate_l1.item(),
+            'gate_var': m._last_gates.var().item(),
+            'a1': (1 - m.alpha_diag.data).abs().mean().item(),
+            'ls_expM': m.log_scale.data.exp().max().item(),
+            'ls_std': m.log_scale.data.std().item(),
+            'skip': math.exp(m.log_skip_alpha.data.mean().item()),
+            'w_delta': m.w_delta_gate.data.abs().mean().item(),
+        })
         print(f'{i:3d} {hp.norm(dim=-1).mean().item():8.3f} '
               f'{F.mse_loss(pk, hp.detach()).item():8.3f} '
               f'{m._last_magnitude.item():9.3f} {m._cached_gate_l1.item():7.5f} '
@@ -338,30 +368,37 @@ def run_live(model, cfg, batch=1, seq=128):
     print('\nSIGNALS (sigmoid + softmax share) L0, mid, last:')
     names = ['temp', 'pred', 'smooth', 'sym'] + (
         ['help'] if model.layers[0].mirror._has_private_mem else [])
+    signals = []
     for i in (0, len(model.layers) // 2, len(model.layers) - 1):
         m = model.layers[i].mirror
         w = torch.sigmoid(m._signal_log_weights)
         p = torch.softmax(m._signal_log_weights, dim=0)
+        signals.append({'layer': i, 'sigmoid': w.tolist(), 'share': p.tolist(),
+                        'names': names})
         print(f'  L{i}: sigmoid={["%.3f" % v for v in w.tolist()]}  '
               f'share={["%.3f" % v for v in p.tolist()]}  names={names}')
 
     print('\nMIRROR PARAMS L0, mid, last:')
+    mirror_rows = []
     for i in (0, len(model.layers) // 2, len(model.layers) - 1):
         m = model.layers[i].mirror
-        print(f'  L{i}: alpha_diag mean={m.alpha_diag.data.mean().item():.4f} '
-              f'min={m.alpha_diag.data.min().item():.4f} max={m.alpha_diag.data.max().item():.4f} | '
-              f'log_scale mean={m.log_scale.data.mean().item():.4f} '
-              f'max={m.log_scale.data.max().item():.4f} | '
-              f'tanh_bias mean={m.tanh_bias.data.mean().item():.4f} '
-              f'max={m.tanh_bias.data.max().item():.4f} | '
-              f'b_gate={m.b_gate.data.mean().item():.4f} gate_bias={m.gate_bias.data.mean().item():.4f} | '
-              f'mod_mlp(σ)={torch.sigmoid(m.mod_scale_mlp.data).mean().item():.3f} '
-              f'mod_mem(σ)={torch.sigmoid(m.mod_scale_mem.data).mean().item():.3f} | '
-              f'gate_ema={m._gate_ema.data.mean().item():.4f}')
+        row = {
+            'layer': i,
+            'alpha_diag': (m.alpha_diag.data.mean().item(), m.alpha_diag.data.min().item(),
+                           m.alpha_diag.data.max().item()),
+            'log_scale': (m.log_scale.data.mean().item(), m.log_scale.data.max().item()),
+            'tanh_bias': (m.tanh_bias.data.mean().item(), m.tanh_bias.data.max().item()),
+            'b_gate': m.b_gate.data.mean().item(),
+            'gate_bias': m.gate_bias.data.mean().item(),
+            'mod_mlp': torch.sigmoid(m.mod_scale_mlp.data).mean().item(),
+            'mod_mem': torch.sigmoid(m.mod_scale_mem.data).mean().item(),
+            'gate_ema': m._gate_ema.data.mean().item(),
+        }
         if m._has_private_mem:
-            print(f'      w_help(σ)={torch.sigmoid(m.w_help.data).mean().item():.3f} '
-                  f'w_contra={m.w_contra.data.mean().item():.4f} '
-                  f'pm_norm={m._private_mem.norm(dim=-1).mean().item():.3f}')
+            row['w_help'] = torch.sigmoid(m.w_help.data).mean().item()
+            row['w_contra'] = m.w_contra.data.mean().item()
+            row['pm_norm'] = m._private_mem.norm(dim=-1).mean().item()
+        mirror_rows.append(row)
 
     vsa_log = model._vsa_log_param
     vsa_tau = torch.exp(torch.cumsum(F.softplus(vsa_log), dim=0)) + 1.0
@@ -371,6 +408,18 @@ def run_live(model, cfg, batch=1, seq=128):
     pm = getattr(model, '_private_mem', None)
     if pm is not None:
         print(f'  model private_mem norm: {pm.norm(dim=-1).mean().item():.3f}')
+
+    return {
+        'in_norm': h.norm(dim=-1).mean().item(),
+        'out_norm': h_out.norm(dim=-1).mean().item(),
+        'out_std': h_out.std().item(),
+        'ce_random': ls.item(), 'pred': aux['pred'], 'gate_l1': aux['gate_l1'],
+        'balance': aux['balance'],
+        'rows': rows, 'signals': signals, 'mirror': mirror_rows,
+        'vsa_tau': [vsa_tau[0].item(), vsa_tau[-1].item()],
+        'tau_l_dev': td.mean().item(), 'tau_l_dev_std': td.std().item(),
+        'pm_norm': pm.norm(dim=-1).mean().item() if pm is not None else None,
+    }
 
 
 # ─────────────────────────── HEAD ───────────────────────────
@@ -439,12 +488,14 @@ def run_head(model, ckpt, args, tok):
     print('\n  POSMAP: pos | top-1 avg | H avg | punct% | word%')
     bins = [(0, 0, 15), (16, 15, 33), (32, 31, 65), (64, 63, 129), (128, 127, 193),
             (192, 191, 225), (224, 223, 241), (240, 239, 249), (250, 249, L - 1)]
+    bins_out = []
     for label, lo, hi in bins:
         span = hi - lo + 1
         top1 = sum(posmap[p]['top1'] / posmap[p]['cnt'] for p in range(lo, hi + 1)) / span
         H = sum(posmap[p]['H'] / posmap[p]['cnt'] for p in range(lo, hi + 1)) / span
         pc = sum(posmap[p]['punct'] for p in range(lo, hi + 1)) / span * 100
         wc = sum(posmap[p]['word'] for p in range(lo, hi + 1)) / span * 100
+        bins_out.append({'label': label, 'top1': top1, 'H': H, 'punct': pc, 'word': wc})
         print(f'  {label:3d} | {top1:.4f} | {H:.3f} | {pc:5.1f}% | {wc:5.1f}%')
 
     print('\n  A/B REASONING (одно окно, top-1/H + KL):')
@@ -465,6 +516,18 @@ def run_head(model, ckpt, args, tok):
     pn, po = res['natural'][4].clamp_min(1e-12), res['OFF'][4].clamp_min(1e-12)
     print(f'    KL natural||OFF = {(pn * torch.log2(pn / po)).sum().item():.4f} bit | '
           f'KL OFF||natural = {(po * torch.log2(po / pn)).sum().item():.4f} bit')
+
+    return {
+        'log_temp': log_temp, 't_eff': t_eff,
+        'token_bias_top': [tok.decode([int(i)]) for i in torch.topk(tb, 5).indices.tolist()],
+        'bias_decomp': {'match': stats['match'], 'total': stats['total'],
+                        'pct': 100.0 * stats['match'] / max(stats['total'], 1),
+                        'ctx_word': stats['ctx_word'], 'ctx_punct': stats['ctx_punct'],
+                        'full_word': stats['full_word'], 'full_punct': stats['full_punct']},
+        'posmap': bins_out,
+        'ab': {m: {'top1': v[0], 'H': v[1], 's_top1': v[2], 's_H': v[3]}
+               for m, v in res.items()},
+    }
 
 
 # ─────────────────────────── CMP ───────────────────────────
@@ -502,6 +565,157 @@ def run_cmp(models, args, tok):
         model.reasoning_scale_override = None
 
 
+# ─────────────────────────── HTML ───────────────────────────
+
+def _hue(v, vmin, vmax):
+    t = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
+    return 120 * (1.0 - t)
+
+
+def save_html_report(ckpt, cfg, model, wake, live, head):
+    import html as H
+    path = ckpt.get('_path', '?')
+    step = ckpt.get('step', '?')
+    stem = os.path.splitext(path)[0]
+    out = stem + '_report.html'
+    best = ckpt.get('best_val_loss', float('inf'))
+    params = model.param_count() / 1e6
+
+    badge = lambda flag: (f'<span class="bdg b-{flag}">{flag}</span>'
+                          if flag in ('PASS', 'WATCH', 'WAKE') else flag)
+    ch = []
+    ch.append('<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">')
+    ch.append('<title>WideBind report step ' + str(step) + '</title><style>')
+    ch.append('''body{background:#0d1117;color:#c9d1d9;font:14px/1.5 Consolas,monospace;margin:24px}
+h1{font-size:20px;color:#f0f6fc}h2{font-size:16px;color:#79c0ff;border-bottom:1px solid #30363d;padding-bottom:4px;margin-top:28px}
+.cards{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:8px 14px;min-width:110px}
+.card b{display:block;font-size:18px;color:#f0f6fc}.card span{font-size:11px;color:#8b949e;text-transform:uppercase}
+table{border-collapse:collapse;margin:10px 0}th,td{border:1px solid #30363d;padding:4px 10px;text-align:right}
+th{background:#161b22;color:#8b949e;font-size:11px;text-transform:uppercase}
+td:first-child,th:first-child{text-align:left}
+.bdg{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:bold}
+.b-PASS{background:#1f6f2f;color:#7ee787}.b-WATCH{background:#6b4d00;color:#e3b341}.b-WAKE{background:#6e1a1a;color:#ff7b72}
+.heat{display:flex;gap:3px;margin:10px 0}.hc{flex:1;text-align:center;font-size:10px;color:#8b949e;border-radius:4px;padding:4px 0}
+.bar{background:#21262d;border-radius:4px;height:14px;position:relative;margin:2px 0;overflow:hidden}
+.bar i{position:absolute;left:0;top:0;bottom:0;background:#58a6ff;border-radius:4px}
+.bar span{position:absolute;left:6px;top:0;font-size:10px;color:#e6edf3}
+.g{color:#7ee787}.y{color:#e3b341}.r{color:#ff7b72}.dim{color:#8b949e}''')
+    ch.append('</style></head><body>')
+    ch.append(f'<h1>WideBind — {H.escape(os.path.basename(path))}</h1>')
+    ch.append(f'<div class="dim">step={step} &nbsp; best_val={best:.4f} &nbsp; params={params:.2f}M '
+              f'&nbsp; {wake["verdict"]}</div>')
+
+    ch.append('<div class="cards">')
+    cards = [
+        ('Step', str(step)), ('Best val', f'{best:.4f}'),
+        ('MLP W_std', f'{wake["wstd"]:.4f}'), ('dev', f'{wake["dev_mean"]:+.4f}'),
+        ('mod_mlp σ', f'{wake["g_mlp"]:.3f}'), ('mod_mem σ', f'{wake["g_mem"]:.3f}'),
+        ('slots', f'{wake["slots"]}/192'), ('full L', str(wake["full"])),
+        ('births', str(wake["births"])), ('CE(rand)', f'{live["ce_random"]:.3f}'),
+        ('pred', f'{live["pred"]:.3f}'), ('gate_l1', f'{live["gate_l1"]:.5f}'),
+        ('tau_l_dev', f'{live["tau_l_dev"]:.4f}'),
+    ]
+    for k, v in cards:
+        ch.append(f'<div class="card"><b>{v}</b><span>{k}</span></div>')
+    ch.append('</div>')
+
+    ch.append('<h2>WAKE DETECTOR</h2>')
+    for line in wake['report']:
+        flag = ''
+        for f in ('WAKE', 'WATCH', 'PASS'):
+            if line.strip().startswith(f'[{f}]') or (f + ' ') in line[:12]:
+                flag = f
+                break
+        esc = H.escape(line)
+        if flag:
+            esc = esc.replace(f'[{flag}]', badge(flag), 1)
+        ch.append(f'<div>{esc}</div>')
+
+    ch.append('<h2>Per-layer gate max (wake &gt; 0.75)</h2>')
+    ch.append('<div class="heat">')
+    for lyr, v in zip(wake['gate_max_layers'], wake['gate_max']):
+        hue = _hue(v, 0.60, 0.80)
+        ch.append(f'<div class="hc" title="L{lyr}: {v:.4f}" style="background:hsl({hue:.0f},75%,32%)">'
+                  f'{lyr}<br>{v:.2f}</div>')
+    ch.append('</div>')
+
+    ch.append('<h2>Per-layer W_std dev (marker #1b)</h2>')
+    ch.append('<div class="heat">')
+    for lyr, d in zip(wake['dev_layers'], wake['dev']):
+        hue = _hue(d, 0.0, 0.004)
+        ch.append(f'<div class="hc" title="L{lyr}: {d:+.5f}" style="background:hsl({hue:.0f},75%,32%)">'
+                  f'{lyr}<br>{d:+.4f}</div>')
+    ch.append('</div>')
+
+    ch.append('<h2>LIVE — per-layer dissection</h2>')
+    ch.append('<table><tr><th>L</th><th>||hp||</th><th>predMSE</th><th>|mirror|</th>'
+              '<th>gate</th><th>gate_var</th><th>|1-a|</th><th>ls_expM</th><th>ls_std</th>'
+              '<th>skip</th><th>w_delta</th></tr>')
+    for r in live['rows']:
+        ch.append('<tr><td>' + str(r['layer']) + '</td><td>' + f"{r['hp']:.3f}" +
+                  '</td><td>' + f"{r['predMSE']:.3f}" + '</td><td>' + f"{r['mirror']:.3f}" +
+                  '</td><td>' + f"{r['gate']:.4f}" + '</td><td>' + f"{r['gate_var']:.4f}" +
+                  '</td><td>' + f"{r['a1']:.4f}" + '</td><td>' + f"{r['ls_expM']:.2f}" +
+                  '</td><td>' + f"{r['ls_std']:.4f}" + '</td><td>' + f"{r['skip']:.3f}" +
+                  '</td><td>' + f"{r['w_delta']:.5f}" + '</td></tr>')
+    ch.append('</table>')
+
+    ch.append('<h2>SIGNALS (softmax share)</h2>')
+    for s in live['signals']:
+        ch.append(f'<div class="dim">L{s["layer"]}: ' +
+                  ' '.join(f'{n}={v:.3f}' for n, v in zip(s['names'], s['share'])) + '</div>')
+        for n, v in zip(s['names'], s['share']):
+            w = v * 100
+            ch.append(f'<div class="bar"><i style="width:{w:.1f}%"></i>'
+                      f'<span>{n} {v:.3f}</span></div>')
+
+    ch.append('<h2>MIRROR PARAMS (L0 / mid / last)</h2>')
+    ch.append('<table><tr><th>L</th><th>α_diag</th><th>log_scale</th><th>tanh_bias</th>'
+              '<th>b_gate</th><th>gate_bias</th><th>mod_mlp σ</th><th>mod_mem σ</th>'
+              '<th>gate_ema</th><th>w_help σ</th><th>w_contra</th><th>pm_norm</th></tr>')
+    for r in live['mirror']:
+        ch.append('<tr><td>' + str(r['layer']) + '</td><td>' +
+                  f"{r['alpha_diag'][0]:.3f}" + '</td><td>' + f"{r['log_scale'][0]:.2f}" +
+                  '</td><td>' + f"{r['tanh_bias'][0]:.3f}" + '</td><td>' +
+                  f"{r['b_gate']:.3f}" + '</td><td>' + f"{r['gate_bias']:.3f}" +
+                  '</td><td>' + f"{r['mod_mlp']:.3f}" + '</td><td>' +
+                  f"{r['mod_mem']:.3f}" + '</td><td>' + f"{r['gate_ema']:.3f}" + '</td><td>' +
+                  (f"{r.get('w_help', 0):.3f}" if r.get('w_help') is not None else '—') +
+                  '</td><td>' + (f"{r.get('w_contra', 0):.4f}" if r.get('w_contra') is not None else '—') +
+                  '</td><td>' + (f"{r.get('pm_norm', 0):.3f}" if r.get('pm_norm') is not None else '—') +
+                  '</td></tr>')
+    ch.append('</table>')
+
+    if head:
+        ch.append('<h2>HEAD</h2>')
+        bd = head['bias_decomp']
+        cls = 'g' if bd['pct'] < 90 else 'r'
+        ch.append(f'<div>BIAS-DECOMP: argmax==bias <b class="{cls}">{bd["match"]}/{bd["total"]} '
+                  f'({bd["pct"]:.1f}%)</b> &nbsp; ctx: word={bd["ctx_word"]} punct={bd["ctx_punct"]} '
+                  f'&nbsp; full: word={bd["full_word"]} punct={bd["full_punct"]}</div>')
+        ch.append('<table><tr><th>pos</th><th>top-1</th><th>H</th><th>punct%</th><th>word%</th></tr>')
+        for b in head['posmap']:
+            ch.append(f'<tr><td>{b["label"]}</td><td>{b["top1"]:.4f}</td><td>{b["H"]:.3f}</td>'
+                      f'<td>{b["punct"]:.1f}%</td><td>{b["word"]:.1f}%</td></tr>')
+        ch.append('</table>')
+        ch.append('<table><tr><th>mode</th><th>top-1</th><th>H</th><th>sampler top-1</th><th>sampler H</th></tr>')
+        for m, v in head['ab'].items():
+            ch.append(f'<tr><td>{m}</td><td>{v["top1"]:.4f}</td><td>{v["H"]:.3f}</td>'
+                      f'<td>{v["s_top1"]:.4f}</td><td>{v["s_H"]:.3f}</td></tr>')
+        ch.append('</table>')
+        ch.append('<div class="dim">token_bias top: ' +
+                  ', '.join(H.escape(repr(t)) for t in head['token_bias_top']) +
+                  f' &nbsp; log_temp={head["log_temp"]:.4f} t_eff={head["t_eff"]:.4f}</div>')
+
+    ch.append('<p class="dim">generated by analyze.py &mdash; ' +
+              f'step {step}, best val {best:.4f}, {params:.2f}M params</p>')
+    ch.append('</body></html>')
+    with open(out, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(ch))
+    print(f'\nHTML report: {out}')
+
+
 # ─────────────────────────── MAIN ───────────────────────────
 
 def main():
@@ -514,6 +728,7 @@ def main():
     ap.add_argument('--prompt', type=str, default='')
     ap.add_argument('--temp', type=float, default=0.8)
     ap.add_argument('--seq', type=int, default=128, help='live forward seq_len')
+    ap.add_argument('--no-html', action='store_true', help='skip HTML report generation')
     args = ap.parse_args()
 
     tok = None
@@ -540,20 +755,28 @@ def main():
         except Exception as e:
             print(f'[error] static: {e}')
         try:
-            run_wake(model, ckpt)
+            wake_data = run_wake(model, ckpt)
         except Exception as e:
             print(f'[error] wake: {e}')
+            wake_data = None
+        live_data = None
+        head_data = None
         if not args.quick:
             if not args.no_live:
                 try:
-                    run_live(model, cfg, seq=args.seq)
+                    live_data = run_live(model, cfg, seq=args.seq)
                 except Exception as e:
                     print(f'[error] live: {e}')
             if tok is not None:
                 try:
-                    run_head(model, ckpt, args, tok)
+                    head_data = run_head(model, ckpt, args, tok)
                 except Exception as e:
                     print(f'[error] head: {e}')
+        if not args.no_html and wake_data is not None:
+            try:
+                save_html_report(ckpt, cfg, model, wake_data, live_data, head_data)
+            except Exception as e:
+                print(f'[error] html: {e}')
 
     if len(models) > 1 and tok is not None:
         try:
