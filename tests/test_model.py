@@ -327,7 +327,7 @@ def test_stack_forward():
     model = WideBindStack(cfg).to(device)
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)
     h = model.embed_tokens(x)
-    out, state, global_state = model(h)
+    out, state, global_state, _ = model(h)
     assert out.shape == h.shape, f'Output shape: {out.shape} vs input {h.shape}'
     assert len(state) == cfg.n_layers, f'State len: {len(state)} vs {cfg.n_layers}'
     assert global_state.shape == (cfg.n_layers, 1, cfg.D), f'Global state shape: {global_state.shape}'
@@ -338,8 +338,8 @@ def test_stack_forward_twice_with_state():
     model = WideBindStack(cfg).to(device)
     x = torch.randint(0, cfg.vocab, (1, 8), device=device)
     h = model.embed_tokens(x)
-    out1, state1, gs1 = model(h)
-    out2, state2, gs2 = model(h, state1, gs1)
+    out1, state1, gs1, _ = model(h)
+    out2, state2, gs2, _ = model(h, state1, gs1)
     assert out2.shape == out1.shape
 
 
@@ -348,7 +348,7 @@ def test_stack_loss():
     model = WideBindStack(cfg).to(device)
     x = torch.randint(0, cfg.vocab, (2, 16), device=device)
     h = model.embed_tokens(x)
-    out, _, _ = model(h)
+    out, _, _, _ = model(h)
     loss = model.compute_loss(out[:, :-1], x[:, 1:])
     assert loss.item() > 0, f'Loss should be positive: {loss.item()}'
     loss.backward()
@@ -388,7 +388,7 @@ def test_strict_false_compatibility():
     # Loss should still work
     x = torch.randint(0, cfg.vocab, (1, 4))
     h = model.embed_tokens(x)
-    out, _, _ = model(h)
+    out, _, _, _ = model(h)
     loss = model.compute_loss(out[:, :-1], x[:, 1:])
     assert not torch.isnan(loss), 'Loss is NaN after strict=False load'
 
@@ -602,7 +602,7 @@ def test_model_with_zeckendorf_readout():
     model = WideBindStack(cfg)
     assert isinstance(model.lm_head, ZeckendorfReadout)
     h = torch.randn(1, 4, 896)
-    out, new_state, gs = model(h)
+    out, new_state, gs, _ = model(h)
     targets = torch.randint(0, cfg.vocab, (1, 4))
     loss = model.compute_loss(out, targets)
     assert loss.item() > 0
@@ -725,7 +725,7 @@ def test_large_config_forward():
     assert n > 0
     x = torch.randint(0, cfg.vocab, (1, 4))
     h = model.embed_tokens(x)
-    out, state, gs = model(h)
+    out, state, gs, _ = model(h)
     assert out.shape == (1, 4, 3584)
 
 
@@ -759,7 +759,7 @@ def test_alpha_deviation_on_structured_data():
     for step in range(100):
         x = torch.randint(0, 100, (2, 8))
         h = model.embed_tokens(x)
-        out, _, _ = model(h, None)
+        out, _, _, _ = model(h, None)
         loss = model.compute_loss(out, x)
         loss.backward()
         opt.step()
@@ -798,7 +798,7 @@ def test_D4096_G32_forward():
     model = WideBindStack(cfg)
     x = torch.randint(0, 100, (1, 4))
     h = model.embed_tokens(x)
-    out, _, _ = model(h, None)
+    out, _, _, _ = model(h, None)
     assert out.shape == (1, 4, 4096)
     n = model.param_count()
     # D=4096, L=2 should be ~16.4M (refactored with bind/mlp submodules)

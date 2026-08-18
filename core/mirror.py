@@ -467,9 +467,9 @@ class GroupedCognitiveMirror(nn.Module):
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
         
         usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)
-        self._fwd_count += 1
-        prog = 1.0 - math.exp(-self._fwd_count.item() / 200.0)
-        temp = max(0.3, 3.0 * math.exp(-prog * 2.0))
+        self._fwd_count = self._fwd_count + 1
+        prog = 1.0 - torch.exp(-self._fwd_count / 200.0)
+        temp = torch.clamp(3.0 * torch.exp(-prog * 2.0), min=0.3, max=3.0)
         with torch.no_grad():
             srt_u, _ = torch.sort(usefulness_logits, dim=-1)
             n_u = srt_u.shape[-1]
@@ -544,9 +544,10 @@ class GroupedCognitiveMirror(nn.Module):
         mirror = mirror * expert_gate.unsqueeze(-1)
         mirror = mirror.reshape(B, L, D)
         
-        self._last_magnitude.fill_(mirror.abs().mean().item())
-        self._last_gates.copy_(expert_gate.detach().mean(dim=(0, 1)))
-        self._last_h_pool.copy_(h_g.detach().mean(dim=(0, 1)))
+        with torch.no_grad():
+            self._last_magnitude.fill_(mirror.abs().mean())
+            self._last_gates.copy_(expert_gate.detach().mean(dim=(0, 1)))
+            self._last_h_pool.copy_(h_g.detach().mean(dim=(0, 1)))
         
         return mirror, mlp_mod, mem_mod
     

@@ -73,7 +73,7 @@ def main():
         model.reasoning_enabled_step = step
         x, y = make_batch(cfg, rng)
         h = model.embed_tokens(x)
-        out, state, _ = model(h, None, adaptive=False)
+        out, state, _, _ = model(h, None, adaptive=False)
         ce = model.compute_loss(out, y, h_emb=h)
         opt.zero_grad(set_to_none=True)
         ce.backward()
@@ -95,7 +95,7 @@ def main():
     # Проверка градиента на отдельном батче после обучения
     x, y = make_batch(cfg, rng)
     h = model.embed_tokens(x)
-    out, _, _ = model(h, None, adaptive=False)
+    out, _, _, _ = model(h, None, adaptive=False)
     ce = model.compute_loss(out, y, h_emb=h)
     opt.zero_grad(set_to_none=True)
     ce.backward()
@@ -116,7 +116,7 @@ def main():
             x, _ = make_batch(cfg, rng)
             model.reset_reasoning()
             h = model.embed_tokens(x)
-            out, _, _ = model(h, None, adaptive=False)
+            out, _, _, _ = model(h, None, adaptive=False)
             avg_steps.append(len(model._reasoning_gates))
     avg = sum(avg_steps) / len(avg_steps)
     log(f'  avg loop steps (eval): {avg:.2f}')

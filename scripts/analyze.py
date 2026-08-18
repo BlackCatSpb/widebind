@@ -321,7 +321,7 @@ def run_live(model, cfg, batch=1, seq=128):
     model.train()
     x = torch.randint(0, cfg.vocab, (batch, seq), device=device)
     h = model.embed_tokens(x)
-    h_out, _, _ = model(h)
+    h_out, _, _, _ = model(h)
 
     sec('LIVE (forward на случайном входе)')
     print(f'INPUT/OUTPUT:  in_norm={h.norm(dim=-1).mean().item():.3f}  '
@@ -427,7 +427,7 @@ def run_live(model, cfg, batch=1, seq=128):
 def _head_forward(model, window, tok):
     with torch.no_grad():
         h = model.embed_tokens(window.unsqueeze(0))
-        out, _, _ = model(h, None, adaptive=False)
+        out, _, _, _ = model(h, None, adaptive=False)
         return model.lm_head(out[0])
 
 
@@ -552,7 +552,7 @@ def run_cmp(models, args, tok):
             model.reset_reasoning()
             with torch.no_grad():
                 h = model.embed_tokens(ctx)
-                out, _, _ = model(h, None, adaptive=False)
+                out, _, _, _ = model(h, None, adaptive=False)
                 logits = model.lm_head(out[:, -1:, :])[0, 0]
             eff = args.temp / math.exp(log_temp)
             for tname, z in (('raw', logits.double()), ('sampler', logits.double() / eff)):

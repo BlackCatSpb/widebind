@@ -41,6 +41,7 @@ class WideBindStack(nn.Module):
             if getattr(cfg, 'reasoning_adaptive', False):
                 self.reasoning_gate = ReasoningGate(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8), know_dim=8)
             self._reasoning_buffer = None
+            self._reasoning_count = None
             self._reasoning_gates = None
             self.reasoning_enabled_step = 0
             self.reasoning_scale_override = None
@@ -62,12 +63,17 @@ class WideBindStack(nn.Module):
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
-                context_mem=None, allow_write=None, step=None):
+                context_mem=None, allow_write=None, step=None,
+                reasoning_buffer=None, reasoning_count=None):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
            pred_weight: adaptive alpha auxiliary loss weight (or None to compute)
            adaptive: if True, run AdaptiveController (training); if False, skip for speed (inference)
+           reasoning_buffer: (B, max_steps, D) tensor of previous reasoning steps
+           (or None → use module attribute, legacy path); reasoning_count: scalar
+           long tensor = valid rows (or None)
+           Returns (h, state, global_state, (reasoning_buffer, reasoning_count)).
         """
         if state is None:
             state = [None] * len(self.layers)
@@ -79,10 +85,17 @@ class WideBindStack(nn.Module):
             sB = s0.shape[0] if isinstance(s0, torch.Tensor) else -1
             if sB != B:
                 state = [None] * len(self.layers)
-        if self.explicit_reasoning and self._reasoning_buffer:
-            sB = self._reasoning_buffer[0].shape[0]
+        if reasoning_buffer is None:
+            reasoning_buffer = getattr(self, '_reasoning_buffer', None)
+            reasoning_count = getattr(self, '_reasoning_count', None)
+            _reasoning_attr = True
+        else:
+            _reasoning_attr = False
+        if self.explicit_reasoning and reasoning_buffer is not None:
+            sB = reasoning_buffer.shape[0]
             if sB != B:
-                self._reasoning_buffer = None
+                reasoning_buffer = None
+                reasoning_count = None
         
         # ─── Learnable VSA scales (Idea 1) — moved before AdaptiveController loop ───
         vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
@@ -215,7 +228,7 @@ class WideBindStack(nn.Module):
                     global_state[i:i+1] = gs_i + (1.0 - alpha_l.detach()) * self._gs_velocity[i:i+1]
                 else:
                     global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
-                s_out = tuple(t.detach() for t in s_out)
+                s_out = tuple(t.detach() if t is not None else None for t in s_out)
             new_state.append(s_out)
             if adaptive:
                 mir = layer.mirror
@@ -229,13 +242,16 @@ class WideBindStack(nn.Module):
             s = self.reasoning_scale
             if s > 0.0:
                 if self.reasoning_gate is not None:
-                    h = self._adaptive_reasoning(h, s, new_state)
+                    h = self._adaptive_reasoning(h, s, new_state, reasoning_buffer, reasoning_count)
                 else:
-                    reasoning_out, self._reasoning_buffer = self.reasoning_memory(
-                        h, self._reasoning_buffer)
+                    reasoning_out, reasoning_buffer, reasoning_count = self.reasoning_memory(
+                        h, reasoning_buffer, reasoning_count)
                     h = h + s * reasoning_out.unsqueeze(1)
+        if _reasoning_attr:
+            self._reasoning_buffer = reasoning_buffer
+            self._reasoning_count = reasoning_count
 
-        return h, new_state, global_state
+        return h, new_state, global_state, (reasoning_buffer, reasoning_count)
 
     def _knowledge_signal(self, h, state=None):
         """(B, know_dim) — how confident the model is in its own knowledge:
@@ -285,7 +301,7 @@ class WideBindStack(nn.Module):
             p = logits.softmax(-1)
             return p.max(-1).values.squeeze(1)  # (B,)
 
-    def _adaptive_reasoning(self, h, s, state=None):
+    def _adaptive_reasoning(self, h, s, state=None, reasoning_buffer=None, reasoning_count=None):
         """Adaptive-depth reasoning loop: up to max_steps iterations, each gated
         by ReasoningGate. Returns updated h and records per-step gates for stats.
         Pure CE training signal — no aux losses, no conflict with the rest.
@@ -295,7 +311,11 @@ class WideBindStack(nn.Module):
         open, so an OFF gate still receives gradient (via the executed previous
         step) and can open later. On resume the first gate is ~1 (bias +4) and
         later gates ~0 (bias -8): the loop executes one full step plus one
-        ~zero-contribution step — output matches the old single-step path."""
+        ~zero-contribution step — output matches the old single-step path.
+        Static-graph form: the loop always executes K iterations, but the
+        data-dependent `break` becomes a tensor run-mask — non-running steps
+        contribute exactly zero. Numerically identical to the python loop;
+        required for torch.export (no python control flow on tensor values)."""
         K = getattr(self.cfg, 'reasoning_max_steps', 8)
         stop_thr = getattr(self.cfg, 'reasoning_gate_stop_threshold', 0.5)
         know = self._knowledge_signal(h)  # (B, 8)
@@ -304,15 +324,20 @@ class WideBindStack(nn.Module):
         weighted = None   # Σ a_i·r_i — взвешенные знаками вклады (разность pos/neg)
         denom_accum = 0.0 # Σ |a_i| — нормировка (стабильность масштаба)
         gates = []
-        buf = self._reasoning_buffer
-        prev_open = 1.0
+        buf = reasoning_buffer
+        count = reasoning_count
+        if buf is None:
+            buf = torch.zeros(h.shape[0], K, h.shape[-1], device=h.device, dtype=h.dtype)
+        if count is None:
+            count = torch.zeros((), dtype=torch.long, device=h.device)
+        prev_open = torch.ones((), device=h.device)
         for i in range(K):
             # Кандидат формализации — что шаг рассуждения предлагает.
             # Вычисляется ДО гейта: гейт решает «беру/отбрасываю», зная
             # сам кандидат (связь неизвестного с известным), а не вслепую.
             # Запись в буфер коммитится только если гейт открыт (вклад ≠ 0):
             # закрытый шаг не засоряет память (буфер = старое поведение).
-            r_i, buf_tmp = self.reasoning_memory(h, buf, record=True)
+            r_i, buf_tmp, count_tmp = self.reasoning_memory(h, buf, count, record=True)
             l_i = self.reasoning_gate.logits(h_acc, know, r_i.unsqueeze(1))[..., i].unsqueeze(-1)
             a_i = torch.tanh(l_i)
             if i > 0:
@@ -320,11 +345,11 @@ class WideBindStack(nn.Module):
                 # tanh'(0)=1 живой, но при насыщении tanh'≈0 мёртв — через
                 # логит гейт может открыться/закрыться, если это выгодно.
                 a_i = l_i + (a_i - l_i).detach()
-            gates.append(a_i.detach().mean().item())
-            if prev_open < stop_thr:
-                break
-            if a_i.detach().mean().item() >= 0.5:
-                buf = buf_tmp
+            # run: шаг исполняется, если предыдущий не закрыл цикл (break)
+            run = prev_open >= stop_thr  # scalar bool tensor
+            commit = run & (a_i.detach().mean() >= 0.5)
+            buf = torch.where(commit, buf_tmp, buf)
+            count = torch.where(commit, count_tmp, count)
             # Вклады шагов глубины нормируются по L2: гейт (tanh ∈ (−1,1))
             # выбирает знак и силу, но не может через норму r_i взорвать
             # h_acc — средневзвешенное стабильно при любом числе шагов.
@@ -333,6 +358,7 @@ class WideBindStack(nn.Module):
             if i > 0:
                 r_contrib = F.normalize(r_contrib, dim=-1)
             contrib = a_i * r_contrib
+            w_soft = torch.ones((), device=h.device)
             if i > 0:
                 # Валидация схождения «знание → лакуна → знание»: гейт уже дал
                 # право на вклад, зная кандидата; валидация лишь масштабирует
@@ -362,14 +388,13 @@ class WideBindStack(nn.Module):
                     delta_avg = delta_norm.mean().clamp(-1.0, 1.0)
                     w_soft = torch.sigmoid(20.0 * delta_avg)  # скаляр: сила валидации
                 contrib = contrib * w_soft
-                gates[-1] = gates[-1] * w_soft.item()
+            # run-маска: неисполненные шаги дают ровно ноль вклада
+            contrib = contrib * run.float()
             # Знаменатель — только ВЗЯТЫЕ для рассуждения шаги (a_i > 0):
             # антизнание (a_i < 0) вычитается в числителе — это концепт в
             # своём потенциале, он не должен разбавлять нормировку и
             # ослаблять полезный вклад шага 0.
-            w_i = a_i.detach().clamp(min=0)
-            if i > 0:
-                w_i = w_i * w_soft.item()
+            w_i = a_i.detach().clamp(min=0) * w_soft * run.float()
             weighted = contrib if weighted is None else weighted + contrib
             denom_accum = denom_accum + w_i
             # Средневзвешенное с учётом разности положительного и
@@ -378,9 +403,10 @@ class WideBindStack(nn.Module):
             # шагов; сегментированный шаг (w_soft→0) не ослабляет остальные.
             accum = weighted / (denom_accum + 1e-6)
             h_acc = h + s * accum
-            prev_open = a_i.detach().mean().item()
-        self._reasoning_buffer = buf
-        self._reasoning_gates = gates
+            prev_open = a_i.detach().mean()
+            gates.append(a_i.detach().mean() * w_soft * run.float())
+        if gates:
+            self._reasoning_gates = torch.stack(gates)
         return h_acc
 
     @property
@@ -394,6 +420,7 @@ class WideBindStack(nn.Module):
     def reset_reasoning(self):
         """Reset reasoning buffer (call at start of new sequence)."""
         self._reasoning_buffer = None
+        self._reasoning_count = None
 
     def embed_tokens(self, tokens):
         """Token indices -> D-space vectors."""

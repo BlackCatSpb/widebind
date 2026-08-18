@@ -79,7 +79,7 @@ def run_training(cfg, steps=400, seed=42, save_every=None, save_path=None,
         model.reset_reasoning()
         x, y = make_batch(cfg, rng)
         h = model.embed_tokens(x)
-        out, state, _ = model(h, None, adaptive=False)
+        out, state, _, _ = model(h, None, adaptive=False)
         ce = model.compute_loss(out, y, h_emb=h)
         opt.zero_grad(set_to_none=True)
         ce.backward()
@@ -113,7 +113,7 @@ def gate_depth_stats(model, cfg, rng, depth_max=4, n=16, trials=8):
                 d = int(x[b, 1].item()) - 16
                 model.reset_reasoning()
                 h = model.embed_tokens(x[b:b + 1])
-                out, _, _ = model(h, None, adaptive=False)
+                out, _, _, _ = model(h, None, adaptive=False)
                 gates = model._reasoning_gates
                 by_depth[d].append(len(gates))
     return {d: (sum(v) / len(v)) for d, v in by_depth.items() if v}

@@ -182,9 +182,13 @@ class WideBindBlock(nn.Module):
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
                 context_mem=None, allow_write=None, tau_s=None, step=None):
-        mem_state = mu_state = conv_state = None
+        mem_state = mu_state = conv_state = traj_state = pen = None
         if state is not None:
-            mem_state, mu_state, conv_state = state
+            mem_state, mu_state, conv_state = state[:3]
+            if len(state) > 3:
+                traj_state = state[3]
+            if len(state) > 4:
+                pen = state[4]
         B, L, D = h.shape
         NaN = float('nan')
         self._nan_at = None
@@ -205,18 +209,13 @@ class WideBindBlock(nn.Module):
         _nan_mem = torch.zeros(B, S * D, device=device) * NaN
         
         # Transfer stale mirror cache (with shape & dtype check)
-        if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
-            pen = self.mirror._cached_pred_error_norm
+        if pen is None:
+            pen = getattr(self.mirror, '_cached_pred_error_norm', None)
+        if pen is not None:
             if pen.shape[-1] != L or pen.shape[0] != B:
-                self.mirror._cached_pred_error_norm = None
+                pen = None
             else:
                 self.mirror._cached_pred_error_norm = pen.detach().to(device=device, dtype=h.dtype)
-        if hasattr(self.mirror, '_cached_hp') and self.mirror._cached_hp is not None:
-            hp_cached = self.mirror._cached_hp
-            if hp_cached.shape[1] != L or hp_cached.shape[0] != B:
-                self.mirror._cached_hp = None
-            else:
-                self.mirror._cached_hp = hp_cached.detach().to(device=device, dtype=h.dtype)
         
         # ─── Pre-LN ───
         h = self.pre_ln_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
@@ -229,25 +228,24 @@ class WideBindBlock(nn.Module):
         h_conv = h_conv[..., :L].transpose(1, 2)
         conv_state_out = h_perm[:, :, -(self.conv.padding[0]):]
         h = h + h_conv
-        if _chk(h, 'conv'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h, 'conv'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         self._cache_conv_out = h_conv  # for branch_loss (with grad)
         
         if isinstance(self.bind, TrajectorySpiralBind):
-            traj_state = getattr(self, '_traj_state', None)
-            if traj_state is not None and (traj_state[0].shape[1] != L
-                                           or traj_state[0].shape[0] != B):
+            if traj_state is None:
+                traj_state = getattr(self, '_traj_state', None)
+            if traj_state is not None and (traj_state.shape[2] != L
+                                           or traj_state.shape[0] != B):
                 traj_state = None
             bind_out, new_traj = self.bind(h, traj_state)
             if traj_state is None:
-                self._traj_state = [t.detach() for t in new_traj]
+                self._traj_state = new_traj.detach()
             else:
-                self._traj_state = [
-                    0.9 * old.detach() + 0.1 * new.detach()
-                    for old, new in zip(traj_state, new_traj)
-                ]
+                self._traj_state = (0.9 * traj_state + 0.1 * new_traj).detach()
         else:
             bind_out = self.bind(h)
-        if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+            new_traj = None
+        if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
         S = self._n_scales
@@ -379,7 +377,7 @@ class WideBindBlock(nn.Module):
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
         mu_state_out = mu_state_out_vec.reshape(B, S * D)
-        if _chk(mem_read, 'mem_read'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(mem_read, 'mem_read'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
         # ─── Mirror (self-consistency: local + global) ───
         # fp32-якорь: exp/log/softmax в mirror переполняются в fp16 под AMP
@@ -393,9 +391,9 @@ class WideBindBlock(nn.Module):
             mirror = mirror.to(h.dtype)
             mlp_mod = mlp_mod.to(h.dtype) if isinstance(mlp_mod, torch.Tensor) else mlp_mod
             mem_mod = mem_mod.to(h.dtype) if isinstance(mem_mod, torch.Tensor) else mem_mod
-        if _chk(mirror, 'mirror'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
-        if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
-        if _chk(mem_mod, 'mem_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(mirror, 'mirror'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
+        if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
+        if _chk(mem_mod, 'mem_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
         # ─── Output (adaptive memory scale, per-group modulation) ───
         # mem_mod: per-token, per-expert gating of memory contribution
@@ -426,27 +424,28 @@ class WideBindBlock(nn.Module):
             if hp_c is not None and pen_c is not None:
                 col_out = self.collective(
                     h, hp_c, pen_c,
-                    resvar=self.mirror._residual_var_ema.mean().item(),
+                    resvar=self.mirror._residual_var_ema.mean(),
                     allow_write=self.training)
                 if col_out is not None:
                     enhanced = enhanced + col_out
-        if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         self._cache_bind_out = enhanced_base  # for branch_loss (with grad)
         self._cache_mirror_out = mirror  # for branch_loss (with grad)
         h = h + enhanced
-        if _chk(h, 'post_enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h, 'post_enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
 
         # ─── Variable Precision Memory ───
         if self.variable_precision:
-            # fp32-якорь: softmax в exact_memory переполняется в fp16 под AMP
+            # fp32-якорь: softmax в exact_memory переполняется в fp16 под AMP.
+            # Гейт встроен тензорной маской (не python-if): статический граф.
             with torch.autocast(device_type=h.device.type, enabled=False):
                 precision = self.precision_gate(h.float())
-                if precision.mean() > self.precision_threshold:
-                    exact = self.exact_memory(h.float())
-                    h = h + (precision * exact).to(h.dtype)
-            self._precision_mean = precision.mean().item()
+                gate = (precision.mean() > self.precision_threshold).to(h.dtype)
+                exact = self.exact_memory(h.float())
+                h = h + (precision * exact * gate).to(h.dtype)
+            self._precision_mean = precision.mean()
 
-        if _chk(h, 'vpm'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h, 'vpm'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
         # ─── Spectral (adaptive: diff modulates frequency shaping) ───
         # fp32-якорь: DCT-базис даёт -inf в fp16 под AMP
@@ -454,17 +453,19 @@ class WideBindBlock(nn.Module):
             h_dct = h.float() @ self.V_dct.T
             h_dct = h_dct * self.lambda_k.float() * float(spectral_mod)
             h = h + (h_dct @ self.V_dct).to(h.dtype)
-        if _chk(h, 'spectral'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h, 'spectral'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
         # ─── MLP (per-group modulation by mlp_mod) ───
         h_mlp = self.mlp(h)
-        if _chk(h_mlp, 'mlp_out'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h_mlp, 'mlp_out'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         mm2 = mlp_mod.unsqueeze(-1)  # (B, L, G, 1)
         h_mlp = (h_mlp.reshape(B, L, g, d) * mm2).reshape(B, L, D)
         h = h + h_mlp
-        if _chk(h, 'post_mlp'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv)
+        if _chk(h, 'post_mlp'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
-        return h, (mem_state_out, mu_state_out, conv_state_out)
+        pen_out = getattr(self.mirror, '_cached_pred_error_norm', None)
+        traj_state_out = getattr(self, '_traj_state', None)
+        return h, (mem_state_out, mu_state_out, conv_state_out, traj_state_out, pen_out)
     
     @property
     def base_parameters(self):

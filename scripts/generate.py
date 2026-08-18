@@ -190,6 +190,7 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     # Generate
     state = None
     allow_write = continuous_learn or None
+    rb = None
     
     mind_log = []
     
@@ -205,9 +206,12 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
         
         if reset_reasoning:
             model.reset_reasoning()
+            rb = None
         h = model.embed_tokens(ctx)
-        out, state, _ = model(h, state, adaptive=False,
-                              context_mem=context_mem, allow_write=allow_write)
+        out, state, _, rb = model(h, state, adaptive=False,
+                                  context_mem=context_mem, allow_write=allow_write,
+                                  reasoning_buffer=rb[0] if rb is not None else None,
+                                  reasoning_count=rb[1] if rb is not None else None)
         
         if show_mind and step % 10 == 0:
             info = model.layers[0].mirror.debug_mind()
@@ -276,7 +280,12 @@ if __name__ == '__main__':
                         help='Head token_bias weight: logits = (logits - tb) + alpha*tb (0.0 = no bias, best)')
     parser.add_argument('--no-log-temp-norm', action='store_true', help='Disable log_temp normalization in adaptive mode')
     parser.add_argument('--adaptive-verbose', action='store_true', help='Print adaptive sampler decisions every 10 steps')
+    parser.add_argument('--threads', type=int, default=0,
+                        help='CPU threads for torch (0 = torch default; 12 best on i5-12450H)')
     args = parser.parse_args()
+
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
 
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')

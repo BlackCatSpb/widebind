@@ -43,7 +43,7 @@ def inspect(cfg, model, ckpt):
 
     x = torch.randint(0, cfg.vocab, (2, min(64, cfg.seq_len)))
     h = model.embed_tokens(x)
-    out, _, _ = model(h)
+    out, _, _, _ = model(h)
     info['out_std'] = round(out.std().item(), 4)
     ls, _, _, _, _ = model.compute_loss(out[:, :-1], x[:, 1:])
     info['loss'] = round(ls.item(), 4)

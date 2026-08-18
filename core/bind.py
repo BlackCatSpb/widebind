@@ -1,4 +1,4 @@
-﻿"""WideBind: bind module."""
+"""WideBind: bind module."""
 
 import math, os
 import torch
@@ -348,16 +348,11 @@ class TrajectorySpiralBind(nn.Module):
 
         # Build trajectory: use traj_state only if sequence length matches
         if traj_state is not None:
-            state_L = traj_state[0].shape[1]
-            if state_L != L or traj_state[0].shape[0] != B:
+            if traj_state.shape[2] != L or traj_state.shape[0] != B:
                 traj_state = None
-
-        if traj_state is None or len(traj_state) < self.n_dims - 1:
-            n_have = 0 if traj_state is None else len(traj_state)
-            padding = [torch.zeros_like(hp) for _ in range(self.n_dims - 1 - n_have)]
-            traj = [hp] + (list(traj_state) if traj_state else []) + padding
-        else:
-            traj = [hp] + list(traj_state[:self.n_dims - 1])
+        if traj_state is None:
+            traj_state = torch.zeros(B, self.n_dims - 1, L, K, device=h.device, dtype=h.dtype)
+        traj = torch.cat([hp.unsqueeze(1), traj_state], dim=1)  # (B, n_dims, L, K)
 
         out_acc = None
         if self.S > 1 or self.n_dims > 1:
@@ -371,7 +366,7 @@ class TrajectorySpiralBind(nn.Module):
             sin_t = torch.sin(theta)
             u_re = hp_v * self.w_u_re.unsqueeze(0).unsqueeze(0)
             u_im = hp_v * self.w_u_im.unsqueeze(0).unsqueeze(0)
-            traj_stack = torch.stack(traj, dim=2).unsqueeze(2)    # (B, L, 1, nd, K)
+            traj_stack = traj.permute(0, 2, 1, 3).unsqueeze(2)    # (B, L, 1, nd, K)
             v_re = traj_stack * self.w_v_re.unsqueeze(0).unsqueeze(0)
             v_im = traj_stack * self.w_v_im.unsqueeze(0).unsqueeze(0)
             vr_re = v_re * cos_t - v_im * sin_t
@@ -401,8 +396,8 @@ class TrajectorySpiralBind(nn.Module):
                     sin_t = torch.sin(theta)
                     u_re = hp * self.w_u_re[s, d].unsqueeze(0).unsqueeze(0)
                     u_im = hp * self.w_u_im[s, d].unsqueeze(0).unsqueeze(0)
-                    v_re = traj[d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
-                    v_im = traj[d] * self.w_v_im[s, d].unsqueeze(0).unsqueeze(0)
+                    v_re = traj[:, d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
+                    v_im = traj[:, d] * self.w_v_im[s, d].unsqueeze(0).unsqueeze(0)
                     vr_re = v_re * cos_t - v_im * sin_t
                     vr_im = v_re * sin_t + v_im * cos_t
                     prod_re = u_re * vr_re - u_im * vr_im
@@ -413,7 +408,7 @@ class TrajectorySpiralBind(nn.Module):
                 out_s = torch.cat(dim_outputs, dim=-1)
                 out_acc = out_s if out_acc is None else out_acc + out_s
         result = out_acc @ self.W_out
-        new_traj = traj[1:]
+        new_traj = traj[:, 1:]  # (B, n_dims - 1, L, K)
         return result, new_traj
 
 

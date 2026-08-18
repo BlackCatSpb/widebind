@@ -165,7 +165,7 @@ class LiveInference:
             if h is None:
                 h = torch.zeros(1, 1, self.cfg.D,
                                 device=next(self.model.parameters()).device)
-            out, new_states, self.global_state = self.model(
+            out, new_states, self.global_state, self._reasoning = self.model(
                 h, self.layer_states, global_state=self.global_state
             )
             self.layer_states = new_states
@@ -186,7 +186,7 @@ class LiveInference:
         Unlike think(), this does NOT feed the output back as input —
         the sequence length of h determines the context.
         """
-        out, new_states, self.global_state = self.model(
+        out, new_states, self.global_state, self._reasoning = self.model(
             h, self.layer_states, global_state=self.global_state
         )
         self.layer_states = new_states

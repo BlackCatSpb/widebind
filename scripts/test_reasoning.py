@@ -93,7 +93,7 @@ def run_epoch(n_steps=100, with_thinking=False):
 
         model.train()
         h = model.embed_tokens(x)
-        out, state, _ = model(h, state, step=step)
+        out, state, _, _ = model(h, state, step=step)
         def detach_state(st):
             if st is None:
                 return None
@@ -120,7 +120,7 @@ def run_epoch(n_steps=100, with_thinking=False):
                     src_test, tgt_test = gen_problem(a_max=20)
                     x_test = torch.tensor([encode(src_test)])
                     h_test = model.embed_tokens(x_test)
-                    out_test, _, _ = model(h_test, None, step=0)
+                    out_test, _, _, _, _ = model(h_test, None, step=0)
                     pred = out_test[0, -len(tgt_test):, :].argmax(dim=-1)
                     pred_str = decode(pred.tolist())
                     if tgt_test == pred_str:
@@ -147,7 +147,7 @@ with torch.no_grad():
         src, tgt = gen_problem(a_max=9, with_thinking=False)
         x = torch.tensor([encode(src)])
         h = model.embed_tokens(x)
-        hidden, _, _ = model(h, None, step=0)
+        hidden, _, _, _, _ = model(h, None, step=0)
         logits = model.lm_head(hidden)
         pred = logits[0, -len(tgt):, :].argmax(dim=-1)
         pred_str = decode(pred.tolist())
