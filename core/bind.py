@@ -319,8 +319,8 @@ class TrajectorySpiralBind(nn.Module):
             [[(n - t) % K for n in range(K)] for t in range(K)], dtype=torch.long)
         circ_corr = torch.tensor(
             [[(t - n) % K for n in range(K)] for t in range(K)], dtype=torch.long)
-        self.register_buffer('_circ_conv_idx', circ_conv)
-        self.register_buffer('_circ_corr_idx', circ_corr)
+        self.register_buffer('_circ_conv_idx', circ_conv, persistent=False)
+        self.register_buffer('_circ_corr_idx', circ_corr, persistent=False)
 
     def _hybrid_alpha(self):
         if not self.training:
