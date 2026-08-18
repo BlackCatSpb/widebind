@@ -2163,7 +2163,68 @@ fp32-якорей), torch.compile недоступен на Windows (нет trit
 
 ---
 
-## 38. Шаги 7480 → 7865: pred > 1.8, diversity ×13, EVAL 7689 = 9.3285 (17.08.2026)
+## 61. Экспорт в ONNX: побитовый EP, ONNX замораживает step; анализ best.pt 10718 (18.08.2026)
+
+### 61.1. Экспорт мини-модели: torch.export → побитово
+
+Мини-конфиг (D=64, n_layers=2, vocab=100, seq_len=32, bind_K=8, mirror_k=8,
+code_dim=16, collective, variable_precision, reasoning adaptive) после
+attr-чистки eval-пути:
+
+- `torch.export.export(model, args, kwargs=..., strict=False)` — работает.
+- **Сверка python ↔ ExportedProgram: дифф 0.0** (out, state, gs, rb) —
+  экспортированный граф побитово совпадает с python-forward.
+- Детерминизм: два вызова с одинаковым step дают 0.0; step=0 vs step=5 —
+  дифф 0.025 (эволюция температуры usefulness работает).
+
+### 61.2. ONNX-конвертер замораживает step (важная находка)
+
+- `torch.onnx.export(ep, args, kwargs=..., dynamo=True)` — конвертирует EP,
+  но **входа `step` в графе нет вообще** (и `allow_write` тоже): конвертер
+  подставил константу из sample-значения. Проверено численно: мини.onnx
+  (экспортирован при sample step=0) совпадает с python step=0 (3.8e-06),
+  но НЕ с python step=5 (0.025).
+- `torch.onnx.export(model, ..., dynamo=True)` (прямой путь, без EP)
+  пере-трассирует со strict=True и падает: `Dynamic control flow is not
+  supported` — python-if `step >= 5000` (stack.py:155).
+- **EP-граф: placeholder `step` имеет users:0** — никто не потребляет!
+  При этом EP ЧУВСТВИТЕЛЕН к step: EP(5) vs EP(0) = 0.025, воспроизводимо
+  при перестановке порядка; повторы с тем же step — 0.0; графы EP(step=5)
+  и EP(step=0) идентичны (1964 ноды, те же target). Откуда EP берёт
+  зависимость от step при users:0 — не установлено (гипотеза: скрытая
+  мутация буферов-счётчиков между вызовами, напр. `bind._step_count += 1`
+  в bind.py:347, выполняется безусловно, в т.ч. в eval).
+- python-детерминизм подтверждён независимо: run(5), run(0), run(0), run(5)
+  → 0.025, 0.0, 0.0, 0.025; свежая модель с тем же входом — 0.0.
+
+### 61.3. Анализ best.pt (step 10718, val 8.9242) — analyze.py
+
+- Формат полный: {step, model, optimizer, scheduler, best_val_loss, cfg,
+  reasoning_enabled_step}; 2263 тензора, 138.41M параметров, NaN/Inf нет.
+- Missing=0, Unexpected=72 — только ленивые буферы коллектива
+  (`_resvar_ema/_resvar_var/_mature_count`) — норма.
+- reasoning_enabled_step=10722 — reasoning включится через 4 шага.
+- **WAKE-детектор: WAKE-CANDIDATE**
+  - L16: W_std dev +0.012 (маркер #1b, WAKE) и gate max 0.880 (>0.75) —
+    MLP-слой просыпается первым.
+  - Рождения слотов в «пустых» слоях L10-23: [10, 12, 13, 18, 23].
+  - Средний modulation gate 0.673 — ещё PASS (порог 0.75).
+- **LIVE: L17 аномалия** — ||hp||=107.1, predMSE=21205 (у соседей 0.1-12),
+  при этом gate нормальный (0.47) — слой-выброс по предсказанию.
+- Сигналы private memory: help доминирует (0.899 / 0.646 / 0.929),
+  temp/pred/smooth/sym почти заглушены; pm_step=11526/5000 (пишет давно).
+- VSA-лестница: tau 9.03 → 505.33 (56x), tau_l_dev −1.32.
+- Отчёт: checkpoints/best_report.html.
+
+### 61.4. Следующее
+
+- Разобраться с зависимостью EP от step при users:0 (проверка повторов
+  step=5 на одном EP) → либо переменный вход step в ONNX, либо
+  фиксация temp константой в eval-пути генератора.
+- Затем: ONNX-экспорт большого графа (24 слоя, D=2560) → ORT-сверка →
+  бенчмарк.
+
+---
 
 ### 38.1. Новый best
 
