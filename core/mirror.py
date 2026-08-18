@@ -451,7 +451,7 @@ class GroupedCognitiveMirror(nn.Module):
         # ─── Merge all signals (weighted sum) ───
         delta = sum(w[i] * signals_normed[i] for i in range(n_sig))
         
-        delta = F.rms_norm(delta, (delta.shape[-1],))  # norm over k
+        delta = delta * torch.rsqrt(delta.pow(2).mean(dim=-1, keepdim=True) + 1e-7)  # rms_norm over k
         delta = delta + self.tanh_bias * tanh_bias_mod
         
         # ─── Gate modulation signals (shared between gate & usefulness) ───
@@ -471,7 +471,13 @@ class GroupedCognitiveMirror(nn.Module):
         prog = 1.0 - math.exp(-self._fwd_count.item() / 200.0)
         temp = max(0.3, 3.0 * math.exp(-prog * 2.0))
         with torch.no_grad():
-            threshold = usefulness_logits.median(dim=-1, keepdim=True).values
+            srt_u, _ = torch.sort(usefulness_logits, dim=-1)
+            n_u = srt_u.shape[-1]
+            if n_u % 2 == 1:
+                threshold = srt_u[..., n_u // 2:n_u // 2 + 1]
+            else:
+                threshold = (srt_u[..., n_u // 2 - 1:n_u // 2]
+                             + srt_u[..., n_u // 2:n_u // 2 + 1]) / 2
         usefulness = torch.sigmoid((usefulness_logits - threshold) / temp)
 
 

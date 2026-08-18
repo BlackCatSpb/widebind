@@ -1,4 +1,4 @@
-"""WideBind: bind module."""
+﻿"""WideBind: bind module."""
 
 import math, os
 import torch
@@ -6,6 +6,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .vsa_utils import dct_basis, fib_sigmoid_init
+
+
+class _ExpRMSNorm(nn.Module):
+    """RMSNorm via explicit formula (ONNX-exportable, equiv to nn.RMSNorm)."""
+
+    def __init__(self, K):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(K))
+
+    def forward(self, x):
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
 
 def migrate_bind_state_dict(sd, n_layers, mode="off", S=1):
     """Convert old (pre-BottleneckBind) state dict keys to new format.
@@ -32,7 +43,7 @@ def migrate_bind_state_dict(sd, n_layers, mode="off", S=1):
     return map_sd
 
 
-# ─── Grouped MLP ──────────────────────────────────────────────────────
+# в”Ђв”Ђв”Ђ Grouped MLP в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 
 def _golden_shifts(K: int, S: int) -> list:
@@ -52,15 +63,15 @@ class BottleneckBind(nn.Module):
     """Bilinear cross-mixing with Fibonacci/golden-angle shifts.
 
     Modes (cfg.bind_twist_mode):
-      "off"     — legacy diagonal bind (u⊙v), no shifts. Exact regression.
-      "shift"   — simple sum of S shifted bilinear products.
-      "cascade" — Fibonacci-nested cascade, monomials up to order F_S.
+      "off"     вЂ” legacy diagonal bind (uвЉ™v), no shifts. Exact regression.
+      "shift"   вЂ” simple sum of S shifted bilinear products.
+      "cascade" вЂ” Fibonacci-nested cascade, monomials up to order F_S.
 
     Ocular (cfg.bind_twist_ocular):
-      "tied"   — shared W_out = W_proj^T for all shifts. rank(M) ≤ K.
-      "multi"  — per-shift W_outˢ (S, K, D). rank(M) ≤ min(S·K, D).
+      "tied"   вЂ” shared W_out = W_proj^T for all shifts. rank(M) в‰¤ K.
+      "multi"  вЂ” per-shift W_outЛў (S, K, D). rank(M) в‰¤ min(SВ·K, D).
 
-    Critical: w_u, w_v init std=1.0. Bilinear gradient scales as std³;
+    Critical: w_u, w_v init std=1.0. Bilinear gradient scales as stdВі;
     default 0.02 kills it (8e-6 vs 1.0).
     """
 
@@ -82,7 +93,7 @@ class BottleneckBind(nn.Module):
         # --- objective lens ---
         self.W_proj = nn.Linear(D, K, bias=False)
         if getattr(cfg, "bind_qk_norm", False):
-            self.hp_norm = nn.RMSNorm(K)
+            self.hp_norm = _ExpRMSNorm(K)
         else:
             self.hp_norm = nn.Identity()
 
@@ -219,7 +230,7 @@ class SpiralBind(nn.Module):
         self.W_proj = nn.Linear(D, K, bias=True)
         self.w_bind_bias = nn.Parameter(torch.zeros(K))
         if getattr(cfg, "bind_qk_norm", False):
-            self.hp_norm = nn.RMSNorm(K)
+            self.hp_norm = _ExpRMSNorm(K)
         else:
             self.hp_norm = nn.Identity()
         self.w_u_re = nn.Parameter(torch.randn(self.S, K) * 0.3)
@@ -288,7 +299,7 @@ class TrajectorySpiralBind(nn.Module):
         self.W_proj = nn.Linear(D, K, bias=True)
         self.w_bind_bias = nn.Parameter(torch.zeros(K))
         if getattr(cfg, "bind_qk_norm", False):
-            self.hp_norm = nn.RMSNorm(K)
+            self.hp_norm = _ExpRMSNorm(K)
         else:
             self.hp_norm = nn.Identity()
         self.w_u_re = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.3)
@@ -407,27 +418,27 @@ class TrajectorySpiralBind(nn.Module):
 
 
 class TrajectoryManifoldBind(TrajectorySpiralBind):
-    """Спиральная траектория + манифолд переходов, масштабированные для большой
-    WideBind (D=4096, K=64): всё то же самое, но масштаб буфера √-законом удвоен.
+    """РЎРїРёСЂР°Р»СЊРЅР°СЏ С‚СЂР°РµРєС‚РѕСЂРёСЏ + РјР°РЅРёС„РѕР»Рґ РїРµСЂРµС…РѕРґРѕРІ, РјР°СЃС€С‚Р°Р±РёСЂРѕРІР°РЅРЅС‹Рµ РґР»СЏ Р±РѕР»СЊС€РѕР№
+    WideBind (D=4096, K=64): РІСЃС‘ С‚Рѕ Р¶Рµ СЃР°РјРѕРµ, РЅРѕ РјР°СЃС€С‚Р°Р± Р±СѓС„РµСЂР° в€љ-Р·Р°РєРѕРЅРѕРј СѓРґРІРѕРµРЅ.
 
-    Три механики дополняют друг друга (FCF-гибрид):
-      1. Спиральный bind (max_phase) — локальное скрещивание hp ↔ траектория
-         (VSA-память + mirror), как в TrajectorySpiralBind.
-      2. Манифолд переходов T = unbind(hp_t, hp_{t-1}), кластеризованный
-         в лучи (центроиды) — «факел»: ближний контекст освещается
-         лучами, а не полной памятью.
-      3. Zeckendorf-затухание по возрасту луча (len(zeckendorf(age)))
-         вместо свободного τ — иерархический распад.
-    Чтение — VSA-бандл: sigmoid-гейты по схожести query↔луч, без квадратичной
-    матрицы попарных вниманий (нет softmax-конкуренции).
+    РўСЂРё РјРµС…Р°РЅРёРєРё РґРѕРїРѕР»РЅСЏСЋС‚ РґСЂСѓРі РґСЂСѓРіР° (FCF-РіРёР±СЂРёРґ):
+      1. РЎРїРёСЂР°Р»СЊРЅС‹Р№ bind (max_phase) вЂ” Р»РѕРєР°Р»СЊРЅРѕРµ СЃРєСЂРµС‰РёРІР°РЅРёРµ hp в†” С‚СЂР°РµРєС‚РѕСЂРёСЏ
+         (VSA-РїР°РјСЏС‚СЊ + mirror), РєР°Рє РІ TrajectorySpiralBind.
+      2. РњР°РЅРёС„РѕР»Рґ РїРµСЂРµС…РѕРґРѕРІ T = unbind(hp_t, hp_{t-1}), РєР»Р°СЃС‚РµСЂРёР·РѕРІР°РЅРЅС‹Р№
+         РІ Р»СѓС‡Рё (С†РµРЅС‚СЂРѕРёРґС‹) вЂ” В«С„Р°РєРµР»В»: Р±Р»РёР¶РЅРёР№ РєРѕРЅС‚РµРєСЃС‚ РѕСЃРІРµС‰Р°РµС‚СЃСЏ
+         Р»СѓС‡Р°РјРё, Р° РЅРµ РїРѕР»РЅРѕР№ РїР°РјСЏС‚СЊСЋ.
+      3. Zeckendorf-Р·Р°С‚СѓС…Р°РЅРёРµ РїРѕ РІРѕР·СЂР°СЃС‚Сѓ Р»СѓС‡Р° (len(zeckendorf(age)))
+         РІРјРµСЃС‚Рѕ СЃРІРѕР±РѕРґРЅРѕРіРѕ П„ вЂ” РёРµСЂР°СЂС…РёС‡РµСЃРєРёР№ СЂР°СЃРїР°Рґ.
+    Р§С‚РµРЅРёРµ вЂ” VSA-Р±Р°РЅРґР»: sigmoid-РіРµР№С‚С‹ РїРѕ СЃС…РѕР¶РµСЃС‚Рё queryв†”Р»СѓС‡, Р±РµР· РєРІР°РґСЂР°С‚РёС‡РЅРѕР№
+    РјР°С‚СЂРёС†С‹ РїРѕРїР°СЂРЅС‹С… РІРЅРёРјР°РЅРёР№ (РЅРµС‚ softmax-РєРѕРЅРєСѓСЂРµРЅС†РёРё).
     """
 
     def __init__(self, D, K, cfg):
         super().__init__(D, K, cfg)
         self.buffer_size = int(getattr(cfg, "traj_buffer_size", 1024))
-        # Число лучей — производное от буфера (ceil(√buffer)); свободных τ нет:
-        # в φ-траектории число различимых кластеров — геометрическая середина
-        # шкалы буфера. Большая: буфер 1024 → 32 луча (Mini: 512 → 23).
+        # Р§РёСЃР»Рѕ Р»СѓС‡РµР№ вЂ” РїСЂРѕРёР·РІРѕРґРЅРѕРµ РѕС‚ Р±СѓС„РµСЂР° (ceil(в€љbuffer)); СЃРІРѕР±РѕРґРЅС‹С… П„ РЅРµС‚:
+        # РІ П†-С‚СЂР°РµРєС‚РѕСЂРёРё С‡РёСЃР»Рѕ СЂР°Р·Р»РёС‡РёРјС‹С… РєР»Р°СЃС‚РµСЂРѕРІ вЂ” РіРµРѕРјРµС‚СЂРёС‡РµСЃРєР°СЏ СЃРµСЂРµРґРёРЅР°
+        # С€РєР°Р»С‹ Р±СѓС„РµСЂР°. Р‘РѕР»СЊС€Р°СЏ: Р±СѓС„РµСЂ 1024 в†’ 32 Р»СѓС‡Р° (Mini: 512 в†’ 23).
         beams_explicit = int(getattr(cfg, "traj_beams", 0) or 0)
         self.n_beams = beams_explicit if beams_explicit > 0 else int(math.ceil(
             self.buffer_size ** 0.5))
@@ -435,7 +446,7 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
         self.rebuild_interval = int(getattr(cfg, "traj_rebuild_interval", 128))
         self.gain = float(getattr(cfg, "traj_gain", 0.05))
 
-        # Неперсистентные (сбрасываются на загрузке чекпоинта) буферы манифолда
+        # РќРµРїРµСЂСЃРёСЃС‚РµРЅС‚РЅС‹Рµ (СЃР±СЂР°СЃС‹РІР°СЋС‚СЃСЏ РЅР° Р·Р°РіСЂСѓР·РєРµ С‡РµРєРїРѕРёРЅС‚Р°) Р±СѓС„РµСЂС‹ РјР°РЅРёС„РѕР»РґР°
         self.register_buffer("beam_centers", torch.zeros(self.n_beams, self.K),
                              persistent=False)
         self.register_buffer("beam_counts", torch.zeros(self.n_beams, dtype=torch.float32),
@@ -452,7 +463,7 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
         nn.init.xavier_uniform_(self.W_man, gain=0.25)
         self._fib_cache = self._fib_list(self.buffer_size + 1)
 
-        # наклон sigmoid-гейтов чтения (обучаемый, VSA — без softmax/T)
+        # РЅР°РєР»РѕРЅ sigmoid-РіРµР№С‚РѕРІ С‡С‚РµРЅРёСЏ (РѕР±СѓС‡Р°РµРјС‹Р№, VSA вЂ” Р±РµР· softmax/T)
         self.logit_gain = nn.Parameter(torch.tensor(3.0))
 
     @staticmethod
@@ -482,13 +493,13 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
         alpha = self._hybrid_alpha()
         return alpha * self._hrr_unbind(a, b) + (1.0 - alpha) * (a * b)
 
-    # ── персист-обновление лучей (no_grad) ─────────────────────────
+    # в”Ђв”Ђ РїРµСЂСЃРёСЃС‚-РѕР±РЅРѕРІР»РµРЅРёРµ Р»СѓС‡РµР№ (no_grad) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
     def _push_transitions(self, hp):
-        """Записать переходы unbind(hp_t, hp_{t-1}) в кольцевой буфер."""
+        """Р—Р°РїРёСЃР°С‚СЊ РїРµСЂРµС…РѕРґС‹ unbind(hp_t, hp_{t-1}) РІ РєРѕР»СЊС†РµРІРѕР№ Р±СѓС„РµСЂ."""
         if hp.shape[1] < 2:
             return
-        hp = hp.float()  # манифолд всегда в fp32 (буферы fp32, FFT стабильна)
+        hp = hp.float()  # РјР°РЅРёС„РѕР»Рґ РІСЃРµРіРґР° РІ fp32 (Р±СѓС„РµСЂС‹ fp32, FFT СЃС‚Р°Р±РёР»СЊРЅР°)
         T = self._hybrid_unbind(hp[:, 1:], hp[:, :-1])  # (B, L-1, K)
         flat = T.reshape(-1, self.K)
         n = flat.shape[0]
@@ -508,7 +519,7 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
                 self._rebuild_beams()
 
     def _rebuild_beams(self):
-        """Жадная VSA-кластеризация переходов в лучи (как FCF)."""
+        """Р–Р°РґРЅР°СЏ VSA-РєР»Р°СЃС‚РµСЂРёР·Р°С†РёСЏ РїРµСЂРµС…РѕРґРѕРІ РІ Р»СѓС‡Рё (РєР°Рє FCF)."""
         n_valid = min(int(self._total.item()), self.buffer_size)
         if n_valid < 2:
             return
@@ -551,31 +562,31 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
             self.beam_counts.zero_()
             self.beam_age.zero_()
 
-    # ── Zeck-распад возраста луча ─────────────────────────────────
+    # в”Ђв”Ђ Zeck-СЂР°СЃРїР°Рґ РІРѕР·СЂР°СЃС‚Р° Р»СѓС‡Р° в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
     def _zeck_weight(self, age):
-        """theta = 1 / (1 + len(zeckendorf(age))) — нет свободного τ."""
+        """theta = 1 / (1 + len(zeckendorf(age))) вЂ” РЅРµС‚ СЃРІРѕР±РѕРґРЅРѕРіРѕ П„."""
         if age <= 0:
             return 1.0
         return 1.0 / (1.0 + self._zlen(self._fib_cache, int(age)))
 
     def _manifold_read(self, hp):
-        """Бандл-чтение: sigmoid-гейты по сходству q↔beam · Zeck-затухание.
+        """Р‘Р°РЅРґР»-С‡С‚РµРЅРёРµ: sigmoid-РіРµР№С‚С‹ РїРѕ СЃС…РѕРґСЃС‚РІСѓ qв†”beam В· Zeck-Р·Р°С‚СѓС…Р°РЅРёРµ.
 
-        Никакого softmax: каждый луч гейтируется независимо (своя сила),
-        сумма нормируется — но это не конкурентная нормировка, а VSA-бандл.
+        РќРёРєР°РєРѕРіРѕ softmax: РєР°Р¶РґС‹Р№ Р»СѓС‡ РіРµР№С‚РёСЂСѓРµС‚СЃСЏ РЅРµР·Р°РІРёСЃРёРјРѕ (СЃРІРѕСЏ СЃРёР»Р°),
+        СЃСѓРјРјР° РЅРѕСЂРјРёСЂСѓРµС‚СЃСЏ вЂ” РЅРѕ СЌС‚Рѕ РЅРµ РєРѕРЅРєСѓСЂРµРЅС‚РЅР°СЏ РЅРѕСЂРјРёСЂРѕРІРєР°, Р° VSA-Р±Р°РЅРґР».
         """
         B, L, K = hp.shape
         beam = self.beam_centers  # (n_beams, K)
         n_eff = int(self.beam_counts.clamp(min=0).gt(0).sum().item())
         if n_eff == 0:
             return torch.zeros(B, L, K, device=hp.device, dtype=hp.dtype)
-        hp = hp.float()  # fp32-прецизия для стабильных sigmoid-гейтов
+        hp = hp.float()  # fp32-РїСЂРµС†РёР·РёСЏ РґР»СЏ СЃС‚Р°Р±РёР»СЊРЅС‹С… sigmoid-РіРµР№С‚РѕРІ
         beam = beam[:n_eff] / beam[:n_eff].norm(dim=-1, keepdim=True).clamp(min=1e-10)
         qnorm = hp.norm(dim=-1, keepdim=True).clamp(min=1e-10)
         sims = (hp / qnorm) @ beam.T  # (B, L, n_beams)
         logit_gain = self.logit_gain.clamp(min=0.1)
-        w = torch.sigmoid(sims * logit_gain)  # (B, L, n_beams) независимые гейты
+        w = torch.sigmoid(sims * logit_gain)  # (B, L, n_beams) РЅРµР·Р°РІРёСЃРёРјС‹Рµ РіРµР№С‚С‹
         now = int(self._trans_idx.item())
         ages = [max(0, now - int(a)) for a in self.beam_age[:n_eff].tolist()]
         decay = torch.tensor([self._zeck_weight(a) for a in ages],
@@ -594,4 +605,4 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
         return result + self.gain * (man @ self.W_man).clamp(-8.0, 8.0), new_traj
 
 
-# ─── WideBind Block ────────────────────────────────────────────────────
+# в”Ђв”Ђв”Ђ WideBind Block в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ

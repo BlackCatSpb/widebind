@@ -222,7 +222,7 @@ class WideBindStack(nn.Module):
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
                     self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
         
-        h = F.rms_norm(h, (self.cfg.D,), self.final_norm_w)
+        h = self.final_norm_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
 
         # ─── Explicit Reasoning ───
         if self.explicit_reasoning:

@@ -219,7 +219,7 @@ class WideBindBlock(nn.Module):
                 self.mirror._cached_hp = hp_cached.detach().to(device=device, dtype=h.dtype)
         
         # ─── Pre-LN ───
-        h = F.rms_norm(h, (D,), self.pre_ln_w)
+        h = self.pre_ln_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
         
         # ─── Conv ───
         if conv_state is None:

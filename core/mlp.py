@@ -43,7 +43,7 @@ class GroupedMLP(nn.Module):
 
     def forward(self, h):
         B, L, D = h.shape
-        h = F.rms_norm(h, (D,), self.norm_w)
+        h = self.norm_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
         h = h.reshape(B, L, self.G, self.d)
         BL = B * L
         # Батч-матмул вместо einsum: под autocast einsum(fp16) падает на
