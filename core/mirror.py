@@ -48,13 +48,14 @@ class GroupedCognitiveMirror(nn.Module):
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
-                 gate_bias_scale=0.0, alpha_novelty_weight=0.0):
+                 gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256):
         super().__init__()
         assert D % G == 0
         self.D = D
         self.G = G
         self.k = k
         self.d = D // G
+        self.seq_len = seq_len
         self.tie_mirror_proj = tie_mirror_proj
         # φ — единая когнитивная координата глубины (логарифмическая)
         phi = math.log(1 + layer_idx) / math.log(max(n_layers, 2))
@@ -160,6 +161,12 @@ class GroupedCognitiveMirror(nn.Module):
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
+        # Eval-only pred caches (fixed shapes; dynamic B/L written via slices).
+        # Training keeps None-able plain attributes (see forward).
+        seq_max = self.seq_len
+        self.register_buffer('_cached_hp_buf', torch.zeros(1, seq_max, G, self.k), persistent=False)
+        self.register_buffer('_cached_pred_k_buf', torch.zeros(1, seq_max, G, self.k), persistent=False)
+        self.register_buffer('_cached_pred_error_norm_buf', torch.zeros(1, seq_max), persistent=False)
         _pos_g = torch.Generator().manual_seed(12345)
         self.register_buffer('_pos_id_buf', torch.sign(torch.randn(1, 4096, 1, k, generator=_pos_g)), persistent=False)
         # Gate EMA: gradual wakeup for mirror, cold-start at zero (self-adaptive per-expert warmup)
@@ -224,7 +231,7 @@ class GroupedCognitiveMirror(nn.Module):
     
     def forward(self, h, mem_all, global_state=None, diff=None,
                 tanh_bias_mod=1.0, pred_scale_mod=None,
-                context_mem=None, allow_write=None):
+                context_mem=None, allow_write=None, step=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -309,11 +316,18 @@ class GroupedCognitiveMirror(nn.Module):
                                         * alpha_center.unsqueeze(1).expand(-1, k) / G)
                         self.alpha_diag.data.add_(novelty_push)
                         self.alpha_diag.data.clamp_(0.01, 0.99)
-        self._cached_pred_k = _pred_k_aux.detach() if _pred_k_aux is not None else None
-        self._cached_hp = hp.detach()
-        # Cache normalized pred_error norm per token для surprisal-gated i_gate
         pred_error_norm = (raw_pred_error / hp_norm).norm(dim=(-2, -1))  # (B, L)
-        self._cached_pred_error_norm = pred_error_norm.detach()
+        if self.training:
+            self._cached_pred_k = _pred_k_aux.detach() if _pred_k_aux is not None else None
+            self._cached_hp = hp.detach()
+            self._cached_pred_error_norm = pred_error_norm.detach()
+        else:
+            self._cached_hp_buf[:, :L].copy_(hp.detach())
+            if _pred_k_aux is not None:
+                self._cached_pred_k_buf[:, :L].copy_(_pred_k_aux.detach())
+            else:
+                self._cached_pred_k_buf[:, :L].zero_()
+            self._cached_pred_error_norm_buf[:, :L].copy_(pred_error_norm.detach())
         
         # ─── Private Memory: read via cross-expert attention (when uncertain) ───
         if self._has_private_mem:
@@ -467,8 +481,15 @@ class GroupedCognitiveMirror(nn.Module):
         dvar_mod = torch.exp(self.log_dvar_mod_scale) * torch.tanh(self._delta_var + self.dvar_mod_bias)
         
         usefulness_logits = self.usefulness_predictor(delta).squeeze(-1)
-        self._fwd_count = self._fwd_count + 1
-        prog = 1.0 - torch.exp(-self._fwd_count / 200.0)
+        if self.training:
+            self._fwd_count.add_(1)
+            n_eff = self._fwd_count
+        else:
+            # Deterministic in eval: temperature depends only on `step` (graph input),
+            # not on the number of calls (would break export determinism).
+            n_eff = step if step is not None else 0
+        n_eff = torch.as_tensor(n_eff, dtype=torch.float32, device=h.device)
+        prog = 1.0 - torch.exp(-n_eff / 200.0)
         temp = torch.clamp(3.0 * torch.exp(-prog * 2.0), min=0.3, max=3.0)
         with torch.no_grad():
             srt_u, _ = torch.sort(usefulness_logits, dim=-1)
@@ -549,7 +570,7 @@ class GroupedCognitiveMirror(nn.Module):
             self._last_gates.copy_(expert_gate.detach().mean(dim=(0, 1)))
             self._last_h_pool.copy_(h_g.detach().mean(dim=(0, 1)))
         
-        return mirror, mlp_mod, mem_mod
+        return mirror, mlp_mod, mem_mod, hp, pred_error_norm
     
     def cache_grad_norms(self, grad_h=None):
         """Call after backward: store per-subspace gradient norm.

@@ -96,7 +96,8 @@ class WideBindBlock(nn.Module):
             expert_asymmetry=getattr(cfg, 'expert_asymmetry', False),
             meta_trust=getattr(cfg, 'meta_trust', False),
             gate_bias_scale=0.5 + 1.5 * layer_idx / max(cfg.n_layers - 1, 1) if getattr(cfg, 'gate_bias_scale_per_layer', False) else cfg.gate_bias_scale,
-            alpha_novelty_weight=getattr(cfg, 'alpha_novelty_weight', 0.0))
+            alpha_novelty_weight=getattr(cfg, 'alpha_novelty_weight', 0.0),
+            seq_len=cfg.seq_len)
         
         # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
         self._n_scales = 4
@@ -211,11 +212,8 @@ class WideBindBlock(nn.Module):
         # Transfer stale mirror cache (with shape & dtype check)
         if pen is None:
             pen = getattr(self.mirror, '_cached_pred_error_norm', None)
-        if pen is not None:
-            if pen.shape[-1] != L or pen.shape[0] != B:
-                pen = None
-            else:
-                self.mirror._cached_pred_error_norm = pen.detach().to(device=device, dtype=h.dtype)
+        if pen is not None and (pen.shape[-1] != L or pen.shape[0] != B):
+            pen = None
         
         # ─── Pre-LN ───
         h = self.pre_ln_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
@@ -229,7 +227,8 @@ class WideBindBlock(nn.Module):
         conv_state_out = h_perm[:, :, -(self.conv.padding[0]):]
         h = h + h_conv
         if _chk(h, 'conv'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
-        self._cache_conv_out = h_conv  # for branch_loss (with grad)
+        if self.training:
+            self._cache_conv_out = h_conv  # for branch_loss (with grad)
         
         if isinstance(self.bind, TrajectorySpiralBind):
             if traj_state is None:
@@ -240,11 +239,13 @@ class WideBindBlock(nn.Module):
             bind_out, new_traj = self.bind(h, traj_state)
             if traj_state is None:
                 self._traj_state = new_traj.detach()
+                traj_state_out = None
             else:
-                self._traj_state = (0.9 * traj_state + 0.1 * new_traj).detach()
+                traj_state_out = (0.9 * traj_state + 0.1 * new_traj).detach()
         else:
             bind_out = self.bind(h)
             new_traj = None
+            traj_state_out = None
         if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
         # ─── VSA Memory (multi-scale: S=4 фиксированных τ) ───
@@ -253,9 +254,7 @@ class WideBindBlock(nn.Module):
         d_s = torch.exp(-1.0 / tau_s.to(device))  # (S,) — τ-scales from learnable param
         # Surprisal-gated write: i_gate = softplus(linear + γ·||ê||₂)
         igate_logit = h * self.w_i + self.b_i
-        mir = self.mirror
-        if hasattr(mir, '_cached_pred_error_norm') and mir._cached_pred_error_norm is not None:
-            pen = mir._cached_pred_error_norm  # (B, L)
+        if pen is not None:
             igate_logit = igate_logit + self.gamma_surprisal * pen.unsqueeze(-1)
         i_gate = F.softplus(igate_logit)                    # (B, L, D)
         d_mod = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D) — content mod of decay
@@ -264,8 +263,7 @@ class WideBindBlock(nn.Module):
             i_gate = i_gate * noise
 
         # Prediction-error-aware decay modulation (before decay expansion)
-        if hasattr(self.mirror, '_cached_pred_error_norm') and self.mirror._cached_pred_error_norm is not None:
-            pen = self.mirror._cached_pred_error_norm
+        if pen is not None:
             d_pen_factor = 1.0 - 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
             d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.to(d_mod.dtype).unsqueeze(-1)).reshape(B, L, D)
 
@@ -384,10 +382,10 @@ class WideBindBlock(nn.Module):
         with torch.autocast(device_type=h.device.type, enabled=False):
             _gs = global_state.float() if isinstance(global_state, torch.Tensor) else global_state
             _ctx = context_mem.float() if isinstance(context_mem, torch.Tensor) else context_mem
-            mirror, mlp_mod, mem_mod = self.mirror(
+            mirror, mlp_mod, mem_mod, hp, pred_error_norm = self.mirror(
                 h.float(), mem_all.float(), global_state=_gs, diff=diff,
                 tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-                context_mem=_ctx, allow_write=allow_write)
+                context_mem=_ctx, allow_write=allow_write, step=step)
             mirror = mirror.to(h.dtype)
             mlp_mod = mlp_mod.to(h.dtype) if isinstance(mlp_mod, torch.Tensor) else mlp_mod
             mem_mod = mem_mod.to(h.dtype) if isinstance(mem_mod, torch.Tensor) else mem_mod
@@ -402,7 +400,6 @@ class WideBindBlock(nn.Module):
         g = self.mirror.G
         d = self.mirror.d
         # Per-expert dynamic read (K-space conditioned memory gating)
-        hp = self.mirror._cached_hp
         if hp is not None:
             BL = B * L
             hp_g = hp.permute(2, 0, 1, 3).reshape(g, BL, self.mirror.k)  # batched matmul (stable under AMP)
@@ -419,8 +416,8 @@ class WideBindBlock(nn.Module):
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
         if self.collective is not None:
-            hp_c = self.mirror._cached_hp
-            pen_c = self.mirror._cached_pred_error_norm
+            hp_c = hp
+            pen_c = pen
             if hp_c is not None and pen_c is not None:
                 col_out = self.collective(
                     h, hp_c, pen_c,
@@ -429,8 +426,9 @@ class WideBindBlock(nn.Module):
                 if col_out is not None:
                     enhanced = enhanced + col_out
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
-        self._cache_bind_out = enhanced_base  # for branch_loss (with grad)
-        self._cache_mirror_out = mirror  # for branch_loss (with grad)
+        if self.training:
+            self._cache_bind_out = enhanced_base  # for branch_loss (with grad)
+            self._cache_mirror_out = mirror  # for branch_loss (with grad)
         h = h + enhanced
         if _chk(h, 'post_enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
 
@@ -443,7 +441,8 @@ class WideBindBlock(nn.Module):
                 gate = (precision.mean() > self.precision_threshold).to(h.dtype)
                 exact = self.exact_memory(h.float())
                 h = h + (precision * exact * gate).to(h.dtype)
-            self._precision_mean = precision.mean()
+            if self.training:
+                self._precision_mean = precision.mean()
 
         if _chk(h, 'vpm'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
@@ -463,9 +462,7 @@ class WideBindBlock(nn.Module):
         h = h + h_mlp
         if _chk(h, 'post_mlp'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
-        pen_out = getattr(self.mirror, '_cached_pred_error_norm', None)
-        traj_state_out = getattr(self, '_traj_state', None)
-        return h, (mem_state_out, mu_state_out, conv_state_out, traj_state_out, pen_out)
+        return h, (mem_state_out, mu_state_out, conv_state_out, traj_state_out, pen)
     
     @property
     def base_parameters(self):

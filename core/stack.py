@@ -42,7 +42,7 @@ class WideBindStack(nn.Module):
                 self.reasoning_gate = ReasoningGate(cfg.D, max_steps=getattr(cfg, 'reasoning_max_steps', 8), know_dim=8)
             self._reasoning_buffer = None
             self._reasoning_count = None
-            self._reasoning_gates = None
+            self.register_buffer('_reasoning_gates', torch.zeros(getattr(cfg, 'reasoning_max_steps', 8)), persistent=False)
             self.reasoning_enabled_step = 0
             self.reasoning_scale_override = None
 
@@ -147,6 +147,9 @@ class WideBindStack(nn.Module):
             global_state = global_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
         elif global_state.shape[0] != n_layers:
             global_state = global_state[0:1].expand(n_layers, -1, -1).clone()
+        # Copy before in-place updates: aot_export forbids mutating graph inputs
+        # that require gradients (global_state is updated per layer below).
+        global_state = global_state.clone()
         # ─── Momentum warmup for global_state oscillation (Idea 3) ───
         momentum_beta = 0.0
         if adaptive and step is not None and step >= 5000:
@@ -406,7 +409,7 @@ class WideBindStack(nn.Module):
             prev_open = a_i.detach().mean()
             gates.append(a_i.detach().mean() * w_soft * run.float())
         if gates:
-            self._reasoning_gates = torch.stack(gates)
+            self._reasoning_gates.copy_(torch.stack(gates))
         return h_acc
 
     @property

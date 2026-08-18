@@ -210,6 +210,7 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
         h = model.embed_tokens(ctx)
         out, state, _, rb = model(h, state, adaptive=False,
                                   context_mem=context_mem, allow_write=allow_write,
+                                  step=step,
                                   reasoning_buffer=rb[0] if rb is not None else None,
                                   reasoning_count=rb[1] if rb is not None else None)
         
