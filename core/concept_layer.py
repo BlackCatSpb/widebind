@@ -139,9 +139,10 @@ class CollectiveConceptLayer(nn.Module):
         _write = allow_write is None or allow_write
         if mature_override is not None:
             self._mature.fill_(float(mature_override))
-        else:
+        elif self.training:
             self._update_maturity(resvar)
-        self._maybe_write(hp, pen, _write)
+        if self.training:
+            self._maybe_write(hp, pen, _write)
 
         B, L, G, k = hp.shape
         shared = F.normalize(hp.mean(dim=-2), dim=-1)
@@ -160,8 +161,9 @@ class CollectiveConceptLayer(nn.Module):
             h_n = F.normalize(h.detach(), dim=-1)
             cos_c = (out_n * h_n).sum(dim=-1, keepdim=True)
             c_gate = torch.sigmoid(self._contra_gain * (cos_c - self._contra_thresh))
-            self._gate_u.fill_(u_gate.mean().item())
-            self._gate_c.fill_(c_gate.mean().item())
+            if self.training:
+                self._gate_u.fill_(u_gate.mean().item())
+                self._gate_c.fill_(c_gate.mean().item())
 
         scale = torch.sigmoid(self._read_scale)
         return read * u_gate * c_gate * scale

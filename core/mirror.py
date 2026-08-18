@@ -265,7 +265,7 @@ class GroupedCognitiveMirror(nn.Module):
         # Alpha override smoothly interpolates: override=1 → identity (α=1),
         # override=0 → learned alpha_diag. Provides smooth warmup transition.
         alpha_eff = self.alpha_diag
-        override = self._alpha_override.item()
+        override = self._alpha_override.item() if self.training else 0.0
         if override > 0:
             alpha_eff = (1 - override) * alpha_eff + override * 1.0
         pred_k = hp_prev * alpha_eff.view(1, 1, G, k)  # (B, L, G, k)

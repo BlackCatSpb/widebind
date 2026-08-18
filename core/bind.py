@@ -304,15 +304,23 @@ class TrajectorySpiralBind(nn.Module):
         self.W_out = nn.Parameter(torch.empty(self.n_dims * 2 * K, D))
         nn.init.xavier_uniform_(self.W_out, gain=0.5)
         self._tied = False
+        circ_conv = torch.tensor(
+            [[(n - t) % K for n in range(K)] for t in range(K)], dtype=torch.long)
+        circ_corr = torch.tensor(
+            [[(t - n) % K for n in range(K)] for t in range(K)], dtype=torch.long)
+        self.register_buffer('_circ_conv_idx', circ_conv)
+        self.register_buffer('_circ_corr_idx', circ_corr)
 
     def _hybrid_alpha(self):
+        if not self.training:
+            return self.hybrid_alpha_min + (
+                self.hybrid_alpha_max - self.hybrid_alpha_min) * math.exp(-2.0)
         t = min(1.0, self._step_count.item() / 5000.0)
         return self.hybrid_alpha_min + (self.hybrid_alpha_max - self.hybrid_alpha_min) * math.exp(-2.0 * t)
 
     def _hrr_bind(self, a, b):
-        fa = torch.fft.rfft(a, dim=-1)
-        fb = torch.fft.rfft(b, dim=-1)
-        return torch.fft.irfft(fa * fb, n=a.shape[-1], dim=-1)
+        bg = b[..., self._circ_conv_idx]  # (B, L, K, K) circular shifts
+        return torch.einsum('blt,bltn->bln', a, bg)
 
     def _hybrid_bind(self, a, b):
         alpha = self._hybrid_alpha()
@@ -341,27 +349,58 @@ class TrajectorySpiralBind(nn.Module):
             traj = [hp] + list(traj_state[:self.n_dims - 1])
 
         out_acc = None
-        for s in range(self.S):
-            dim_outputs = []
-            for d in range(self.n_dims):
-                freq = torch.exp(self.W_freq[s, d]).unsqueeze(0).unsqueeze(0)
-                phase = self.W_phase[s, d].unsqueeze(0).unsqueeze(0)
-                theta = freq * hp + phase
-                cos_t = torch.cos(theta)
-                sin_t = torch.sin(theta)
-                u_re = hp * self.w_u_re[s, d].unsqueeze(0).unsqueeze(0)
-                u_im = hp * self.w_u_im[s, d].unsqueeze(0).unsqueeze(0)
-                v_re = traj[d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
-                v_im = traj[d] * self.w_v_im[s, d].unsqueeze(0).unsqueeze(0)
-                vr_re = v_re * cos_t - v_im * sin_t
-                vr_im = v_re * sin_t + v_im * cos_t
-                prod_re = u_re * vr_re - u_im * vr_im
-                prod_im = u_re * vr_im + u_im * vr_re
-                hybrid = self._hybrid_bind(u_re, v_re)
-                prod_re = prod_re + 0.1 * hybrid
-                dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
-            out_s = torch.cat(dim_outputs, dim=-1)
-            out_acc = out_s if out_acc is None else out_acc + out_s
+        if self.S > 1 or self.n_dims > 1:
+            # Vectorized over (s, d): single batched computation instead of
+            # S*n_dims sequential micro-op groups. Mathematically identical.
+            hp_v = hp[:, :, None, None, :]                        # (B, L, 1, 1, K)
+            wf = torch.exp(self.W_freq).unsqueeze(0).unsqueeze(0)  # (1, 1, S, nd, K)
+            wp = self.W_phase.unsqueeze(0).unsqueeze(0)
+            theta = wf * hp_v + wp
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            u_re = hp_v * self.w_u_re.unsqueeze(0).unsqueeze(0)
+            u_im = hp_v * self.w_u_im.unsqueeze(0).unsqueeze(0)
+            traj_stack = torch.stack(traj, dim=2).unsqueeze(2)    # (B, L, 1, nd, K)
+            v_re = traj_stack * self.w_v_re.unsqueeze(0).unsqueeze(0)
+            v_im = traj_stack * self.w_v_im.unsqueeze(0).unsqueeze(0)
+            vr_re = v_re * cos_t - v_im * sin_t
+            vr_im = v_re * sin_t + v_im * cos_t
+            prod_re = u_re * vr_re - u_im * vr_im
+            prod_im = u_re * vr_im + u_im * vr_re
+            u_re_v = u_re.reshape(-1, K)
+            v_re_v = v_re.reshape(-1, K)
+            bg = v_re_v[..., self._circ_conv_idx]                 # (B*L*S*nd, K, K)
+            alpha = self._hybrid_alpha()
+            hrr = torch.einsum('bt,btn->bn', u_re_v, bg).reshape(
+                u_re.shape[0], u_re.shape[1], self.S, self.n_dims, K)
+            ewise = u_re * v_re
+            hybrid = alpha * hrr + (1 - alpha) * ewise
+            prod_re = prod_re + 0.1 * hybrid
+            out_s = torch.cat([prod_re, prod_im], dim=-1)         # (B, L, S, nd, 2K)
+            out_acc = out_s.sum(dim=2)                            # (B, L, nd*2K)
+            out_acc = out_acc.reshape(B, L, self.n_dims * 2 * K)
+        else:
+            for s in range(self.S):
+                dim_outputs = []
+                for d in range(self.n_dims):
+                    freq = torch.exp(self.W_freq[s, d]).unsqueeze(0).unsqueeze(0)
+                    phase = self.W_phase[s, d].unsqueeze(0).unsqueeze(0)
+                    theta = freq * hp + phase
+                    cos_t = torch.cos(theta)
+                    sin_t = torch.sin(theta)
+                    u_re = hp * self.w_u_re[s, d].unsqueeze(0).unsqueeze(0)
+                    u_im = hp * self.w_u_im[s, d].unsqueeze(0).unsqueeze(0)
+                    v_re = traj[d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
+                    v_im = traj[d] * self.w_v_im[s, d].unsqueeze(0).unsqueeze(0)
+                    vr_re = v_re * cos_t - v_im * sin_t
+                    vr_im = v_re * sin_t + v_im * cos_t
+                    prod_re = u_re * vr_re - u_im * vr_im
+                    prod_im = u_re * vr_im + u_im * vr_re
+                    hybrid = self._hybrid_bind(u_re, v_re)
+                    prod_re = prod_re + 0.1 * hybrid
+                    dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
+                out_s = torch.cat(dim_outputs, dim=-1)
+                out_acc = out_s if out_acc is None else out_acc + out_s
         result = out_acc @ self.W_out
         new_traj = traj[1:]
         return result, new_traj
@@ -436,9 +475,8 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
         return cnt
 
     def _hrr_unbind(self, a, b):
-        fa = torch.fft.rfft(a, dim=-1)
-        fb = torch.fft.rfft(b, dim=-1)
-        return torch.fft.irfft(fa * torch.conj(fb), n=a.shape[-1], dim=-1)
+        bg = b[..., self._circ_corr_idx]  # (B, L, K, K) circular shifts
+        return torch.einsum('blt,bltn->bln', a, bg)
 
     def _hybrid_unbind(self, a, b):
         alpha = self._hybrid_alpha()
