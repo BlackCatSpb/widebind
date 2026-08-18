@@ -309,11 +309,11 @@ class GroupedCognitiveMirror(nn.Module):
                                         * alpha_center.unsqueeze(1).expand(-1, k) / G)
                         self.alpha_diag.data.add_(novelty_push)
                         self.alpha_diag.data.clamp_(0.01, 0.99)
-        self._cached_pred_k = _pred_k_aux
-        self._cached_hp = hp
+        self._cached_pred_k = _pred_k_aux.detach() if _pred_k_aux is not None else None
+        self._cached_hp = hp.detach()
         # Cache normalized pred_error norm per token для surprisal-gated i_gate
         pred_error_norm = (raw_pred_error / hp_norm).norm(dim=(-2, -1))  # (B, L)
-        self._cached_pred_error_norm = pred_error_norm
+        self._cached_pred_error_norm = pred_error_norm.detach()
         
         # ─── Private Memory: read via cross-expert attention (when uncertain) ───
         if self._has_private_mem:
