@@ -48,49 +48,79 @@ def create_lr_scheduler(optimizer, warmup, max_steps, lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
 
 
-def _restore_optimizer(optimizer, model, ckpt_opt):
-    """Restore AdamW state by parameter name.
-
-    Survives params added after the checkpoint was saved (reasoning_gate,
-    reasoning_proj): positional load would either fail (group size mismatch)
-    or silently shift state onto the wrong params, so we re-map by name.
-    Checkpoint param order == current order without the new gate params.
-    """
-    flat = [(id(p), tuple(p.shape)) for g in optimizer.param_groups for p in g['params']]
+def _opt_param_names(model, optimizer):
     names = {id(p): n for n, p in model.named_parameters()}
-    old = ckpt_opt
-    try:
-        optimizer.load_state_dict(old)
-        if all(tuple(sd['exp_avg'].shape) == flat[i][1]
-               for i, sd in optimizer.state_dict()['state'].items()):
-            return True
-    except ValueError:
-        pass
+    return [names[id(p)] for g in optimizer.param_groups for p in g['params']]
+
+
+def _restore_optimizer(optimizer, model, ckpt_opt):
+    """Restore AdamW state BY PARAMETER NAME.
+
+    Positional load shifts state onto wrong params whenever the parameter
+    list changed (freq_scale/bind_coh_gate/W_out+K added): index i in the old
+    checkpoint no longer refers to the same parameter. We re-map by name:
+    new checkpoints carry 'param_names' (order of param_groups); old
+    checkpoints without it get a FRESH Adam (safe) instead of a broken
+    positional restore.
+    """
+    old_names = ckpt_opt.get('param_names') if isinstance(ckpt_opt, dict) else None
+    if old_names is None:
+        print('  WARNING: checkpoint has no param_names — optimizer state NOT restored (fresh Adam)')
+        return False
+    names = {id(p): n for n, p in model.named_parameters()}
+    pos = {id(p): i for i, p in enumerate(
+        (p for g in optimizer.param_groups for p in g['params']))}
     new_sd = optimizer.state_dict()
     new_sd['state'] = {}
-    no_gate = [(names[id(p)], p) for g in optimizer.param_groups for p in g['params']
-               if not names[id(p)].startswith('reasoning_gate.')]
-    pos = {id(p): i for i, (n, p) in enumerate(
-        (names[id(p)], p) for g in optimizer.param_groups for p in g['params'])}
+    old_state = ckpt_opt.get('state', {})
+    old_groups = ckpt_opt.get('param_groups', [])
+    # матчинг по имени: старое имя -> слот
     moved = skipped = 0
-    for si, (n, p) in enumerate(no_gate):
-        st = old['state'].get(si)
+    for name, p in model.named_parameters():
+        if name not in old_names:
+            skipped += 1
+            continue
+        si = old_names.index(name)
+        st = old_state.get(str(si)) if str(si) in old_state else old_state.get(si)
         if st is None:
             continue
         if tuple(st['exp_avg'].shape) != tuple(p.shape):
-            skipped += 1
-            print(f'  Optimizer state shape mismatch at {si} {n}: '
-                  f'{tuple(st["exp_avg"].shape)} vs {tuple(p.shape)}')
-            continue
+            # W_out +K (когерентность): первые строки те же — частичный restore
+            if (name.endswith('bind.W_out')
+                    and len(st['exp_avg'].shape) == 2
+                    and st['exp_avg'].shape[1] == p.shape[1]
+                    and st['exp_avg'].shape[0] < p.shape[0]):
+                st = {k: (v.clone() if isinstance(v, torch.Tensor) and v.dim() == 2
+                          and v.shape[0] == p.shape[0]
+                          else (torch.ones(p.shape[0], v.shape[1], dtype=v.dtype, device=v.device)
+                                if k == 'exp_avg_sq' and isinstance(v, torch.Tensor) and v.dim() == 2
+                                else (torch.zeros(p.shape[0], v.shape[1], dtype=v.dtype, device=v.device)
+                                      if isinstance(v, torch.Tensor) and v.dim() == 2 else v)))
+                      for k, v in st.items()}
+                for k in ('exp_avg', 'exp_avg_sq'):
+                    v = st[k]
+                    if isinstance(v, torch.Tensor) and v.dim() == 2 and v.shape[0] < p.shape[0]:
+                        pv = v.new_zeros(p.shape[0], v.shape[1])
+                        pv[:v.shape[0]] = v
+                        if k == 'exp_avg_sq':
+                            pv[v.shape[0]:] = 1.0
+                        st[k] = pv
+                moved += 1
+            else:
+                skipped += 1
+                print(f'  Opt state shape mismatch {name}: '
+                      f'{tuple(st["exp_avg"].shape)} vs {tuple(p.shape)}')
+                continue
+        else:
+            moved += 1
         new_sd['state'][pos[id(p)]] = {k: (v.clone() if isinstance(v, torch.Tensor) else v)
                                        for k, v in st.items()}
-        moved += 1
-    for gi in range(min(len(new_sd['param_groups']), len(old['param_groups']))):
-        if 'lr' in old['param_groups'][gi]:
-            new_sd['param_groups'][gi]['lr'] = old['param_groups'][gi]['lr']
+    # LR из старого чекпоинта
+    for gi in range(min(len(new_sd['param_groups']), len(old_groups))):
+        if 'lr' in old_groups[gi]:
+            new_sd['param_groups'][gi]['lr'] = old_groups[gi]['lr']
     optimizer.load_state_dict(new_sd)
-    if skipped:
-        print(f'  WARNING: {skipped} optimizer slots skipped (shape mismatch), {moved} restored')
+    print(f'  Optimizer restored by name: {moved} slots, {skipped} skipped (new params)')
     return moved > 0
 
 
@@ -430,6 +460,7 @@ def train(cfg=None, resume_path=None):
                         'step': step,
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'param_names': _opt_param_names(model),
                         'scheduler': scheduler.state_dict(),
                         'best_val_loss': best_val_loss,
                         'cfg': cfg,
@@ -445,6 +476,7 @@ def train(cfg=None, resume_path=None):
                     'step': step,
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'param_names': _opt_param_names(model),
                     'scheduler': scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                     'cfg': cfg,
@@ -459,6 +491,7 @@ def train(cfg=None, resume_path=None):
             'step': step,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'param_names': _opt_param_names(model),
             'scheduler': scheduler.state_dict(),
             'best_val_loss': best_val_loss,
             'cfg': cfg,
