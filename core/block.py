@@ -267,9 +267,9 @@ class WideBindBlock(nn.Module):
             d_pen_factor = 1.0 - 0.5 * torch.sigmoid(pen.unsqueeze(-1) + self.w_d_pen.unsqueeze(0).unsqueeze(0))
             d_mod = (d_mod.reshape(B, L, self.mirror.G, self.mirror.d) * d_pen_factor.to(d_mod.dtype).unsqueeze(-1)).reshape(B, L, D)
 
-        # Vectorize over S scales: (B, L, D) → (B, L, S*D)
-        d_s_vec = d_s.view(1, 1, S, 1).expand(B, L, S, D).reshape(B, L, S * D)
-        d_mod_vec = d_mod.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
+        # Vectorize over S scales: (B, L, S, D) — expand-views, no materialized copies
+        d_s_vec = d_s.view(1, 1, S, 1).expand(B, L, S, D)
+        d_mod_vec = d_mod.unsqueeze(2).expand(-1, -1, S, -1)
         decay = (d_s_vec * d_mod_vec).clamp(min=0.01, max=1.0)  # per-scale per-channel, floor 0.01 cap 1.0
 
         # Dynamic write modulation (per-expert K-space conditioning)
@@ -286,17 +286,18 @@ class WideBindBlock(nn.Module):
         else:
             mem_input = h * i_gate  # (B, L, D)
 
-        input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
+        input_vec = mem_input.unsqueeze(2).expand(-1, -1, S, -1)  # (B, L, S, D) expand-view
         
         eps = 1e-6
         CHUNK = 32
         
         # fp32 guard for log-space scan (critical under AMP for long memory)
+        # NOTE: when already fp32, .float() would be a full copy — keep the reference
         _dtype = decay.dtype
-        decay_f32 = decay.float()
-        input_vec_f32 = input_vec.float()
+        decay_f32 = decay.float() if decay.dtype != torch.float32 else decay
+        input_vec_f32 = input_vec.float() if input_vec.dtype != torch.float32 else input_vec
         if mem_state is not None:
-            mem_state_f32 = mem_state.reshape(B, S * D).float()
+            mem_state_f32 = mem_state.reshape(B, S, D).float()
         else:
             mem_state_f32 = None
         
@@ -348,9 +349,6 @@ class WideBindBlock(nn.Module):
         mem_all_vec, mem_state_out_vec, mem_leaf_vec = _combine_chunks(chunks, mem_state_f32)
         # Keep VSA in fp32 — prefix scan accumulators underflow/overflow in fp16
         
-        mem_all_vec = mem_all_vec.view(B, L, S, D)  # (B, L, S, D)
-        mem_leaf_vec = mem_leaf_vec.view(B, L, S, D)  # leaf: within-chunk only
-        
         # Weighted combination: sigmoid per scale per channel (no sum-to-1)
         w = torch.sigmoid(self.scale_w)  # (S, D)
         mem_all = (mem_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # (B, L, D)
@@ -361,16 +359,15 @@ class WideBindBlock(nn.Module):
         
         # First moment (same multi-scale decay, scaled input)
         if mu_state is not None:
-            mu_state = mu_state.reshape(B, S * D)
-        mu_input_vec = (mem_input * self.w_k_mu).unsqueeze(2).expand(-1, -1, S, -1).reshape(B, L, S * D)
-        mu_input_f32 = mu_input_vec.float()  # fp32 for scan stability
+            mu_state = mu_state.reshape(B, S, D)
+        mu_input_vec = (mem_input * self.w_k_mu).unsqueeze(2).expand(-1, -1, S, -1)
+        mu_input_f32 = mu_input_vec.float() if mu_input_vec.dtype != torch.float32 else mu_input_vec
         mu_chunks = []
         for start in range(0, L, CHUNK):
             end = min(start + CHUNK, L)
             intra, final, cum_decay = _scan_chunk(mu_input_f32[:, start:end], decay_f32[:, start:end])
             mu_chunks.append((intra, final, cum_decay))
         mu_all_vec, mu_state_out_vec, _ = _combine_chunks(mu_chunks, mu_state)
-        mu_all_vec = mu_all_vec.view(B, L, S, D)  # keep fp32
         mu_all = (mu_all_vec * w.unsqueeze(0).unsqueeze(0)).sum(dim=2)
         mu_read = mu_all * self.w_q_mu
         mem_read = mem_read + mu_read * self.w_mu_mem
