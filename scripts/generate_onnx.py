@@ -48,12 +48,50 @@ def state_feeds(shapes, n_layers):
     return st
 
 
+def migrate_state_dict(sd, model):
+    """Миграция старых чекпоинтов под когерентность спиралей (bind W_out +K, bind_coh_gate).
+
+    - W_out старой формы (n_dims*2K, D) → новая (n_dims*2K+K, D): первые строки копируются,
+      хвост обнуляется — при нулевой когерентности выход численно совпадает со старым.
+    - bind_coh_gate отсутствует → 0.0: старое поведение записи (когерентность выключена).
+    Возвращает (мигрированный sd, число изменённых ключей).
+    """
+    changed = 0
+    for name, p in model.named_parameters():
+        if not name.endswith('bind.W_out'):
+            continue
+        old = sd.get(name)
+        if old is None:
+            continue
+        if tuple(old.shape) == tuple(p.shape):
+            continue
+        new = torch.zeros_like(p)
+        n = min(old.shape[0], p.shape[0])
+        new[:n] = old[:n]
+        sd[name] = new
+        changed += 1
+    for name, p in model.named_parameters():
+        if name.endswith('bind_coh_gate'):
+            if name not in sd:
+                sd[name] = torch.zeros_like(p)
+                changed += 1
+        elif name.endswith('freq_scale'):
+            if name not in sd:
+                sd[name] = torch.tensor(1.0)  # численно эквивалентно старому масштабу частот
+                changed += 1
+    return sd, changed
+
+
 def generate_onnx(onnx_path, ckpt, prompt, max_new_tokens=128, temperature=1.0,
                   top_k=50, sampler=None, rep_penalty=2.0, rep_window=5,
                   bias_alpha=0.0, threads=0, verbose=False):
     cfg = ckpt['cfg']
     model = WideBindStack(cfg).eval()
-    model.load_state_dict(ckpt['model'], strict=False)
+    sd = dict(ckpt['model'])
+    sd, n_migrated = migrate_state_dict(sd, model)
+    model.load_state_dict(sd, strict=False)
+    if n_migrated:
+        print(f'Checkpoint migrated for spiral coherence: {n_migrated} keys', flush=True)
     if model.explicit_reasoning:
         model.reasoning_enabled_step = int(ckpt.get('reasoning_enabled_step', 0))
     print(f'Reasoning: enabled, ramp t={model.reasoning_enabled_step} '

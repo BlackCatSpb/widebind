@@ -131,6 +131,8 @@ class WideBindBlock(nn.Module):
         gamma_max = 0.5
         gamma_init = gamma_max * (1.0 / (1.0 + math.exp(-(math.log(tau_l) - math.log(32.0)))))
         self.gamma_surprisal = nn.Parameter(torch.full((), gamma_init))
+        # Когерентность спиралей → запись в VSA-память (опорные точки скрещивания фаз)
+        self.bind_coh_gate = nn.Parameter(torch.tensor(0.5))
 
         # First moment
         self.w_k_mu = nn.Parameter(torch.randn(cfg.D))
@@ -236,7 +238,7 @@ class WideBindBlock(nn.Module):
             if traj_state is not None and (traj_state.shape[2] != L
                                            or traj_state.shape[0] != B):
                 traj_state = None
-            bind_out, new_traj = self.bind(h, traj_state)
+            bind_out, new_traj, coherence = self.bind(h, traj_state)
             if traj_state is None:
                 self._traj_state = new_traj.detach()
                 traj_state_out = None
@@ -244,6 +246,7 @@ class WideBindBlock(nn.Module):
                 traj_state_out = (0.9 * traj_state + 0.1 * new_traj).detach()
         else:
             bind_out = self.bind(h)
+            coherence = torch.zeros(B, L, K, device=device, dtype=h.dtype)
             new_traj = None
             traj_state_out = None
         if _chk(bind_out, 'bind'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
@@ -257,6 +260,9 @@ class WideBindBlock(nn.Module):
         if pen is not None:
             igate_logit = igate_logit + self.gamma_surprisal * pen.unsqueeze(-1)
         i_gate = F.softplus(igate_logit)                    # (B, L, D)
+        # Опорные точки скрещивания спиралей: синхронность фаз усиливает запись
+        coh_mean = coherence.mean(dim=-1, keepdim=True)     # (B, L, 1)
+        i_gate = i_gate * (1.0 + self.bind_coh_gate * coh_mean.to(i_gate.dtype))
         d_mod = torch.sigmoid(h * self.w_d + self.b_d)      # (B, L, D) — content mod of decay
         if noise_scale > 0 and self.training:
             noise = 1.0 + noise_scale * torch.randn_like(i_gate)

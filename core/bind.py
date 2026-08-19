@@ -1,4 +1,4 @@
-"""WideBind: bind module."""
+﻿"""WideBind: bind module."""
 
 import math, os
 import torch
@@ -307,12 +307,25 @@ class TrajectorySpiralBind(nn.Module):
         self.w_v_re = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.3)
         self.w_v_im = nn.Parameter(torch.zeros(self.S, self.n_dims, K))
         tau_init = torch.log(torch.arange(1, K + 1, dtype=torch.float32) / K).unsqueeze(0).unsqueeze(0).expand(self.S, self.n_dims, -1).clone()
-        self.W_freq = nn.Parameter(tau_init)
+        # ONNX-совместимая лог-сетка частот со сдвигом на каждую (s,d): шаг ≈ 1 октава
+        tau_base = torch.log(torch.arange(1, K + 1, dtype=torch.float32) / K)
+        span = math.log(K)
+        wf = []
+        for s in range(self.S):
+            for d in range(self.n_dims):
+                frac = (s * self.n_dims + d + 0.5) / (self.S * self.n_dims)
+                wf.append(tau_base + (frac - 0.5) * 2.0 * span)
+        self.W_freq = nn.Parameter(torch.stack(wf).view(self.S, self.n_dims, K))
+        # Масштаб частот: θ = ω·hp·freq_scale. init 2π — фазы пробегают циклы при
+        # типичных hp (скрещивания в hp-пространстве); старые чекпоинты через
+        # миграцию получают 1.0 (численно эквивалентно прежнему поведению).
+        self.freq_scale = nn.Parameter(torch.tensor(2 * math.pi))
         self.W_phase = nn.Parameter(torch.randn(self.S, self.n_dims, K) * 0.1)
         self.register_buffer('_step_count', torch.zeros(1, dtype=torch.long))
         self.hybrid_alpha_max = getattr(cfg, 'hybrid_alpha_max', 0.7)
         self.hybrid_alpha_min = getattr(cfg, 'hybrid_alpha_min', 0.3)
-        self.W_out = nn.Parameter(torch.empty(self.n_dims * 2 * K, D))
+        # +K каналов когерентности спиралей (точки скрещивания) — в выход bind
+        self.W_out = nn.Parameter(torch.empty(self.n_dims * 2 * K + K, D))
         nn.init.xavier_uniform_(self.W_out, gain=0.5)
         self._tied = False
         circ_conv = torch.tensor(
@@ -359,7 +372,7 @@ class TrajectorySpiralBind(nn.Module):
             # Vectorized over (s, d): single batched computation instead of
             # S*n_dims sequential micro-op groups. Mathematically identical.
             hp_v = hp[:, :, None, None, :]                        # (B, L, 1, 1, K)
-            wf = torch.exp(self.W_freq).unsqueeze(0).unsqueeze(0)  # (1, 1, S, nd, K)
+            wf = (torch.exp(self.W_freq) * self.freq_scale).unsqueeze(0).unsqueeze(0)  # (1, 1, S, nd, K)
             wp = self.W_phase.unsqueeze(0).unsqueeze(0)
             theta = wf * hp_v + wp
             cos_t = torch.cos(theta)
@@ -385,15 +398,28 @@ class TrajectorySpiralBind(nn.Module):
             out_s = torch.cat([prod_re, prod_im], dim=-1)         # (B, L, S, nd, 2K)
             out_acc = out_s.sum(dim=2)                            # (B, L, nd*2K)
             out_acc = out_acc.reshape(B, L, self.n_dims * 2 * K)
+            # Когерентность спиралей |Σ e^{iθ}|²: точки скрещивания фаз (стандартные ONNX-op: ReduceSum/Pow/Concat)
+            if self.S * self.n_dims > 1:
+                sum_cos = cos_t.sum(dim=2).sum(dim=2)             # (B, L, K)
+                sum_sin = sin_t.sum(dim=2).sum(dim=2)             # (B, L, K)
+                coherence = (sum_cos.pow(2) + sum_sin.pow(2)) / ((self.S * self.n_dims) ** 2)
+            else:
+                coherence = torch.zeros(B, L, K, device=h.device, dtype=h.dtype)
+            out_acc = torch.cat([out_acc, coherence], dim=-1)     # (B, L, nd*2K + K)
         else:
+            coh_re = None
+            coh_im = None
             for s in range(self.S):
                 dim_outputs = []
                 for d in range(self.n_dims):
-                    freq = torch.exp(self.W_freq[s, d]).unsqueeze(0).unsqueeze(0)
+                    freq = (torch.exp(self.W_freq[s, d]) * self.freq_scale).unsqueeze(0).unsqueeze(0)
                     phase = self.W_phase[s, d].unsqueeze(0).unsqueeze(0)
                     theta = freq * hp + phase
                     cos_t = torch.cos(theta)
                     sin_t = torch.sin(theta)
+                    if self.S * self.n_dims > 1:
+                        coh_re = cos_t if coh_re is None else coh_re + cos_t
+                        coh_im = sin_t if coh_im is None else coh_im + sin_t
                     u_re = hp * self.w_u_re[s, d].unsqueeze(0).unsqueeze(0)
                     u_im = hp * self.w_u_im[s, d].unsqueeze(0).unsqueeze(0)
                     v_re = traj[:, d] * self.w_v_re[s, d].unsqueeze(0).unsqueeze(0)
@@ -407,9 +433,15 @@ class TrajectorySpiralBind(nn.Module):
                     dim_outputs.append(torch.cat([prod_re, prod_im], dim=-1))
                 out_s = torch.cat(dim_outputs, dim=-1)
                 out_acc = out_s if out_acc is None else out_acc + out_s
+            if self.S * self.n_dims > 1:
+                coherence = (coh_re.pow(2) + coh_im.pow(2)) / ((self.S * self.n_dims) ** 2)
+                out_acc = torch.cat([out_acc, coherence], dim=-1)
+            else:
+                coherence = torch.zeros(B, L, K, device=h.device, dtype=h.dtype)
+                out_acc = torch.cat([out_acc, coherence], dim=-1)
         result = out_acc @ self.W_out
         new_traj = traj[:, 1:]  # (B, n_dims - 1, L, K)
-        return result, new_traj
+        return result, new_traj, coherence
 
 
 class TrajectoryManifoldBind(TrajectorySpiralBind):
@@ -593,11 +625,11 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
     def forward(self, h, traj_state=None):
         if h.dim() == 2:
             h = h.unsqueeze(0)
-        result, new_traj = super().forward(h, traj_state)
+        result, new_traj, coherence = super().forward(h, traj_state)
         hp = self.hp_norm(self.W_proj(h) + self.w_bind_bias)
         self._push_transitions(hp)
         man = self._manifold_read(hp).float()
-        return result + self.gain * (man @ self.W_man).clamp(-8.0, 8.0), new_traj
+        return result + self.gain * (man @ self.W_man).clamp(-8.0, 8.0), new_traj, coherence
 
 
 # в”Ђв”Ђв”Ђ WideBind Block в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
