@@ -176,7 +176,12 @@ def train(cfg=None, resume_path=None):
     if resume_path and os.path.exists(resume_path):
         print(f'Resuming from {resume_path}')
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
-        missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+        sd = dict(ckpt['model'])
+        from core.migrate import migrate_state_dict
+        sd, n_migrated = migrate_state_dict(sd, model)
+        if n_migrated:
+            print(f'  MIGRATED {n_migrated} keys (W_out +K, bind_coh_gate=0, freq_scale=1.0) — старое поведение сохранено')
+        missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:

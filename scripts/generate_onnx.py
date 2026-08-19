@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import onnxruntime as ort
 
 from core import WideBindConfig, WideBindStack
+from core.migrate import migrate_state_dict
 from scripts.generate import AdaptiveSampler, load_russian_tokenizer
 
 
@@ -46,40 +47,6 @@ def state_feeds(shapes, n_layers):
         if n.startswith('state_'):
             st[n] = torch.zeros(*sh)
     return st
-
-
-def migrate_state_dict(sd, model):
-    """Миграция старых чекпоинтов под когерентность спиралей (bind W_out +K, bind_coh_gate).
-
-    - W_out старой формы (n_dims*2K, D) → новая (n_dims*2K+K, D): первые строки копируются,
-      хвост обнуляется — при нулевой когерентности выход численно совпадает со старым.
-    - bind_coh_gate отсутствует → 0.0: старое поведение записи (когерентность выключена).
-    Возвращает (мигрированный sd, число изменённых ключей).
-    """
-    changed = 0
-    for name, p in model.named_parameters():
-        if not name.endswith('bind.W_out'):
-            continue
-        old = sd.get(name)
-        if old is None:
-            continue
-        if tuple(old.shape) == tuple(p.shape):
-            continue
-        new = torch.zeros_like(p)
-        n = min(old.shape[0], p.shape[0])
-        new[:n] = old[:n]
-        sd[name] = new
-        changed += 1
-    for name, p in model.named_parameters():
-        if name.endswith('bind_coh_gate'):
-            if name not in sd:
-                sd[name] = torch.zeros_like(p)
-                changed += 1
-        elif name.endswith('freq_scale'):
-            if name not in sd:
-                sd[name] = torch.tensor(1.0)  # численно эквивалентно старому масштабу частот
-                changed += 1
-    return sd, changed
 
 
 def generate_onnx(onnx_path, ckpt, prompt, max_new_tokens=128, temperature=1.0,
