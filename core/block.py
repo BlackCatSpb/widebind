@@ -274,7 +274,8 @@ class WideBindBlock(nn.Module):
 
         # Dynamic write modulation (per-expert K-space conditioning)
         hp_cached = self.mirror._cached_hp
-        if hp_cached is not None and self.training:
+        if (hp_cached is not None and self.training
+                and hp_cached.shape[0] == B and hp_cached.shape[1] == L):
             g = self.mirror.G
             d = self.mirror.d
             k = self.mirror.k
