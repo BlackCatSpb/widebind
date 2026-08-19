@@ -191,7 +191,7 @@ def test_mirror_shape():
     B, L = 2, 16
     h = torch.randn(B, L, D)
     mem_all = torch.randn(B, L, D)
-    out, mlp_mod, mem_mod = mirror(h, mem_all)
+    out, mlp_mod, mem_mod, *_ = mirror(h, mem_all)
     assert out.shape == (B, L, D), f'Shape: {out.shape}'
     assert mlp_mod.shape == (B, L, G) and mem_mod.shape == (B, L, G)
 
@@ -221,7 +221,7 @@ def test_mirror_no_lo_hi_split():
     B, L = 2, 8
     h = torch.randn(B, L, D)
     mem_all = torch.randn(B, L, D)
-    out, _, _ = mirror(h, mem_all)
+    out, *_ = mirror(h, mem_all)
     assert out.shape == (B, L, D)
 
 
@@ -233,7 +233,7 @@ def test_mirror_skip_connection_preserves_gradient():
     mem_all = torch.randn(B, L, D)
     log_scale_before = mirror.log_scale.data.clone()
     
-    out, _, _ = mirror(h, mem_all)
+    out, *_ = mirror(h, mem_all)
     loss = out.sum()
     loss.backward()
     
@@ -271,8 +271,8 @@ def test_mirror_global_state():
     h = torch.randn(B, L, D)
     mem_all = torch.randn(B, L, D)
     global_state = torch.randn(1, 1, D)
-    out_with, _, _ = mirror(h, mem_all, global_state)
-    out_without, _, _ = mirror(h, mem_all, global_state=None)
+    out_with, *_ = mirror(h, mem_all, global_state)
+    out_without, *_ = mirror(h, mem_all, global_state=None)
     assert out_with.shape == out_without.shape
 
 
@@ -740,7 +740,7 @@ def test_alpha_gradient_stronger_than_wpred():
     B, L = 2, 16
     h = torch.randn(B, L, D)
     mem_all = torch.randn(B, L, D)
-    out, _, _ = mirror(h, mem_all)
+    out, *_ = mirror(h, mem_all)
     loss = out.sum() * 0.01  # scale down to avoid extreme grads
     loss.backward()
     alpha_grad = mirror.alpha_diag.grad.norm().item()
@@ -781,7 +781,7 @@ def test_no_lo_hi_split_grad_to_all_k():
     B, L = 1, 4
     h = torch.randn(B, L, D, requires_grad=True)
     mem_all = torch.randn(B, L, D)
-    out, _, _ = mirror(h, mem_all)
+    out, *_ = mirror(h, mem_all)
     loss = out.sum()
     loss.backward()
     # Grad should exist for all parameters (no dims blocked)

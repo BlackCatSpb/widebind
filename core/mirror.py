@@ -322,6 +322,11 @@ class GroupedCognitiveMirror(nn.Module):
             self._cached_hp = hp.detach()
             self._cached_pred_error_norm = pred_error_norm.detach()
         else:
+            if self._cached_hp_buf.shape[0] != B:
+                _seq_max = self._cached_hp_buf.shape[1]
+                self._cached_hp_buf = torch.zeros(B, _seq_max, G, self.k, device=hp.device)
+                self._cached_pred_k_buf = torch.zeros(B, _seq_max, G, self.k, device=hp.device)
+                self._cached_pred_error_norm_buf = torch.zeros(B, _seq_max, device=hp.device)
             self._cached_hp_buf[:, :L].copy_(hp.detach())
             if _pred_k_aux is not None:
                 self._cached_pred_k_buf[:, :L].copy_(_pred_k_aux.detach())
