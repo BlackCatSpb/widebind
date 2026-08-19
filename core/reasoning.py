@@ -37,10 +37,14 @@ class ReasoningMemory(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(D, D)
 
-    def forward(self, h, reasoning_buffer=None, record=True):
+    def forward(self, h, reasoning_buffer=None, reasoning_count=None, record=True):
         """
         h: (B, L, D) current hidden state
-        reasoning_buffer: list of previous reasoning step tensors
+        reasoning_buffer: (B, max_steps, D) tensor of previous reasoning steps
+            (rows [0, count) are valid, rest zero-padded) or None for a fresh
+            buffer. Tensor form is required for static export; the list form
+            is gone — a fresh buffer starts empty (count=0, rows all zero).
+        reasoning_count: scalar long tensor = number of valid rows (or None)
         record: False — step not written to the buffer (closed gate step):
         it still produces a contribution but does not pollute attention.
         """
@@ -49,35 +53,54 @@ class ReasoningMemory(nn.Module):
         # Encode current step
         current_step = self.step_encoder(h[:, -1:, :])  # (B, 1, D)
 
-        if reasoning_buffer is None or len(reasoning_buffer) == 0:
-            new_buffer = [current_step.detach()] if record else []
-            return current_step.squeeze(1), new_buffer
+        if reasoning_buffer is None:
+            reasoning_buffer = torch.zeros(B, self.max_steps, D, device=h.device, dtype=h.dtype)
+        if reasoning_count is None:
+            reasoning_count = torch.zeros((), dtype=torch.long, device=h.device)
 
-        # Attend to previous reasoning steps
-        # Stack previous steps: (B, num_steps, D)
-        prev_steps = torch.cat(reasoning_buffer, dim=1)
-
-        q = self.step_query(current_step)  # (B, 1, D)
-        k = self.step_key(prev_steps)      # (B, num_steps, D)
-        v = self.step_value(prev_steps)    # (B, num_steps, D)
+        # Attend to previous reasoning steps: masked attention over the padded
+        # fixed-size buffer. Rows [0, count) are valid; the mask zeroes the rest
+        # — numerically identical to attending over a dynamic-length cat.
+        q = self.step_query(current_step)            # (B, 1, D)
+        k = self.step_key(reasoning_buffer)          # (B, max_steps, D)
+        v = self.step_value(reasoning_buffer)        # (B, max_steps, D)
 
         # Attention: независимые сигмоид-гейты (не softmax, без sum-to-1).
         # Каждый шаг буфера взвешивается самостоятельно и может быть
         # полностью отброшен (attn=0); размазывание softmax по шагам
         # убирает селективность внимания к релевантному шагу.
         attn = torch.sigmoid(q @ k.transpose(-2, -1) / math.sqrt(D))
+        mask = (torch.arange(self.max_steps, device=h.device, dtype=h.dtype)
+                < reasoning_count.to(h.dtype)).view(1, 1, self.max_steps)
+        attn = attn * mask
         context = attn @ v  # (B, 1, D)
 
         # Combine current step with context
-        output = current_step + context
-        output = self.output_proj(output)
+        combined = current_step + context
+        output = self.output_proj(combined)
+        # Empty buffer: no attention AND no projection (historical behavior).
+        # Masked (not control flow) so the graph is static; wasted compute on
+        # the empty path is negligible.
+        empty = (reasoning_count <= 0).to(h.dtype)
+        output = current_step * empty + output * (1.0 - empty)
 
-        # Update buffer
-        new_buffer = reasoning_buffer + ([current_step.detach()] if record else [])
-        if len(new_buffer) > self.max_steps:
-            new_buffer = new_buffer[-self.max_steps:]
+        # Update buffer: append current step; shift left only when full.
+        # Fully detached — the buffer is cross-call state (like the old list
+        # of detached steps); no gradient may flow through it.
+        if record:
+            new_count = (reasoning_count + 1).clamp(max=self.max_steps)
+            row_idx = reasoning_count.clamp(max=self.max_steps - 1)
+            one_hot = F.one_hot(row_idx, self.max_steps).float().view(1, self.max_steps, 1)
+            full = (reasoning_count >= self.max_steps).float()
+            shifted = torch.cat(
+                [reasoning_buffer[:, 1:], torch.zeros_like(reasoning_buffer[:, :1])], dim=1)
+            buf_pre = shifted * full + reasoning_buffer * (1.0 - full)
+            new_buffer = (buf_pre * (1.0 - one_hot) + current_step.detach() * one_hot).detach()
+        else:
+            new_buffer = reasoning_buffer
+            new_count = reasoning_count
 
-        return output.squeeze(1), new_buffer
+        return output.squeeze(1), new_buffer, new_count
 
 
 class ReasoningGate(nn.Module):

@@ -61,6 +61,8 @@ class CollectiveConceptLayer(nn.Module):
         """Adaptive maturity from residual variance stabilization."""
         if resvar is None:
             return
+        if isinstance(resvar, torch.Tensor):
+            resvar = resvar.detach().item()
         lam = getattr(self.cfg, 'lambda_d', 3) if self.cfg else 3
         lam_inv = 1.0 / lam
         if not hasattr(self, '_resvar_ema'):
