@@ -90,6 +90,14 @@ class WideBindConfig:
     max_decay_steps: int = 50000
     var_min_for_lr_decay: float = 0.005
 
+    # Per-layer LS-based LR modulation (индивидуальная адаптация по var(log_scale))
+    per_layer_ls_lr: bool = False  # True = per-layer mult из fast/slow EMA var(ls)
+    ls_ema_fast: float = 0.99
+    ls_ema_slow: float = 0.999
+    ls_mult_min: float = 0.5
+    ls_mult_max: float = 2.0
+    ls_mirror_mult_max: float = 2.0  # кламп итога irm*ls_mult для mirror-градиентов
+
     # AdaptiveController (values below will be overridden by λ_d when lambda_d_enabled=True)
     exploration_threshold: float = 0.25
     differentiation_threshold: float = 0.08

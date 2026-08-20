@@ -1155,6 +1155,11 @@ class MirrorLRScheduler:
         self._tau_1malpha = None
         self._tau_gate_var = None
         self._tau_ema = 0.99
+        # Per-layer var(log_scale) modulation (cfg.per_layer_ls_lr)
+        self._ls_enabled = bool(getattr(cfg, 'per_layer_ls_lr', False)) if cfg is not None else False
+        self._ls_fast = None
+        self._ls_slow = None
+        self._ls_mult = None
 
     def _mirror_stats(self):
         var_sum = 0.0
@@ -1171,6 +1176,39 @@ class MirrorLRScheduler:
             alpha_sum += (1.0 - alpha).abs().mean().item()
             gate_var_sum += m._last_gates.var().item()
         return var_sum / n, mag_sum / n, alpha_sum / n, gate_var_sum / n
+
+    def _update_ls_mult(self):
+        """Per-layer multiplier from fast/slow EMA of var(log_scale) per layer.
+
+        ratio_i = fast_i / slow_i  (trend detector: fast EMA tracks current level,
+        slow EMA the long-term baseline). Rising variance -> ratio>1 -> mult<1
+        (layer throttled), falling (specialization) -> mult>1 (layer boosted).
+        """
+        if not self._ls_enabled:
+            self._ls_mult = None
+            return None
+        n = len(self.model.layers)
+        vals = []
+        for layer in self.model.layers:
+            ls = layer.mirror.log_scale.data
+            vals.append(ls.var().item())
+        if self._ls_fast is None:
+            self._ls_fast = list(vals)
+            self._ls_slow = list(vals)
+            self._ls_mult = [1.0] * n
+            return self._ls_mult
+        tf = getattr(self.cfg, 'ls_ema_fast', 0.99)
+        ts = getattr(self.cfg, 'ls_ema_slow', 0.999)
+        lo = getattr(self.cfg, 'ls_mult_min', 0.5)
+        hi = getattr(self.cfg, 'ls_mult_max', 2.0)
+        mults = []
+        for i in range(n):
+            self._ls_fast[i] = tf * self._ls_fast[i] + (1 - tf) * vals[i]
+            self._ls_slow[i] = ts * self._ls_slow[i] + (1 - ts) * vals[i]
+            r = self._ls_fast[i] / max(self._ls_slow[i], 1e-10)
+            mults.append(max(lo, min(hi, 1.0 / r)))
+        self._ls_mult = mults
+        return mults
 
     def report_train_loss(self, train_loss, ce_loss=None):
         """Report training loss for LR damping. Uses CE (not total) to avoid pred_loss false dampings."""
@@ -1199,6 +1237,7 @@ class MirrorLRScheduler:
         warmup_end = self.warmup
         blend_steps = 50
         if self._step < warmup_end + blend_steps:
+            self._ls_mult = None
             if self._step < warmup_end:
                 mult = self._step / max(warmup_end, 1)
                 override = max(0.0, 1.0 - mult * 0.7)
@@ -1249,14 +1288,19 @@ class MirrorLRScheduler:
             mult = max(0.05, min(1.0, mirror_mult))
             if hasattr(self, '_loss_lr_factor'):
                 mult = mult * self._loss_lr_factor
+            self._update_ls_mult()
 
             if self._step - self._last_log >= 500:
                 self._last_log = self._step
                 tau_var = self._tau_var.item() if hasattr(self._tau_var, 'item') else self._tau_var
+                ls_info = ''
+                if self._ls_mult is not None:
+                    ls_info = (f' ls_mult[min={min(self._ls_mult):.3f} '
+                               f'max={max(self._ls_mult):.3f}]')
                 print(f'  lr_adapt: var(ls)={var:.6f} |1-a|={mean_1malpha:.6f} '
                       f'gate_var={gate_var:.6f} |mirror|={mag:.4f} '
                       f'tau_var={tau_var:.6f} '
-                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}')
+                      f'mult={mult:.4f} lr={self.base_lr*mult:.2e}{ls_info}')
 
         for i, pg in enumerate(self.optimizer.param_groups):
             pg['lr'] = self._orig_lrs[i] * mult
@@ -1278,6 +1322,9 @@ class MirrorLRScheduler:
         if hasattr(self, '_best_val_loss'):
             sd['best_val_loss'] = self._best_val_loss
             sd['loss_lr_factor'] = self._loss_lr_factor
+        if self._ls_enabled and self._ls_fast is not None:
+            sd['ls_fast'] = self._ls_fast
+            sd['ls_slow'] = self._ls_slow
         return sd
 
     def load_state_dict(self, sd):
@@ -1292,12 +1339,18 @@ class MirrorLRScheduler:
         if 'best_val_loss' in sd:
             self._best_val_loss = sd['best_val_loss']
             self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
+        if self._ls_enabled:
+            self._ls_fast = sd.get('ls_fast')
+            self._ls_slow = sd.get('ls_slow')
 
     def reset_for_new_data(self, reset_warmup_steps=2000):
         self._tau_var = None
         self._tau_mag = None
         self._tau_1malpha = None
         self._tau_gate_var = None
+        self._ls_fast = None
+        self._ls_slow = None
+        self._ls_mult = None
 
 
 # ─── Verify ────────────────────────────────────────────────────────────

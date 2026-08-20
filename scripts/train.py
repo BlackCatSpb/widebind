@@ -402,6 +402,22 @@ def train(cfg=None, resume_path=None):
                         p.grad *= mir_s
             mean_mirror_scale = sum(s[0] for s in phase_scales) / len(phase_scales)
             mean_ratio = sum(s[1] for s in phase_scales) / len(phase_scales)
+
+            # Per-layer LS-based LR modulation (cfg.per_layer_ls_lr)
+            ls_mults = getattr(scheduler, '_ls_mult', None)
+            if ls_mults is not None:
+                mirror_hi = getattr(cfg, 'ls_mirror_mult_max', 2.0)
+                for i, layer in enumerate(model.layers):
+                    ls_m = ls_mults[i]
+                    for p in layer.base_parameters:
+                        if p.grad is not None:
+                            p.grad.mul_(ls_m)
+                    if ls_m != 1.0:
+                        mir_s = phase_scales[i][0]
+                        total = max(0.2, min(mirror_hi, mir_s * ls_m))
+                        for p in layer.mirror_parameters:
+                            if p.grad is not None:
+                                p.grad.mul_(total / mir_s)
             tokens_seen += cfg.batch_size * seq_len
             
             # Clip gradients
@@ -553,6 +569,8 @@ if __name__ == '__main__':
     parser.add_argument('--eval-interval', type=int, default=1000)
     parser.add_argument('--save-interval', type=int, default=5000)
     parser.add_argument('--scheduler', type=str, default='mirror', choices=['cosine', 'mirror'])
+    parser.add_argument('--per-layer-ls-lr', action='store_true',
+                        help='Per-layer LR modulation from fast/slow EMA var(log_scale)')
     parser.add_argument('--head', type=str, default='partitioned', choices=['partitioned', 'codec'],
                         help='LM head: partitioned (softmax-CE) or codec (SignedAmpCodec CE + W_pred + echo)')
     parser.add_argument('--amp-obj', type=str, default='ce', choices=['ce', 'mh'],
@@ -583,6 +601,7 @@ if __name__ == '__main__':
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         scheduler=args.scheduler,
+        per_layer_ls_lr=args.per_layer_ls_lr,
         amp_codec=(args.head == 'codec'),
         amp_obj=args.amp_obj,
         amp_pred=not args.no_amp_pred,
