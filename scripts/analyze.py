@@ -6,6 +6,7 @@
   - wake      — вердикт PASS/WATCH/WAKE (пробуждение MLP по маркерам watchlist)
   - live      — forward на случайном входе: hp/predMSE/|mirror|/gate/ls/skip, сигналы, параметры
   - anomaly   — трекер аномалий: max ||hp||/predMSE/min gate/births + дельты к прошлому чекпоинту
+  - gradinfo  — dead_pred (pred_loss без градиента из-за detach в _pred_cache) + cos_sim(diversity, CE)
   - head      — декомпозиция bias vs контекст + позиционная карта головы + A/B reasoning
   - cmp       — сравнение нескольких чекпоинтов на одинаковом входе
 
@@ -316,7 +317,7 @@ def run_wake(model, ckpt):
 
 # ─────────────────────────── LIVE ───────────────────────────
 
-def run_live(model, cfg, batch=1, seq=128):
+def run_live(model, cfg, batch=1, seq=128, gradinfo=True):
     device = 'cpu'
     model.to(device)
     model.train()
@@ -410,6 +411,13 @@ def run_live(model, cfg, batch=1, seq=128):
     if pm is not None:
         print(f'  model private_mem norm: {pm.norm(dim=-1).mean().item():.3f}')
 
+    grad_info = None
+    if gradinfo:
+        try:
+            grad_info = run_grad_info(model, ls, aux)
+        except Exception as e:
+            print(f'  [warn] grad info: {e}')
+
     return {
         'in_norm': h.norm(dim=-1).mean().item(),
         'out_norm': h_out.norm(dim=-1).mean().item(),
@@ -420,6 +428,7 @@ def run_live(model, cfg, batch=1, seq=128):
         'vsa_tau': [vsa_tau[0].item(), vsa_tau[-1].item()],
         'tau_l_dev': td.mean().item(), 'tau_l_dev_std': td.std().item(),
         'pm_norm': pm.norm(dim=-1).mean().item() if pm is not None else None,
+        'grad_info': grad_info,
     }
 
 
@@ -648,6 +657,63 @@ def run_anomaly(live, wake, ckpt):
             'dhp': dh, 'dpe': dp, 'dgate': dg}
 
 
+# ─────────────────────────── GRAD INFO ───────────────────────────
+
+def _flat_grad_stats(params, grad_map):
+    dot = nce = ndiv = 0.0
+    for p in params:
+        g = grad_map.get(id(p))
+        if g is None:
+            continue
+        g = g.flatten()
+        dot += float(g @ g)
+        nce += float((g ** 2).sum())
+    n = math.sqrt(nce)
+    return n, dot
+
+
+def run_grad_info(model, ce_loss, aux):
+    sec('GRAD INFO: dead_pred + cos_sim(diversity, CE)')
+    info = {'dead_pred': None, 'cos_global': None, 'cos_l16': None,
+            'scale': None, 'n_ce': None, 'n_div': None}
+    pred = aux.get('pred')
+    if pred is None:
+        info['dead_pred'] = True
+        print('  pred: МЁРТВЫЙ — отсутствует в aux (pred_k/hp детачатся в _pred_cache), '
+              'градиента НЕ даёт')
+    else:
+        dead = not (isinstance(pred, torch.Tensor) and pred.requires_grad)
+        info['dead_pred'] = dead
+        print(f'  pred: aux={pred.item():.4f} requires_grad={pred.requires_grad}'
+              + (' → БЕЗ ГРАДИЕНТА (dead)' if dead else ''))
+
+    div = aux.get('diversity')
+    if isinstance(div, torch.Tensor) and div.requires_grad:
+        div_grads = torch.autograd.grad(div, model.parameters(), retain_graph=True,
+                                        allow_unused=True)
+        ce_grads = torch.autograd.grad(ce_loss, model.parameters(), allow_unused=True)
+        map_ce = {id(p): g for p, g in zip(model.parameters(), ce_grads)}
+        map_div = {id(p): g for p, g in zip(model.parameters(), div_grads)}
+        n_ce, dot = _flat_grad_stats(model.parameters(), map_ce)
+        n_div, _ = _flat_grad_stats(model.parameters(), map_div)
+        cos = dot / math.sqrt(n_ce * n_div) if n_ce > 0 and n_div > 0 else 0.0
+        scale = max(0.0, min(10.0, cos)) * n_ce / max(n_div, 1e-8)
+        n_ce16, dot16 = _flat_grad_stats(model.layers[16].parameters(), map_ce)
+        n_div16, _ = _flat_grad_stats(model.layers[16].parameters(), map_div)
+        cos16 = dot16 / math.sqrt(n_ce16 * n_div16) if n_ce16 > 0 and n_div16 > 0 else 0.0
+        info.update(cos_global=cos, cos_l16=cos16, scale=scale,
+                    n_ce=n_ce, n_div=n_div, diversity_aux=div.item())
+        print(f'  diversity aux={div.item():.3f}')
+        print(f'  ||gCE||={n_ce:.3e}  ||gDIV||={n_div:.3e}')
+        print(f'  cos_sim(diversity, CE): global={cos:.4f}  L16={cos16:.4f}')
+        print(f'  scale(align) = cos·||CE||/||DIV|| = {scale:.4f} (cap 10)')
+        if cos < 0.2:
+            print('  [WATCH] diversity слабо выровнен с CE — её градиент почти не добавляется')
+    else:
+        print('  diversity: не требует градиента или отсутствует — пропущено')
+    return info
+
+
 # ─────────────────────────── HTML ───────────────────────────
 
 def _hue(v, vmin, vmax):
@@ -790,6 +856,26 @@ td:first-child,th:first-child{text-align:left}
     else:
         ch.append('<div class="dim">live пропущен — трекер недоступен</div>')
 
+    ch.append('<h2>GRAD INFO</h2>')
+    gi = live.get('grad_info') if live else None
+    if gi:
+        dead = gi.get('dead_pred')
+        ch.append('<div>pred: ' +
+                  ('<span class="bdg b-PASS">DEAD</span> — нет в aux / без градиента '
+                   '(pred_k/hp детачатся в _pred_cache), на обучение не влияет'
+                   if dead else '<span class="bdg b-WATCH">ALIVE</span> — требует градиента') +
+                  '</div>')
+        if gi.get('cos_global') is not None:
+            cls = 'g' if gi['cos_global'] >= 0.2 else 'r'
+            ch.append(f'<div>diversity aux={gi.get("diversity_aux", 0):.0f} — '
+                      f'cos_sim(div, CE): global=<b class="{cls}">{gi["cos_global"]:.4f}</b> '
+                      f'L16={gi["cos_l16"]:.4f} | ||gCE||={gi["n_ce"]:.2e} '
+                      f'||gDIV||={gi["n_div"]:.2e} | scale(align)={gi["scale"]:.4f} (cap 10)</div>')
+        else:
+            ch.append('<div>diversity: не требует градиента или отсутствует</div>')
+    else:
+        ch.append('<div class="dim">grad info пропущен (--no-gradinfo)</div>')
+
     if head:
         ch.append('<h2>HEAD</h2>')
         bd = head['bias_decomp']
@@ -825,6 +911,8 @@ def main():
     ap = argparse.ArgumentParser(description='WideBind checkpoint analyzer (все методы)')
     ap.add_argument('checkpoints', nargs='+', help='path(s) to .pt')
     ap.add_argument('--no-live', action='store_true', help='skip live forward dissection')
+    ap.add_argument('--no-gradinfo', action='store_true',
+                    help='skip dead_pred/cos_sim(diversity,CE) grad diagnostics (slower)')
     ap.add_argument('--no-head', action='store_true', help='skip head analysis (bias/posmap/A-B)')
     ap.add_argument('--quick', action='store_true', help='static + wake only')
     ap.add_argument('--windows', type=int, default=2)
@@ -868,7 +956,7 @@ def main():
         if not args.quick:
             if not args.no_live:
                 try:
-                    live_data = run_live(model, cfg, seq=args.seq)
+                    live_data = run_live(model, cfg, seq=args.seq, gradinfo=not args.no_gradinfo)
                 except Exception as e:
                     print(f'[error] live: {e}')
                 if live_data is not None and wake_data is not None:
