@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 EOS = 2
 MIN_SENT_TOKENS = 3
-_HEADER_LINES = 3
+_HEADER_LINES = 8
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?…])\s+')
 _DIRTY = re.compile(
@@ -43,21 +43,48 @@ def clean_header(text: str) -> str:
     cut = 0
     for i in range(min(_HEADER_LINES, len(lines))):
         s = lines[i].strip()
-        if _TITLE_FRAME.match(s) or len(s) < 60 and (_DIRTY.search(s) or len(s) < 15):
+        if not s:
+            continue
+        if _TITLE_FRAME.match(s) or _DIRTY.search(s):
             cut = i + 1
-        else:
+            continue
+        if len(s) >= 60:
             break
+        if len(s) < 40 and not re.search(r'[.!?…]$', s):
+            cut = i + 1
+            continue
+        break
     return '\n'.join(lines[cut:])
 
 
+_ABBR_RE = re.compile(r'(?<!\w)[а-яё]{1,3}\.$')
+
+
+def _is_abbrev(text: str, m) -> bool:
+    """Точка не является границей предложения (аббревиатура/домен/число)."""
+    if m.group() != '.' or m.start() == 0:
+        return m.start() == 0
+    start = m.start()
+    prev = text[start - 1]
+    if prev.isdigit() or (prev.isascii() and prev.isalpha()):
+        return True
+    return bool(_ABBR_RE.search(text[max(0, start - 8):start + 1]))
+
+
 def split_sentences(text: str):
-    """Предложения по .!?… (не режет по аббревиатурам), отдаёт список."""
+    """Границы предложений (start, end) по .!?… с фильтром аббревиатур.
+
+    Не режет: точки после латиницы/цифр (mail.ru, 1966.), короткие
+    кириллические аббревиатуры (г., ул., т.е., т.п., и т.д.).
+    """
     out = []
-    for part in re.split(r'(?<=[.!?…])\s+', text):
-        part = part.strip()
-        if len(part) < 3:
+    for m in re.finditer(r'[.!?…]', text):
+        if _is_abbrev(text, m):
             continue
-        out.append(part)
+        if out and m.start() - out[-1][1] <= 1:
+            out[-1] = (out[-1][0], m.end())
+        else:
+            out.append((m.start(), m.end()))
     return out
 
 
@@ -98,19 +125,35 @@ def process_genre(genre, tokenizer, src, out_dir, encoding='cp1251'):
             print(f'  [WARN] {os.path.basename(path)}: {e}')
             continue
         text = clean_header(raw)
-        for sent in split_sentences(text):
-            ids = tokenizer.encode(sent).ids
-            if len(ids) < MIN_SENT_TOKENS:
-                continue
-            if pos + len(ids) + 1 > CHUNK:
+        text = re.sub(r'\n+', ' ', text.replace('\r', ''))
+        text = re.sub(r'[ \t]{2,}', ' ', text)
+        bounds = split_sentences(text)
+        if not bounds:
+            continue
+        enc = tokenizer.encode(text)
+        ids = enc.ids
+        offs = enc.offsets
+        bi = 0
+        for tok_id, (s, e) in zip(ids, offs):
+            while bi < len(bounds) and s >= bounds[bi][1]:
+                if pos + 1 > CHUNK:
+                    flush()
+                buf[pos] = EOS
+                pos += 1
+                n_sents += 1
+                bi += 1
+            if pos + 1 > CHUNK:
                 flush()
-            ids_arr = np.asarray(ids, dtype=np.uint16)
-            buf[pos:pos + len(ids_arr)] = ids_arr
-            pos += len(ids_arr)
+            buf[pos] = tok_id
+            pos += 1
+        while bi < len(bounds):
+            if pos + 1 > CHUNK:
+                flush()
             buf[pos] = EOS
             pos += 1
             n_sents += 1
-        pbar.set_postfix(tok=f'{n_sents * 12 // 1e6:.0f}M', sents=f'{n_sents // 1000}K')
+            bi += 1
+        pbar.set_postfix(tok=f'{n_sents * 14 // 1e6:.0f}M', sents=f'{n_sents // 1000}K')
     flush()
     fh.close()
     pbar.close()
