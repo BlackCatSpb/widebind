@@ -435,8 +435,10 @@ class WideBindStack(nn.Module):
         return ce_loss
 
     def _finalize_ce(self, ce, targets):
-        """Mask PAD/EOS (0, 2) и surprisal-weighting — единый хвост CE."""
-        mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
+        """Mask PAD (0) и опционально EOS (2) + surprisal-weighting — единый хвост CE."""
+        mask = targets.reshape(-1) != 0
+        if getattr(self.cfg, 'mask_eos', True):
+            mask = mask & (targets.reshape(-1) != 2)
         ce_m = ce * mask.float()
         sw = getattr(self.cfg, 'surprisal_weight', 0.0)
         if self.training and sw > 0:
@@ -466,7 +468,9 @@ class WideBindStack(nn.Module):
             logits = self.lm_head(h)
             ce = F.cross_entropy(logits.reshape(-1, self.cfg.vocab),
                                  targets.reshape(-1), reduction='none')
-            mask = (targets.reshape(-1) != 0) & (targets.reshape(-1) != 2)
+            mask = targets.reshape(-1) != 0
+            if getattr(self.cfg, 'mask_eos', True):
+                mask = mask & (targets.reshape(-1) != 2)
             ce = ce * mask.float()
             sw = getattr(self.cfg, 'surprisal_weight', 0.0)
             if self.training and sw > 0:

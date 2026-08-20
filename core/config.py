@@ -22,6 +22,9 @@ class WideBindConfig:
     grad_clip: float = 0.5
     dtype: str = 'float32'
 
+    # False = обучать EOS-токен (границы предложений), True = маскировать (старое поведение)
+    mask_eos: bool = True
+
     # ─── λ_d hierarchy ─────────────────────────────────────────
     lambda_d: int = 3            # dimension of generalized golden ratio
     lambda_d_enabled: bool = True  # True = apply λ_d derivation in __post_init__

@@ -137,7 +137,9 @@ def train(cfg=None, resume_path=None):
     
     # Data
     print(f'Loading data from {cfg.data_dir}')
-    stream_files = sorted(glob.glob(os.path.join(cfg.data_dir, 'token_stream_*_clean.bin')))
+    stream_files = sorted(glob.glob(os.path.join(cfg.data_dir, 'token_stream_*_eos.bin')))
+    if not stream_files:
+        stream_files = sorted(glob.glob(os.path.join(cfg.data_dir, 'token_stream_*_clean.bin')))
     if not stream_files:
         stream_files = sorted(glob.glob(os.path.join(cfg.data_dir, 'token_stream_*.bin')))
     if not stream_files:
