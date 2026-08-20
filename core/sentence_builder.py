@@ -145,10 +145,16 @@ class SentenceResult:
 
 
 class SentenceBuilder:
-    """Собирает грамматически корректное русское предложение из набора слов."""
+    """Собирает грамматически корректное русское предложение из набора слов.
 
-    def __init__(self):
+    Если передан stencil (трафарет порядка слов из корпуса), сборка идёт
+    по его статистике: выбор ядра по salience, прикрепление модификаторов
+    по PMI, порядок — по реальным частеречным цепочкам корпуса.
+    """
+
+    def __init__(self, stencil=None):
         self._morph = _MORPH
+        self.stencil = stencil
 
     def parse(self, words: List[str]) -> List[WordInfo]:
         out = []
@@ -161,7 +167,7 @@ class SentenceBuilder:
             out.append(WordInfo(
                 text=w,
                 lemma=p.normal_form,
-                pos=tag.POS or 'UNKN',
+                pos=str(tag.POS or 'UNKN'),
                 case=getattr(tag, 'case', None),
                 number=getattr(tag, 'number', None),
                 gender=getattr(tag, 'gender', None),
@@ -178,12 +184,14 @@ class SentenceBuilder:
                 return infl.word
         except Exception:
             pass
-        return wi.lemma
+        return wi.text
 
     def build(self, words: List[str]) -> SentenceResult:
         parsed = self.parse(words)
         if not parsed:
             return SentenceResult(text='', core=[], periphery=[], roles=[])
+        if self.stencil is not None:
+            return self._build_with_stencil(parsed)
 
         # ── 1. Ранжирование важности и назначение ролей ──
         for wi in parsed:
@@ -216,6 +224,216 @@ class SentenceBuilder:
             roles=parsed,
             explanation=explanation,
         )
+
+    # ────────────────────────────────────────────────────────────────
+
+    # ── сборка по трафарету (stencil) ──────────────────────────────
+
+    def _frame_has_accs(self, frames) -> bool:
+        if not frames:
+            return False
+        accs = sum(c for k, c in frames.items()
+                   if k == 'accs' or (isinstance(k, tuple) and k[1] == 'accs'))
+        total = sum(c for k, c in frames.items()
+                    if k in CASE_ROLES or (isinstance(k, tuple) and k[1] in CASE_ROLES))
+        return total > 0 and accs / total > 0.25
+
+    def _build_with_stencil(self, parsed: List[WordInfo]) -> SentenceResult:
+        st = self.stencil
+        for wi in parsed:
+            wgt, _ = st.salience(wi.lemma, morph=self._morph)
+            wi.importance = wgt
+            wi.head = None
+            wi.role = ''
+            wi.depth = 3
+
+        # ── ядро: предикат → подлежащее → прямое дополнение ──
+        verbs = [w for w in parsed if w.pos in ('VERB', 'INFN')]
+        predicate = max(verbs, key=lambda w: w.importance) if verbs else None
+        if predicate is not None:
+            predicate.role = 'predicate'
+            predicate.depth = 0
+            for v in verbs:
+                if v is not predicate:
+                    v.role = 'aux_verb'
+                    v.depth = 3
+
+        nouns = [w for w in parsed if w.pos in ('NOUN', 'NPRO')]
+        nomn = [w for w in nouns if w.case == 'nomn']
+        subject = max(nomn, key=lambda w: w.importance) if nomn else None
+        if subject is not None:
+            subject.role = 'subject'
+            subject.depth = 0
+        obj = None
+        if predicate is not None:
+            frames = st.verb_frames.get(predicate.lemma)
+            frame_accs = self._frame_has_accs(frames)
+            accs = [w for w in nouns if w.case == 'accs' and w is not subject]
+            if accs and (frame_accs or not frames):
+                obj = max(accs, key=lambda w: w.importance)
+                obj.role = 'direct_object'
+                obj.depth = 0
+
+        # ── роли остальных слов ──
+        for wi in parsed:
+            if wi.role:
+                continue
+            pos = wi.pos
+            if pos in ('NOUN', 'NPRO'):
+                wi.role = CASE_ROLES.get(wi.case, 'related')
+                if wi.case == 'nomn':
+                    wi.role = 'related'
+                    wi.depth = 1
+                else:
+                    wi.depth = ROLE_IMPORTANCE.get(wi.role, 1)
+                    if wi.role == 'direct_object':
+                        if wi is not obj:
+                            wi.depth = 1
+                        elif predicate is None:
+                            wi.depth = 1
+                        else:
+                            vframes = st.verb_frames.get(predicate.lemma)
+                            v_accs = self._frame_has_accs(vframes)
+                            if vframes and not v_accs:
+                                wi.depth = 1
+            elif pos in ('ADJF', 'PRTF', 'PRTS'):
+                wi.role = 'attribute'
+                wi.depth = 2
+            elif pos == 'NUMR':
+                wi.role = 'numeral'
+                wi.depth = 2
+            elif pos in ('ADVB', 'GRND'):
+                wi.role = 'adverb'
+                wi.depth = 2
+            elif pos == 'PREP':
+                wi.role = 'preposition'
+                wi.depth = 3
+            else:
+                wi.role = 'function'
+                wi.depth = 3
+
+        # ── валентность предиката: привязать актанты по рамкам трафарета ──
+        bound_preps = set()
+        if predicate is not None:
+            frames = st.verb_frames.get(predicate.lemma)
+            if frames:
+                preps = {w.lemma: w for w in parsed if w.pos == 'PREP'}
+                noun_by_case = defaultdict(list)
+                for w in parsed:
+                    if w.pos in ('NOUN', 'NPRO') and w.case:
+                        noun_by_case[w.case].append(w)
+                for key, cnt in frames.most_common(30):
+                    if isinstance(key, tuple):
+                        prep_l, case = key
+                        if prep_l in preps and case in noun_by_case and prep_l not in bound_preps:
+                            prep = preps[prep_l]
+                            target = max(noun_by_case[case], key=lambda w: w.importance)
+                            prep.head = id(target)
+                            target.role = 'object_of_prep'
+                            target.depth = 1
+                            bound_preps.add(prep_l)
+                            break
+                    else:
+                        case = key
+                        if case in noun_by_case:
+                            target = max(noun_by_case[case], key=lambda w: w.importance)
+                            if target.role not in ('subject', 'direct_object'):
+                                target.role = 'object_of_prep'
+                                target.depth = 1
+                            break
+
+        # ── предлоги: прикрепить к существительному по PMI ──
+        hosts_n = [w for w in parsed if w.pos in ('NOUN', 'NPRO')]
+        for prep in [w for w in parsed if w.pos == 'PREP']:
+            if prep.lemma in bound_preps:
+                continue
+            if hosts_n:
+                target = max(hosts_n, key=lambda w: st.pmi(prep.lemma, w.lemma))
+                prep.head = id(target)
+                if target.role in ('subject',) or target.role in CASE_ROLES.values() \
+                        or target.role == 'related':
+                    target.role = 'object_of_prep'
+                    target.depth = 1
+
+        # ── модификаторы: прикрепить к хозяину по max PMI ──
+        hosts = [w for w in parsed if w.pos in ('NOUN', 'NPRO', 'VERB', 'INFN', 'GRND')]
+        for wi in parsed:
+            if wi.role in ('attribute', 'adverb', 'numeral') and hosts:
+                wi.head = id(max(hosts, key=lambda h: st.pmi(wi.lemma, h.lemma)))
+
+        # ── порядок ──
+        ordered = self._order_by_stencil(parsed, predicate, subject)
+
+        # ── морфосогласование ──
+        if predicate is not None and subject is not None:
+            self._agree_verb(predicate, subject)
+        if subject is not None:
+            self._agree_subject_phrase(parsed, subject)
+        self._agree_attributes(parsed)
+
+        text = self._compose(ordered)
+        core = [w.lemma for w in parsed if w.depth == 0]
+        periphery = [w.lemma for w in parsed if w.depth > 0]
+        explanation = self._explain(parsed, predicate, subject)
+        return SentenceResult(text=text, core=core, periphery=periphery,
+                              roles=parsed, explanation=explanation)
+
+    def _order_by_stencil(self, parsed: List[WordInfo], predicate: Optional[WordInfo],
+                          subject: Optional[WordInfo]) -> List[WordInfo]:
+        order: List[WordInfo] = []
+        used = set()
+
+        def take(w: Optional[WordInfo]):
+            if w is None or id(w) in used:
+                return
+            order.append(w)
+            used.add(id(w))
+
+        def emit(w: Optional[WordInfo]):
+            if w is None or id(w) in used:
+                return
+            prep = next((p for p in parsed if p.pos == 'PREP' and p.head == id(w)), None)
+            if prep is not None:
+                take(prep)
+            for m in parsed:
+                if m is not w and m.head == id(w) and m.role in ('attribute', 'numeral'):
+                    take(m)
+            take(w)
+
+        topic = subject if subject is not None else (
+            max((w for w in parsed if w.pos in ('NOUN', 'NPRO')),
+                key=lambda w: w.importance, default=None))
+        emit(topic)
+        if predicate is not None:
+            take(predicate)
+            for w in parsed:
+                if w.role == 'adverb' and w.head == id(predicate):
+                    take(w)
+        for w in parsed:
+            if w.role == 'direct_object':
+                emit(w)
+        for w in sorted((w for w in parsed
+                         if id(w) not in used
+                         and w.role not in ('function', 'aux_verb')),
+                        key=lambda w: (-w.importance, w.depth)):
+            emit(w)
+        for w in parsed:
+            if id(w) not in used:
+                take(w)
+        return order
+
+    def _agree_attributes(self, parsed: List[WordInfo]):
+        for wi in parsed:
+            if wi.role not in ('attribute', 'numeral') or wi.head is None:
+                continue
+            if wi.role == 'numeral' and wi.lemma not in ('один', 'одна', 'одно', 'одни'):
+                continue
+            target = next((p for p in parsed if id(p) == wi.head), None)
+            if target is None:
+                continue
+            gr = [target.case or 'nomn', target.number or 'sing',
+                  target.gender or '']
+            wi.form = self._inflect(wi, gr)
 
     # ────────────────────────────────────────────────────────────────
 
@@ -273,12 +491,12 @@ class SentenceBuilder:
         for w in parsed:
             if w.role == 'attribute' and w.head is None:
                 w.form = self._inflect(w, ['nomn', subject.number or 'sing',
-                                           subject.gender or '', subject.animacy or ''])
+                                           subject.gender or ''])
             elif w.role == 'attribute' and w.head is not None:
                 target = next((p for p in parsed if p.head == w.head), None)
                 if target is not None:
                     gr = [target.case or 'nomn', target.number or 'sing',
-                          target.gender or '', target.animacy or '']
+                          target.gender or '']
                     w.form = self._inflect(w, gr)
 
     def _order(self, parsed: List[WordInfo], predicate: WordInfo,

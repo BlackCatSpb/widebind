@@ -33,6 +33,13 @@ _SENT_END = {'.', '!', '?', '…', '!?', '?!', '...'}
 # POS, которые считаем «служебными» (соединители, периферия)
 FUNCTION_POS = frozenset({'PREP', 'CONJ', 'PRCL', 'INTJ'})
 
+# Местоименные слова — периферия (указатели, а не содержание)
+PRONOUN_LEMMAS = frozenset({
+    'который', 'этот', 'тот', 'такой', 'таков', 'сам', 'весь', 'каждый',
+    'любой', 'другой', 'некоторый', 'никакой', 'какой', 'чей', 'где',
+    'когда', 'куда', 'откуда', 'зачем', 'почему', 'как', 'сколько', 'столько',
+})
+
 
 class Stencil:
     """Накопительная статистика трафарета."""
@@ -40,6 +47,9 @@ class Stencil:
     def __init__(self):
         self.word_freq: Counter = Counter()
         self.lemma_freq: Counter = Counter()
+        self.lemma_pos: Dict[str, Counter] = defaultdict(Counter)
+        self.lemma_first: Counter = Counter()
+        self.lemma_last: Counter = Counter()
         self.pos_freq: Counter = Counter()
         self.pos_chains: Counter = Counter()
         self.pos_position: Dict[str, List[int]] = defaultdict(list)
@@ -97,12 +107,17 @@ class Stencil:
         for i, w in enumerate(words):
             p = morph.parse(w)[0]
             tag = p.tag
-            pos = tag.POS or 'UNKN'
+            pos = str(tag.POS or 'UNKN')
             lemma = p.normal_form
             case = getattr(tag, 'case', None)
             self.word_freq[w] += 1
             self.lemma_freq[lemma] += 1
+            self.lemma_pos[lemma][pos] += 1
             self.pos_freq[pos] += 1
+            if i == 0:
+                self.lemma_first[lemma] += 1
+            if i == n - 1:
+                self.lemma_last[lemma] += 1
             parsed.append((w, lemma, pos, case))
             pos_idx = 'first' if i == 0 else ('second' if i == 1
                        else ('last' if i == n - 1 else ('prelast' if i == n - 2 else 'mid')))
@@ -168,6 +183,51 @@ class Stencil:
     def top_pos_chains(self, k: int = 20) -> List[Tuple[tuple, int]]:
         return self.pos_chains.most_common(k)
 
+    def top_pos(self, lemma: str) -> str:
+        c = self.lemma_pos.get(lemma)
+        return c.most_common(1)[0][0] if c else 'UNKN'
+
+    def salience(self, lemma: str, morph: Optional[pymorphy3.MorphAnalyzer] = None) -> Tuple[float, float]:
+        """Вес важности слова: (weight, глубина k).
+
+        weight → 1.0 для ядра (предикат/актант), → ~0.2 для периферии.
+        Признаки: частотная λ-глубина, часть речи, тема-позиция, PMI-связность.
+        """
+        pos = str(self.top_pos(lemma))
+        if lemma in self.lemma_freq and self.lemma_freq[lemma] > 0:
+            k = self.lambda_depth(lemma)
+            pos = self.top_pos(lemma)
+            total = self.lemma_freq[lemma]
+            first = self.lemma_first.get(lemma, 0)
+            top5 = [w2 for w2, _ in list(self.adjacency.get(lemma, {}).items())[:5]]
+            avg_pmi = (sum(self.pmi(lemma, w2) for w2 in top5) / len(top5)) if top5 else 0.0
+        else:
+            k = 3.0
+            pos = 'UNKN'
+            if morph is not None:
+                pos = str(morph.parse(lemma)[0].tag.POS or 'UNKN')
+            total = 0
+            first = 0
+            avg_pmi = 0.0
+        if pos in FUNCTION_POS or pos in ('NPRO',) or pos == 'UNKN' or lemma in PRONOUN_LEMMAS:
+            k = max(k, 3.2)
+        else:
+            cap = 1.8 if pos in ('VERB', 'INFN', 'GRND', 'PRTF') else 2.5
+            k = min(k, cap)
+            if total == 0:
+                k = min(k, 2.5)
+        if self.zipf_rank(lemma) <= 30:
+            k = max(k, 3.0)
+        if total > 0 and first / total > 0.35:
+            k = max(0.0, k - 1.0)
+        if total > 0 and pos not in FUNCTION_POS and pos not in ('VERB', 'INFN', 'GRND', 'PRTF') \
+                and lemma not in PRONOUN_LEMMAS:
+            strong = sum(1 for w2 in self.adjacency.get(lemma, {}) if self.pmi(lemma, w2) >= 1.0)
+            if strong < 2:
+                k += 0.5
+        k = min(k, 4.0)
+        return max(0.05, 1.0 - k / 4.0), k
+
     def top_ngrams(self, k: int = 20) -> List[Tuple[tuple, int]]:
         return self.word_ngrams.most_common(k)
 
@@ -183,6 +243,9 @@ class Stencil:
             'pos_chains': {' '.join(k): v for k, v in self.pos_chains.most_common(20000)},
             'pos_position': {k: v for k, v in self.pos_position.items()},
             'lemma_freq': dict(self.lemma_freq),
+            'lemma_pos': {k: dict(v) for k, v in self.lemma_pos.items()},
+            'lemma_first': dict(self.lemma_first),
+            'lemma_last': dict(self.lemma_last),
             'word_ngrams': {f'{o} {" ".join(k)}': v for (o, k), v in self.word_ngrams.most_common(max_ngrams)},
             'adjacency': {k: dict(v.most_common(max_adj)) for k, v in self.adjacency.items()},
             'verb_frames': {k: {str(c): v for c, v in v.most_common(max_frames)}
@@ -215,6 +278,9 @@ class Stencil:
         s.pos_chains = Counter({tuple(k.split(' ')): v for k, v in data['pos_chains'].items()})
         s.pos_position = defaultdict(list, data['pos_position'])
         s.lemma_freq = Counter(data['lemma_freq'])
+        s.lemma_pos = defaultdict(Counter, {k: Counter(v) for k, v in data['lemma_pos'].items()})
+        s.lemma_first = Counter(data.get('lemma_first', {}))
+        s.lemma_last = Counter(data.get('lemma_last', {}))
         s.word_ngrams = Counter(
             {(int(k.split(' ')[0]), tuple(k.split(' ')[1:])): v for k, v in data['word_ngrams'].items()})
         s.adjacency = defaultdict(Counter, {k: Counter(v) for k, v in data['adjacency'].items()})
