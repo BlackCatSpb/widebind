@@ -26,6 +26,8 @@ from typing import Dict, List, Optional
 
 import pymorphy3
 
+from core.word_num import morph_sim
+
 _MORPH = pymorphy3.MorphAnalyzer()
 
 # Обобщённое золотое сечение (d=3): язык как λ_d-машина
@@ -229,6 +231,11 @@ class SentenceBuilder:
 
     # ── сборка по трафарету (stencil) ──────────────────────────────
 
+    def _attach_score(self, wi: WordInfo, host: WordInfo, st: Stencil) -> float:
+        pmi = st.pmi(wi.lemma, host.lemma)
+        m = max(0.0, morph_sim(wi.lemma, host.lemma) - 0.5)
+        return pmi + 0.6 * m
+
     def _frame_has_accs(self, frames) -> bool:
         if not frames:
             return False
@@ -359,7 +366,7 @@ class SentenceBuilder:
         hosts = [w for w in parsed if w.pos in ('NOUN', 'NPRO', 'VERB', 'INFN', 'GRND')]
         for wi in parsed:
             if wi.role in ('attribute', 'adverb', 'numeral') and hosts:
-                wi.head = id(max(hosts, key=lambda h: st.pmi(wi.lemma, h.lemma)))
+                wi.head = id(max(hosts, key=lambda h: self._attach_score(wi, h, st)))
 
         # ── порядок ──
         ordered = self._order_by_stencil(parsed, predicate, subject)
