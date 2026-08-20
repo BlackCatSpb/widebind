@@ -60,6 +60,8 @@ class Stencil:
         self.total_sentences: int = 0
         self.total_words: int = 0
         self.ngram_order: int = 4
+        self._rank_cache: Optional[Dict[str, int]] = None
+        self._top_freq: Optional[int] = None
 
     # ── построение ────────────────────────────────────────────────
 
@@ -153,18 +155,16 @@ class Stencil:
     # ── производные метрики ───────────────────────────────────────
 
     def zipf_rank(self, lemma: str) -> int:
-        ordered = [l for l, _ in self.lemma_freq.most_common()]
-        try:
-            return ordered.index(lemma) + 1
-        except ValueError:
-            return len(ordered) + 1
+        if self._rank_cache is None:
+            self._rank_cache = {l: i + 1 for i, (l, _) in enumerate(self.lemma_freq.most_common())}
+        return self._rank_cache.get(lemma, len(self._rank_cache) + 1)
 
     def lambda_depth(self, lemma: str) -> float:
         """λ_d-глубина в семантическом поле: частота ядра λ⁻ᵏ от максимума."""
-        top = self.lemma_freq.most_common(1)
-        if not top:
-            return 3.0
-        top_f = top[0][1]
+        if self._top_freq is None:
+            top = self.lemma_freq.most_common(1)
+            self._top_freq = top[0][1] if top else 0
+        top_f = self._top_freq
         f = self.lemma_freq.get(lemma, 0)
         if f <= 0 or top_f <= 0:
             return 3.0
