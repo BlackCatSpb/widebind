@@ -5,6 +5,7 @@
   - inspector — сигналы (temp/pred/smooth/sym/help), trust/concept/dominance (private memory)
   - wake      — вердикт PASS/WATCH/WAKE (пробуждение MLP по маркерам watchlist)
   - live      — forward на случайном входе: hp/predMSE/|mirror|/gate/ls/skip, сигналы, параметры
+  - anomaly   — трекер аномалий: max ||hp||/predMSE/min gate/births + дельты к прошлому чекпоинту
   - head      — декомпозиция bias vs контекст + позиционная карта головы + A/B reasoning
   - cmp       — сравнение нескольких чекпоинтов на одинаковом входе
 
@@ -14,7 +15,7 @@ Usage:
 
   Один чекпоинт — полный разбор; несколько — разбор каждого + сравнение.
 """
-import sys, os, math, re
+import sys, os, math, re, json
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -565,6 +566,88 @@ def run_cmp(models, args, tok):
         model.reasoning_scale_override = None
 
 
+# ─────────────────────────── ANOMALY TRACK ───────────────────────────
+
+def _track_path(ckpt_path):
+    return os.path.join(os.path.dirname(os.path.abspath(ckpt_path)), 'anomaly_track.json')
+
+
+def run_anomaly(live, wake, ckpt):
+    step = int(ckpt.get('step', 0))
+    rows = live['rows']
+    hp_max = max(rows, key=lambda r: r['hp'])
+    pe_max = max(rows, key=lambda r: r['predMSE'])
+    gate_min = min(rows, key=lambda r: r['gate'])
+    med_hp = sorted(r['hp'] for r in rows)[len(rows) // 2]
+    births = wake.get('births') or []
+
+    report = [f'Anomaly track: step={step} layers={len(rows)}']
+    report.append(f'  max ||hp|| L{hp_max["layer"]} = {hp_max["hp"]:.3f} '
+                  f'(median {med_hp:.3f}, x{hp_max["hp"] / max(med_hp, 1e-6):.1f})')
+    report.append(f'  max predMSE L{pe_max["layer"]} = {pe_max["predMSE"]:.1f}')
+    report.append(f'  min gate L{gate_min["layer"]} = {gate_min["gate"]:.4f} '
+                  f'(gate_var {gate_min["gate_var"]:.4f}, |mirror| {gate_min["mirror"]:.1f})')
+    report.append(f'  births in empty layers: {births or "none"}')
+
+    flags = []
+    if hp_max['hp'] > 20.0:
+        flags.append(('WAKE', f'||hp|| L{hp_max["layer"]} раздут ({hp_max["hp"]:.1f}, '
+                              f'медиана {med_hp:.1f})'))
+    elif hp_max['hp'] > 10.0:
+        flags.append(('WATCH', f'||hp|| L{hp_max["layer"]} повышен ({hp_max["hp"]:.1f})'))
+    if pe_max['predMSE'] > 1000.0:
+        flags.append(('WAKE', f'predMSE L{pe_max["layer"]} огромен ({pe_max["predMSE"]:.0f})'))
+    elif pe_max['predMSE'] > 50.0:
+        flags.append(('WATCH', f'predMSE L{pe_max["layer"]} повышен ({pe_max["predMSE"]:.0f})'))
+    if gate_min['gate'] < 0.25:
+        flags.append(('WATCH', f'глубокая модуляция L{gate_min["layer"]} '
+                               f'(gate {gate_min["gate"]:.3f})'))
+    if births:
+        flags.append(('WATCH', f'births {births}'))
+    for flag, text in flags:
+        _verdict(report, flag, [], text)
+    hdr = 'OK' if not flags else ('ANOMALY' if any(f == 'WAKE' for f, _ in flags) else 'WATCH')
+    print(f'\nANOMALY TRACK (verdict: {hdr})')
+    for line in report:
+        print(line)
+
+    path = _track_path(ckpt.get('_path', 'best.pt'))
+    hist = []
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                hist = json.load(f)
+        except Exception:
+            hist = []
+    prev = next((e for e in reversed(hist) if e['step'] < step), None)
+    if prev is not None:
+        dh, dp, dg = (hp_max['hp'] - prev['hp_max'],
+                      pe_max['predMSE'] - prev['predmse_max'],
+                      gate_min['gate'] - prev['gate_min'])
+        print(f'  vs prev step {prev["step"]}: ||hp||max {dh:+.3f} | '
+              f'predMSEmax {dp:+.1f} | gate_min {dg:+.4f} | '
+              f'births {prev["births"]} -> {births}')
+    else:
+        dh = dp = dg = None
+    hist.append({'step': step, 'hp_max': hp_max['hp'], 'hp_layer': hp_max['layer'],
+                 'predmse_max': pe_max['predMSE'], 'predmse_layer': pe_max['layer'],
+                 'gate_min': gate_min['gate'], 'gate_min_layer': gate_min['layer'],
+                 'births': births})
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(hist, f, ensure_ascii=False, indent=1)
+        print(f'  track: {path}')
+    except Exception as e:
+        print(f'  [warn] track not saved: {e}')
+
+    return {'verdict': hdr, 'report': report, 'hp_max': hp_max['hp'],
+            'hp_layer': hp_max['layer'], 'predmse_max': pe_max['predMSE'],
+            'predmse_layer': pe_max['layer'], 'gate_min': gate_min['gate'],
+            'gate_min_layer': gate_min['layer'], 'births': births,
+            'prev_step': prev['step'] if prev else None,
+            'dhp': dh, 'dpe': dp, 'dgate': dg}
+
+
 # ─────────────────────────── HTML ───────────────────────────
 
 def _hue(v, vmin, vmax):
@@ -572,7 +655,7 @@ def _hue(v, vmin, vmax):
     return 120 * (1.0 - t)
 
 
-def save_html_report(ckpt, cfg, model, wake, live, head):
+def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None):
     import html as H
     path = ckpt.get('_path', '?')
     step = ckpt.get('step', '?')
@@ -687,6 +770,26 @@ td:first-child,th:first-child{text-align:left}
                   '</td></tr>')
     ch.append('</table>')
 
+    ch.append('<h2>ANOMALY TRACK</h2>')
+    if anomaly:
+        for line in anomaly['report']:
+            flag = ''
+            for f in ('WAKE', 'WATCH', 'PASS'):
+                if line.strip().startswith(f'[{f}]') or (f + ' ') in line[:12]:
+                    flag = f
+                    break
+            esc = H.escape(line)
+            if flag:
+                esc = esc.replace(f'[{flag}]', badge(flag), 1)
+            ch.append(f'<div>{esc}</div>')
+        if anomaly.get('prev_step') is not None:
+            ch.append(f'<div class="dim">vs prev step {anomaly["prev_step"]}: '
+                      f'||hp||max {anomaly["dhp"]:+.3f} | predMSEmax {anomaly["dpe"]:+.1f} '
+                      f'| gate_min {anomaly["dgate"]:+.4f} | '
+                      f'births {anomaly["births"]}</div>')
+    else:
+        ch.append('<div class="dim">live пропущен — трекер недоступен</div>')
+
     if head:
         ch.append('<h2>HEAD</h2>')
         bd = head['bias_decomp']
@@ -761,12 +864,18 @@ def main():
             wake_data = None
         live_data = None
         head_data = None
+        anomaly_data = None
         if not args.quick:
             if not args.no_live:
                 try:
                     live_data = run_live(model, cfg, seq=args.seq)
                 except Exception as e:
                     print(f'[error] live: {e}')
+                if live_data is not None and wake_data is not None:
+                    try:
+                        anomaly_data = run_anomaly(live_data, wake_data, ckpt)
+                    except Exception as e:
+                        print(f'[error] anomaly: {e}')
             if tok is not None:
                 try:
                     head_data = run_head(model, ckpt, args, tok)
@@ -774,7 +883,8 @@ def main():
                     print(f'[error] head: {e}')
         if not args.no_html and wake_data is not None:
             try:
-                save_html_report(ckpt, cfg, model, wake_data, live_data, head_data)
+                save_html_report(ckpt, cfg, model, wake_data, live_data, head_data,
+                                 anomaly_data)
             except Exception as e:
                 print(f'[error] html: {e}')
 
