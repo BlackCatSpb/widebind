@@ -51,6 +51,12 @@ class CollectiveConceptLayer(nn.Module):
         self.register_buffer('_gate_c', torch.zeros(1))
         self._last_write_step = -1
 
+        # Сигналы для прожектора (считывание слов из скрытого состояния):
+        # _write_event — на каких позициях записан новый/обновлённый концепт (≈ граница слова)
+        # _concept_id   — в какой слот концепта отображается позиция (best match)
+        self.register_buffer('_write_event', torch.zeros(1, 1, dtype=torch.bool), persistent=False)
+        self.register_buffer('_concept_id', torch.zeros(1, 1, dtype=torch.long), persistent=False)
+
         self.W_o = nn.Linear(S * k, D, bias=False)
         nn.init.orthogonal_(self.W_o.weight)
         self._read_scale = nn.Parameter(torch.tensor(0.0))
@@ -83,12 +89,20 @@ class CollectiveConceptLayer(nn.Module):
 
     @torch.no_grad()
     def _maybe_write(self, hp, pen, allow_write):
-        """Mature-gated, confident+novel slot refinement and birth."""
+        """Mature-gated, confident+novel slot refinement and birth.
+
+        Возвращает (write_event, best):
+          write_event: (B, L) bool — на позициях, где записан концепт (граница разметки)
+          best:        (B, L) long — слот концепта с наилучшим совпадением
+        """
         self._step += 1
+        B = hp.shape[0]
+        L = hp.shape[1]
+        zeros_ev = torch.zeros(B, L, dtype=torch.bool, device=hp.device)
         if not allow_write:
-            return
+            return zeros_ev, zeros_ev.long()
         if self._mature.item() < 0.5:
-            return
+            return zeros_ev, zeros_ev.long()
 
         B, L, G, k = hp.shape
         shared = hp.mean(dim=-2)
@@ -101,10 +115,12 @@ class CollectiveConceptLayer(nn.Module):
         conf = torch.sigmoid(-pen)
         conf_thresh = conf.median().clamp(min=0.01)
 
+        write_event = torch.zeros(B, L, dtype=torch.bool, device=hp.device)
         did_write = False
         for s in range(self.S):
             mask = (best == s) & (conf >= conf_thresh)
             if mask.any():
+                write_event |= mask
                 upd = F.normalize(shared[mask].mean(dim=0), dim=-1)
                 if self.N_s[s].item() < 10:
                     self.M.data[s] = upd
@@ -117,16 +133,17 @@ class CollectiveConceptLayer(nn.Module):
 
         empty = torch.nonzero(self.N_s == 0)
         novel = (d_min > self._birth_gap * 0.2) & (conf >= conf_thresh)
-        if empty.numel() > 0 and novel.any():
-            idx = empty[0].item()
-            self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
-            self.N_s[idx] += 1
-            did_write = True
-        elif empty.numel() == 0 and novel.any():
-            evict = int(torch.argmin(self.U_s).item())
-            self.M.data[evict] = F.normalize(shared[novel].mean(dim=0), dim=-1)
-            self.N_s[evict] = 1
-            self.U_s[evict] = 0.0
+        if novel.any():
+            write_event |= novel
+            if empty.numel() > 0:
+                idx = empty[0].item()
+                self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
+                self.N_s[idx] += 1
+            else:
+                evict = int(torch.argmin(self.U_s).item())
+                self.M.data[evict] = F.normalize(shared[novel].mean(dim=0), dim=-1)
+                self.N_s[evict] = 1
+                self.U_s[evict] = 0.0
             did_write = True
 
         if did_write:
@@ -136,6 +153,7 @@ class CollectiveConceptLayer(nn.Module):
         for s in range(self.S):
             occ[s] = (best == s).float().mean().item()
         self.U_s.mul_(0.99).add_(occ.to(self.U_s), alpha=0.01)
+        return write_event, best
 
     def forward(self, h, hp, pen, resvar=None, allow_write=None, mature_override=None):
         _write = allow_write is None or allow_write
@@ -143,8 +161,10 @@ class CollectiveConceptLayer(nn.Module):
             self._mature.fill_(float(mature_override))
         elif self.training:
             self._update_maturity(resvar)
-        if self.training:
-            self._maybe_write(hp, pen, _write)
+        write_event, best = self._maybe_write(hp, pen, _write)
+        # Прожектор: сохраняем сигналы границ слов и id концептов
+        self._write_event = write_event
+        self._concept_id = best
 
         B, L, G, k = hp.shape
         shared = F.normalize(hp.mean(dim=-2), dim=-1)
