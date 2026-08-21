@@ -202,7 +202,7 @@ out, state, global_state = model(h, state, global_state=…)
 на синтаксических границах (EOS) и при смене потока мягко гасится
 (умножается на 0.1).
 
-**Вариант с разметкой предложений (`build_streams_eos.py`).** Альтернативный
+**Вариант с разметкой предложений (`data/build_streams_eos.py`).** Альтернативный
 билд потока (`wb/token_stream_*_eos.bin`) расставляет явные границы
 предложений: формат `[EOS]+предложение+[EOS]`, минимум 3 слова, пофайловая
 токенизация с полным контекстом, фильтр аббревиатур (`г.`, `ул.`, `т.е.`,
@@ -215,6 +215,9 @@ out, state, global_state = model(h, state, global_state=…)
 LR (§9–§10) и когерентностью спиралей (§5.2) этот режим даёт текущий
 AMP-прогон заметно эффективнее ранних fp32/cosine-попыток (val 10.71 на
 шаге 2097, опережение журнала №2 ~2× по шагам).
+
+Запуск бинаризации: `python -m data.build_streams_eos --src main-russian --out-dir wb`
+(лингвистический фронт-энд — `data/sentence_builder.py`, λ_d-веса важности).
 
 ---
 
@@ -816,28 +819,30 @@ WideBind/
 │   ├── amp_optim.py            # AmpAdam (для старых кодек-голов)
 │   ├── reasoning.py            # ReasoningMemory + ReasoningGate +
 │   │                           #   ThinkingTokenHead (адаптивная глубина)
-│   ├── model.py                # deprecated shim
-│   └── archive/                # старые головы (amp_codec, zeckendorf_readout)
+│   └── model.py                # deprecated shim
+│
+├── data/                       # подготовка данных для обучения
+│   ├── __init__.py             # пакет: sentence_builder + build_streams_eos
+│   ├── sentence_builder.py     # лингв. построитель предложений (веса λ_d)
+│   └── build_streams_eos.py    # бинаризатор: txt → wb/token_stream_*_eos.bin
 │
 ├── scripts/
 │   ├── train.py                # учебный цикл (streams, градиенты, eval, миграция)
 │   ├── analyze.py              # единый анализатор: статика + wake + live + head + cmp
 │   ├── proj_read.py            # прогон Прожектора на чекпоинте (чтение слов)
-│   ├── build_streams_eos.py    # пересборка бинарников с EOS-границами предложений
 │   ├── checkpoint_inspector.py # быстрое дерево ключей чекпоинта
 │   ├── generate.py             # текстовая генерация (best.pt)
 │   ├── generate_onnx.py        # экспорт ONNX + миграция чекпоинта
 │   ├── check_onnx_coherence.py # проверка экспорта графа с когерентностью
 │   ├── generate_russian.py     # генерация с разбором метрик
 │   ├── test_reasoning_synth.py # синтетический тест reasoning (адаптивная глубина)
-│   ├── test_reasoning_grad.py  # проверка живых градиентов гейтов
-│   └── archive/                # старые/экспериментальные скрипты
+│   └── test_reasoning_grad.py  # проверка живых градиентов гейтов
 │
 ├── notebooks/
 │   ├── colab.ipynb             # канонический ноутбук (D2560/24L, T4)
 │   └── widebind_colab.ipynb    # вариант D4096/16L (24GB+ вариант)
 │
-├── docs/                       # документы; TRAINING_JOURNAL.md — журнал обучения best.pt
+├── docs/                       # документы; журналы: TRAINING_JOURNAL.md (история) и LIVE_TRAINING_LOG.md (актуальный)
 ├── checkpoints/                # сохранённые чекпоинты (best.pt, step_N.pt)
 ├── wb/                         # BPE-токенизатор
 ├── tests/                      # smoke-тесты (53 passed / 9 known-fail baseline)
@@ -872,8 +877,9 @@ print(model.param_count())   # 140,335,360 (140.34M)
    (статика, wake-вердикт, live-разбор, head-анализ, сравнение нескольких чекпоинтов — одним вызовом);
 - **Прожектор (чтение слов из коллектива)**: `python scripts/proj_read.py checkpoints/best.pt`
    (сегментация текста по событиям записи концептов коллективного слоя → слова; см. §5.10);
-- **Журнал наблюдений за обучением**: `docs/TRAINING_JOURNAL.md` — динамика валидации,
-  фазы обучения, сравнение чекпоинтов, гипотезы (резервуар, эксперты-предикторы), watchlist.
+- **Журналы обучения**: `docs/TRAINING_JOURNAL.md` (история, главы 1–73) и
+   `docs/LIVE_TRAINING_LOG.md` (актуальный, round 0–2200) — динамика валидации,
+   фазы обучения, сравнение чекпоинтов, гипотезы (резервуар, эксперты-предикторы), watchlist.
 
 ---
 
@@ -896,7 +902,7 @@ print(model.param_count())   # 140,335,360 (140.34M)
 ## 16. Наблюдения из обучения (актуально: шаги 12831–13281)
 
 Чистый прогон с нуля (reasoning активен с шага 0), best.pt, 140.34M.
-Полный журнал — `docs/TRAINING_JOURNAL.md` (главы до 73).
+Полный журнал — `docs/TRAINING_JOURNAL.md` (главы 1–73) и актуальный `docs/LIVE_TRAINING_LOG.md` (round 0–2200).
 
 - **Валидация прорвала рубеж 8.5**: val_loss 10.93 (1398) → **8.5746
   (13048) / 8.5644 (13281)** — рекорд на каждом eval; случайный уровень
@@ -954,7 +960,7 @@ print(model.param_count())   # 140,335,360 (140.34M)
    за пробуждением MLP. Если MLP не проснётся — 59M параметров останутся мёртвым
    грузом, и архитектуру придётся пересматривать.
 
-Полный разбор по данным — `docs/TRAINING_JOURNAL.md` (§1–§73).
+Полный разбор по данным — `docs/TRAINING_JOURNAL.md` (§1–§73) и `docs/LIVE_TRAINING_LOG.md` (актуальный).
 
 ---
 
