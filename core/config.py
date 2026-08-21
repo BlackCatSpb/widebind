@@ -25,6 +25,10 @@ class WideBindConfig:
     # False = обучать EOS-токен (границы предложений), True = маскировать (старое поведение)
     mask_eos: bool = True
 
+    # ─── Projector gate head (путь B) ───
+    projector_gate: bool = False  # True = обучать гейт границ слов в том же цикле
+    projector_gate_weight: float = 1.0  # вес BCE-потери гейта в общем loss
+
     # ─── λ_d hierarchy ─────────────────────────────────────────
     lambda_d: int = 3            # dimension of generalized golden ratio
     lambda_d_enabled: bool = True  # True = apply λ_d derivation in __post_init__

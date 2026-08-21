@@ -9,6 +9,7 @@ from .block import WideBindBlock, PrecisionGate, ExactSequenceMemory
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
+from .projector_gate import ProjectorGateHead
 
 class WideBindStack(nn.Module):
     """Stack of WideBindBlock layers with embedding and lm_head."""
@@ -61,6 +62,11 @@ class WideBindStack(nn.Module):
         self._tau_mid_value = tau_mid
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
+
+        # ─── Projector gate head (путь B: границы слов в процессе обучения) ───
+        self.projector_gate = getattr(cfg, 'projector_gate', False)
+        if self.projector_gate:
+            self.proj_gate = ProjectorGateHead(cfg.D)
     
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
                 context_mem=None, allow_write=None, step=None,
@@ -428,6 +434,18 @@ class WideBindStack(nn.Module):
     def embed_tokens(self, tokens):
         """Token indices -> D-space vectors."""
         return self.embed(tokens)
+
+    def projector_gate_loss(self, x, h, tokenizer):
+        """BCE-потеря гейта прожектора по меткам границ слов.
+
+        x: (B, L) токены, h: (B, L, D) скрытые состояния, tokenizer: HF Tokenizer.
+        Возвращает скаляр (взвешенный cfg.projector_gate_weight).
+        """
+        if not self.projector_gate:
+            return None
+        from .projector_gate import projector_gate_loss as _pgl
+        w = getattr(self.cfg, 'projector_gate_weight', 1.0)
+        return _pgl(self.proj_gate, h, x, tokenizer, weight=w)
     
     def compute_loss(self, h, targets, pred_weight=None, h_emb=None):
         """Returns CE only (aux losses applied via gradient scaling in training step)."""
