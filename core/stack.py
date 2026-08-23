@@ -600,7 +600,7 @@ class WideBindStack(nn.Module):
                     tau_l_t = tau_min_t * (tau_max_t / tau_min_t) ** (lf * (1.0 + 0.1 * dev))
                     target = getattr(self.cfg, 'w_m2v_hierarchy_target', 1.0)
                     target_m2v = target / (1.0 + torch.exp(-(tau_l_t.log() - tau_mid_t.log())))
-                    w_m2v_loss = w_m2v_loss + (wm.mean() - target_m2v).pow(2)
+                    w_m2v_loss = w_m2v_loss + (wm.mean().detach() - target_m2v).pow(2)
                     n_m2v = n_m2v + 1
                     n_m2v = n_m2v + 1
             if n_m2v > 0:
