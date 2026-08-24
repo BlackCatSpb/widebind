@@ -305,6 +305,8 @@ if __name__ == '__main__':
                         help='Use tau-aware adaptive SmartController instead of static/adaptive sampling')
     parser.add_argument('--smart-no-reasoning', action='store_true',
                         help='Disable the per-token reasoning toggle inside smart mode')
+    parser.add_argument('--no-top', action='store_true',
+                        help='Disable top-p/top-k truncation (pure temperature sampling); applies to --smart')
     parser.add_argument('--show-mind', action='store_true', help='Log meta-cognitive mirror stats')
     parser.add_argument('--continuous-learn', action='store_true', help='Allow memory writes during generation')
     parser.add_argument('--context-mem', type=str, default='', help='Path to .pt file with context memory tensor (G, k)')
@@ -353,15 +355,17 @@ if __name__ == '__main__':
     if args.smart:
         from scripts.smart_controller import smart_generate, SmartController
         vocab = cfg.vocab
-        ctrl = SmartController(model, vocab, reasoning_on=not args.smart_no_reasoning)
+        ctrl = SmartController(model, vocab, reasoning_on=not args.smart_no_reasoning,
+                               no_trunc=args.no_top)
         print(f'[smart][tau] personality={ctrl.tau_personality:.1f} norm={ctrl.tau_norm:.2f} '
-              f'temp=({ctrl.temp_lo:.2f},{ctrl.temp_hi:.2f}) trust_thr={ctrl.trust_thr:.2f}')
+              f'temp=({ctrl.temp_lo:.2f},{ctrl.temp_hi:.2f}) trust_thr={ctrl.trust_thr:.2f}'
+              f'{" no_trunc" if args.no_top else ""}')
         prompts = [args.prompt] if args.prompt else [
             'Привет, как дела?', 'Москва — столица',
             'В начале было Слово', 'Искусственный интеллект']
         for p in prompts:
             text, dec = smart_generate(model, p, ctrl, max_new_tokens=args.tokens,
-                                       rep_window=ctrl.rep_window)
+                                       rep_window=ctrl.rep_window, no_trunc=args.no_top)
             print(f'> {p}')
             print(text)
             print()

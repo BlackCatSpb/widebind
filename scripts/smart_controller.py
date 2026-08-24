@@ -33,9 +33,10 @@ SCALAR_KEYS = {'trust_max', 'gate_ema_mean', 'w_help', 'private_mem_norm', 'ls_v
 
 
 class SmartController:
-    def __init__(self, model, vocab, reasoning_on=True):
+    def __init__(self, model, vocab, reasoning_on=True, no_trunc=False):
         self.reasoning_on = reasoning_on
         self.vocab = vocab
+        self.no_trunc = no_trunc
         self.recent = []
         self.hist = []
         self.recov = 0
@@ -126,6 +127,10 @@ class SmartController:
         if rep or collapse:
             self.recov = 3
 
+        if self.no_trunc:
+            top_p = 1.0
+            top_k = 0
+
         self.model_reason_override = reason
         self.decisions.append((step, mode, round(H, 2), round(trust, 2),
                                round(temp, 2), round(top_p, 2), int(top_k),
@@ -152,10 +157,13 @@ class SmartController:
 
 
 def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
-                   set_reason=True):
+                   set_reason=True, no_trunc=False):
+    """Генерация под управлением SmartController. set_reason=True -> переключает
+    model.reasoning_scale_override перетокеново (по решению контроллера)."""
     """Генерация под управлением SmartController. set_reason=True -> переключает
     model.reasoning_scale_override перетокеново (по решению контроллера)."""
     from scripts.generate import load_russian_tokenizer
+    controller.no_trunc = no_trunc
     tok = load_russian_tokenizer()
     det = lambda ids: tok.decode(ids, skip_special_tokens=True)
     ids = tok.encode(prompt).ids

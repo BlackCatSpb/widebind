@@ -18,6 +18,7 @@ def main():
     ap.add_argument('--tokens', type=int, default=60)
     ap.add_argument('--device', default='auto')
     ap.add_argument('--compare', action='store_true', help='также прогнать baseline')
+    ap.add_argument('--no-top', action='store_true', help='без top-p/top-k (чистый temperature-семплинг)')
     ap.add_argument('--no-reasoning', action='store_true')
     args = ap.parse_args()
 
@@ -36,10 +37,11 @@ def main():
         print('BASELINE:', base)
         print()
 
-    ctrl = SmartController(model, vocab, reasoning_on=not args.no_reasoning)
+    ctrl = SmartController(model, vocab, reasoning_on=not args.no_reasoning, no_trunc=args.no_top)
     print(f'[tau] personality={ctrl.tau_personality:.1f} norm={ctrl.tau_norm:.2f} '
-          f'temp=({ctrl.temp_lo:.2f},{ctrl.temp_hi:.2f}) trust_thr={ctrl.trust_thr:.2f}')
-    text, dec = smart_generate(model, args.prompt, ctrl, args.tokens)
+          f'temp=({ctrl.temp_lo:.2f},{ctrl.temp_hi:.2f}) trust_thr={ctrl.trust_thr:.2f}'
+          f'{" no_trunc" if args.no_top else ""}')
+    text, dec = smart_generate(model, args.prompt, ctrl, args.tokens, no_trunc=args.no_top)
     print('SMART:', text)
     print()
     print('DECISIONS (step, mode, H, trust, temp, top_p, top_k, rep, reason):')
