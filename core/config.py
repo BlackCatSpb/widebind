@@ -119,7 +119,7 @@ class WideBindConfig:
 
     # w_m2v hierarchy by τ (Proposal IV)
     w_m2v_hierarchy_target: float = 1.0  # m — max target for deep layers
-    w_m2v_hierarchy_weight: float = 0.001  # λ_weight for w_m2v regularisation
+    w_m2v_hierarchy_weight: float = 0.01  # λ_weight for w_m2v regularisation (drives _tau_l_dev adaptation)
 
     # Init stds
     w_d_init_std: float = 0.1

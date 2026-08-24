@@ -312,7 +312,7 @@ def train(cfg=None, resume_path=None):
             w_div = getattr(cfg, 'div_weight', 0.0)
             w_rp = getattr(cfg, 'gate_repulse_weight', 0.0)
             w_nv = getattr(cfg, 'alpha_novelty_weight', 0.0)
-            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking'}
+            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking', 'w_m2v'}
             bypass_losses = {k: None for k in bypass_keys}
             aligned_list = []
             if aux_dict:
