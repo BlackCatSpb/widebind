@@ -105,6 +105,8 @@ class SmartController:
         Hn = min(H / math.log(self.vocab), 1.0)
         trust = mind.get('trust_max', 0.5)
         self.hist.append(H)
+        if len(self.hist) > 64:
+            self.hist = self.hist[-32:]
         collapse = len(self.hist) >= 4 and max(self.hist[-4:]) < self.collapse_H
         rep = self._repetition()
 
@@ -191,14 +193,14 @@ class SmartController:
         return int(torch.multinomial(probs, 1).item())
 
 
+@torch.no_grad()
 def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
                    set_reason=True, no_trunc=False):
     """Генерация под управлением SmartController. set_reason=True -> переключает
     model.reasoning_scale_override перетокеново (по решению контроллера)."""
-    """Генерация под управлением SmartController. set_reason=True -> переключает
-    model.reasoning_scale_override перетокеново (по решению контроллера)."""
     from scripts.generate import load_russian_tokenizer
     controller.no_trunc = no_trunc
+    model.eval()
     tok = load_russian_tokenizer()
     det = lambda ids: tok.decode(ids, skip_special_tokens=True)
     ids = tok.encode(prompt).ids
