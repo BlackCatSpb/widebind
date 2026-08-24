@@ -240,20 +240,26 @@ class FCF_CPR:
         return sd
     
     def save_compressed(self, ckpt, save_path):
-        """Save compressed checkpoint."""
+        """Save compressed checkpoint as an inference-only artifact.
+
+        Strips all training-only state (optimizer, scheduler, param_names,
+        best_val_loss, interrupted) so the file holds only what is needed to
+        rebuild the model: step, cfg, the compressed weights, their meta, and
+        the reasoning flag. The compressed model weights already exclude the
+        deterministic buffers (V_dct, codes), which are recomputed on load.
+        """
         sd = ckpt['model']
         compressed, meta = self.compress_sd(sd)
-        
+
         out = {
             'step': ckpt.get('step', 0),
             'cfg': ckpt.get('cfg'),
             'model_compressed': compressed,
             'meta': meta,
         }
-        for key in ('optimizer', 'scheduler', 'best_val_loss', 'interrupted'):
-            if key in ckpt:
-                out[key] = ckpt[key]
-        
+        if 'reasoning_enabled_step' in ckpt:
+            out['reasoning_enabled_step'] = ckpt['reasoning_enabled_step']
+
         torch.save(out, save_path)
         size = os.path.getsize(save_path)
         print(f'\nSaved: {save_path}')
