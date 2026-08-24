@@ -229,6 +229,11 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
             logits = head(out[:, -1:, :])[0, 0]
         if bias_alpha != 1.0:
             logits = (logits - tb) + bias_alpha * tb
+        if not torch.isfinite(logits).all():
+            # model diverged to NaN/Inf (hot output regime); reset recurrent
+            # state and sample from flat logits instead of crashing.
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            state = None
         if sampler is not None:
             next_token = torch.tensor([sampler.sample(logits)], device=device)
         else:

@@ -77,6 +77,7 @@ class SmartController:
 
     def _entropy(self, logits):
         p = torch.softmax(logits.float(), -1)
+        p = torch.clamp(p, min=1e-12)  # avoid 0*log(0)=NaN on overconfident (hot) logits
         return float(-(p * p.log()).sum().item())
 
     def _repetition(self):
@@ -229,6 +230,12 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
             logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
         else:
             logits = head(out[:, -1:, :])[0, 0]
+        if not torch.isfinite(logits).all():
+            # model diverged to NaN/Inf (hot output regime); break recurrent
+            # blow-up by resetting state/memory and using flat logits.
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            state = None
+            rb = None
 
         # tau-weighted trust_max aggregated from all layers WITHOUT per-layer
         # host syncs: debug_mind() calls .item() ~10x/layer, which under
@@ -245,6 +252,8 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
                             device=trust_stack.device)
         wsum = wvec.sum()
         trust_val = ((trust_stack * wvec).sum() / wsum).item() if wsum > 0 else 0.5
+        if not math.isfinite(trust_val):
+            trust_val = 0.5
         mind = {
             'trust_max': trust_val,
             'gate_ema_mean': gate_stack[-1].item(),
