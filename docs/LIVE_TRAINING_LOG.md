@@ -333,7 +333,8 @@ Train CE стабилен ~10.5; mem 13.6 GB; tok/s растёт 53→100 (пр�
 - diversity → ~0.0001 (инертна, предсказано gradinfo: ||gDIV|| ≪ ||gCE||).
 - pred медленно растёт 0.089 → 0.126 (живой, но слабый readout-сигнал).
 - ranch 3.69 → 0.28 — балансировка ветвей усаживается.
-- anking ~133–137 стабилен — сигнал порядка держится.
+- 
+anking ~133–137 стабилен — сигнал порядка держится.
 - ls_reg ~0.098, gate_repulse ~−0.07 — базовые регуляторы на месте.
 
 ### Адаптивный L в деле
@@ -1474,3 +1475,211 @@ PYTHONPATH=archive. Импорт в generate.py / tests/test_infer.py требу
 больше шагов, чем в Run A (~100-160K вместо 5-8K). Пользователь осознанно ждёт.
 План: мониторинг EVAL/чекпоинтов; ре-оценка если val снова обвалится или MLP не
 проснётся после аномально большого числа шагов.
+---
+
+## ТРЕНИРОВКА ВОЗОБНОВЛЕНА resume-ом с step_11844 -> 300000 (2026-08-25)
+
+Лог пользователя (Colab, прогон возобновлён с чекпоинта step_11844; цель 300000,
+288156 шагов осталось; batch=1, seq=256 -> 256 токенов/шаг). Полный сырой лог:
+
+```
+Training: step 11844 -> 300000
+  (288156 steps remaining)
+  batch=1 seq=256 -> tokens/step=256
+
+  Saved checkpoint to /content/drive/MyDrive/widebind/checkpoints/step_11844.pt
+step= 11880  loss=109.8092  ce=10.7125  lr=4.43e-06  tok/s=81  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0005 branch=3.6910 decorr=0.0006 div=-5.8766 diversity=0.0157 gate_l1=0.0001 gate_repulse=-0.0500 ls_reg=0.0942 nuc=0.0015 pred=0.0727 ranking=101.1328 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=11883: val_loss=10.7865 val_ppl=48362.49
+step= 11935  loss=120.6035  ce=12.7512  lr=4.39e-06  tok/s=63  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0006 branch=3.8794 decorr=0.0006 div=-5.8766 diversity=0.0195 gate_l1=0.0001 gate_repulse=-0.0527 ls_reg=0.0942 nuc=0.0015 pred=0.0734 ranking=109.6981 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 11990  loss=124.0401  ce=11.1429  lr=4.39e-06  tok/s=78  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0006 branch=3.3817 decorr=0.0005 div=-5.8766 diversity=0.0224 gate_l1=0.0001 gate_repulse=-0.0539 ls_reg=0.0942 nuc=0.0015 pred=0.0728 ranking=115.2396 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.735989 |1-a|=0.096727 gate_var=0.180876 |mirror|=230.4461 tau_var=12.736089 mult=0.0495 lr=1.48e-05 ls_mult[min=1.000 max=1.001]
+step= 12045  loss=133.0477  ce=14.5926  lr=4.40e-06  tok/s=88  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.6765 decorr=0.0005 div=-5.8766 diversity=0.0165 gate_l1=0.0000 gate_repulse=-0.0550 ls_reg=0.0942 nuc=0.0015 pred=0.0703 ranking=120.5120 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12100  loss=161.2443  ce=29.0179  lr=4.39e-06  tok/s=95  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.3896 decorr=0.0005 div=-5.8766 diversity=0.0280 gate_l1=0.0000 gate_repulse=-0.0565 ls_reg=0.0942 nuc=0.0015 pred=0.0736 ranking=134.5569 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=12116: val_loss=12.0364 val_ppl=168794.59
+step= 12155  loss=163.2941  ce=29.3870  lr=4.39e-06  tok/s=85  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.2233 decorr=0.0005 div=-5.8766 diversity=0.0215 gate_l1=0.0000 gate_repulse=-0.0576 ls_reg=0.0942 nuc=0.0015 pred=0.0716 ranking=136.4135 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12210  loss=162.0921  ce=31.9152  lr=4.39e-06  tok/s=89  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.3691 decorr=0.0005 div=-5.8765 diversity=0.0216 gate_l1=0.0000 gate_repulse=-0.0585 ls_reg=0.0942 nuc=0.0015 pred=0.0683 ranking=132.5416 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12265  loss=166.7298  ce=31.8913  lr=4.40e-06  tok/s=93  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.2337 decorr=0.0005 div=-5.8765 diversity=0.0269 gate_l1=0.0001 gate_repulse=-0.0589 ls_reg=0.0942 nuc=0.0015 pred=0.0678 ranking=137.3342 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12320  loss=174.8150  ce=35.3192  lr=4.38e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.2420 decorr=0.0006 div=-5.8765 diversity=0.0300 gate_l1=0.0000 gate_repulse=-0.0607 ls_reg=0.0942 nuc=0.0015 pred=0.0708 ranking=141.9787 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=12349: val_loss=10.8619 val_ppl=52152.84
+step= 12375  loss=169.9080  ce=26.8622  lr=4.38e-06  tok/s=90  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.3038 decorr=0.0005 div=-5.8765 diversity=0.0497 gate_l1=0.0000 gate_repulse=-0.0613 ls_reg=0.0942 nuc=0.0015 pred=0.0690 ranking=145.4497 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12430  loss=161.3737  ce=19.3717  lr=4.31e-06  tok/s=93  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.5805 decorr=0.0006 div=-5.8765 diversity=0.0508 gate_l1=0.0000 gate_repulse=-0.0648 ls_reg=0.0942 nuc=0.0015 pred=0.0697 ranking=144.1308 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12485  loss=156.6466  ce=16.9853  lr=4.33e-06  tok/s=95  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.3794 decorr=0.0006 div=-5.8765 diversity=0.0365 gate_l1=0.0000 gate_repulse=-0.0652 ls_reg=0.0942 nuc=0.0015 pred=0.0708 ranking=142.0048 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.735791 |1-a|=0.096236 gate_var=0.216739 |mirror|=212.7768 tau_var=12.735853 mult=0.0488 lr=1.46e-05 ls_mult[min=1.000 max=1.000]
+step= 12540  loss=148.5305  ce=10.6959  lr=4.29e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.5595 decorr=0.0006 div=-5.8764 diversity=0.0347 gate_l1=0.0000 gate_repulse=-0.0652 ls_reg=0.0942 nuc=0.0015 pred=0.0736 ranking=139.9969 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=12582: val_loss=10.7043 val_ppl=44546.43
+step= 12595  loss=138.4954  ce=10.5070  lr=4.33e-06  tok/s=93  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2056 decorr=0.0006 div=-5.8763 diversity=0.0225 gate_l1=0.0000 gate_repulse=-0.0655 ls_reg=0.0942 nuc=0.0015 pred=0.0725 ranking=130.5182 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12650  loss=160.4543  ce=37.2527  lr=4.40e-06  tok/s=94  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.0609 decorr=0.0005 div=-5.8762 diversity=0.0272 gate_l1=0.0000 gate_repulse=-0.0641 ls_reg=0.0942 nuc=0.0015 pred=0.0722 ranking=125.8700 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12705  loss=131.0386  ce=10.9574  lr=4.38e-06  tok/s=96  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2685 decorr=0.0005 div=-5.8761 diversity=0.0234 gate_l1=0.0000 gate_repulse=-0.0642 ls_reg=0.0942 nuc=0.0015 pred=0.0711 ranking=122.5471 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12760  loss=135.4535  ce=13.9430  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2086 decorr=0.0005 div=-5.8761 diversity=0.0123 gate_l1=0.0000 gate_repulse=-0.0640 ls_reg=0.0942 nuc=0.0015 pred=0.0712 ranking=124.0471 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12815  loss=146.2190  ce=14.8179  lr=4.41e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.6130 decorr=0.0005 div=-5.8761 diversity=0.0154 gate_l1=0.0000 gate_repulse=-0.0648 ls_reg=0.0942 nuc=0.0015 pred=0.0716 ranking=133.5304 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=12815: val_loss=11.0625 val_ppl=63734.01
+  Saved checkpoint to /content/drive/MyDrive/widebind/checkpoints/step_12831.pt
+step= 12870  loss=152.0863  ce=15.8215  lr=4.40e-06  tok/s=94  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.6995 decorr=0.0006 div=-5.8761 diversity=0.0244 gate_l1=0.0001 gate_repulse=-0.0651 ls_reg=0.0942 nuc=0.0015 pred=0.0722 ranking=138.2985 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12925  loss=151.7439  ce=10.7329  lr=4.43e-06  tok/s=96  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.7146 decorr=0.0006 div=-5.8761 diversity=0.0253 gate_l1=0.0001 gate_repulse=-0.0650 ls_reg=0.0942 nuc=0.0015 pred=0.0707 ranking=143.0300 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 12980  loss=153.2600  ce=17.3345  lr=4.37e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.8694 decorr=0.0005 div=-5.8761 diversity=0.0115 gate_l1=0.0000 gate_repulse=-0.0655 ls_reg=0.0942 nuc=0.0015 pred=0.0703 ranking=137.8044 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.734817 |1-a|=0.096396 gate_var=0.216281 |mirror|=222.5853 tau_var=12.734886 mult=0.0500 lr=1.50e-05 ls_mult[min=1.000 max=1.000]
+step= 13035  loss=146.5082  ce=18.4978  lr=4.42e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.7431 decorr=0.0005 div=-5.8761 diversity=0.0090 gate_l1=0.0000 gate_repulse=-0.0652 ls_reg=0.0942 nuc=0.0015 pred=0.0678 ranking=130.0203 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=13048: val_loss=14.9732 val_ppl=3182575.55
+step= 13090  loss=143.5341  ce=19.3112  lr=4.39e-06  tok/s=95  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.6052 decorr=0.0005 div=-5.8761 diversity=0.0153 gate_l1=0.0000 gate_repulse=-0.0643 ls_reg=0.0942 nuc=0.0015 pred=0.0692 ranking=126.3622 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13145  loss=148.4519  ce=23.0042  lr=4.43e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.6793 decorr=0.0006 div=-5.8761 diversity=0.0221 gate_l1=0.0000 gate_repulse=-0.0646 ls_reg=0.0942 nuc=0.0015 pred=0.0685 ranking=127.5070 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13200  loss=141.3524  ce=10.7536  lr=4.34e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=4.0336 decorr=0.0005 div=-5.8760 diversity=0.0374 gate_l1=0.0001 gate_repulse=-0.0634 ls_reg=0.0942 nuc=0.0015 pred=0.0660 ranking=132.2900 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13255  loss=135.6149  ce=12.4227  lr=4.32e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=4.0156 decorr=0.0005 div=-5.8760 diversity=0.0256 gate_l1=0.0001 gate_repulse=-0.0646 ls_reg=0.0942 nuc=0.0015 pred=0.0689 ranking=124.9112 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=13281: val_loss=10.8867 val_ppl=53458.36
+step= 13310  loss=129.9594  ce=10.6494  lr=4.42e-06  tok/s=96  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=3.7024 decorr=0.0005 div=-5.8759 diversity=0.0161 gate_l1=0.0001 gate_repulse=-0.0637 ls_reg=0.0942 nuc=0.0015 pred=0.0789 ranking=121.3408 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13365  loss=132.7917  ce=10.4289  lr=4.32e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.6903 decorr=0.0005 div=-5.8757 diversity=0.0235 gate_l1=0.0000 gate_repulse=-0.0650 ls_reg=0.0942 nuc=0.0015 pred=0.0719 ranking=124.4064 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13420  loss=134.5024  ce=10.7277  lr=4.34e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.8862 decorr=0.0005 div=-5.8756 diversity=0.0267 gate_l1=0.0000 gate_repulse=-0.0665 ls_reg=0.0942 nuc=0.0015 pred=0.0699 ranking=125.6227 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13475  loss=136.7869  ce=10.4312  lr=4.40e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.7310 decorr=0.0005 div=-5.8755 diversity=0.0184 gate_l1=0.0000 gate_repulse=-0.0670 ls_reg=0.0942 nuc=0.0015 pred=0.0742 ranking=128.3631 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.733363 |1-a|=0.096322 gate_var=0.223671 |mirror|=230.6996 tau_var=12.733876 mult=0.0497 lr=1.49e-05 ls_mult[min=1.000 max=1.001]
+  EVAL step=13514: val_loss=11.3558 val_ppl=85462.56
+step= 13530  loss=139.6497  ce=10.5176  lr=4.40e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.7770 decorr=0.0005 div=-5.8754 diversity=0.0196 gate_l1=0.0000 gate_repulse=-0.0679 ls_reg=0.0942 nuc=0.0015 pred=0.0770 ranking=131.0903 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13585  loss=157.1150  ce=29.6307  lr=4.42e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.7491 decorr=0.0005 div=-5.8753 diversity=0.0301 gate_l1=0.0000 gate_repulse=-0.0678 ls_reg=0.0942 nuc=0.0015 pred=0.0679 ranking=129.4688 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13640  loss=141.1537  ce=12.9527  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.6694 decorr=0.0005 div=-5.8753 diversity=0.0254 gate_l1=0.0000 gate_repulse=-0.0664 ls_reg=0.0942 nuc=0.0015 pred=0.0691 ranking=130.2673 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13695  loss=139.2869  ce=12.5174  lr=4.41e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.1857 decorr=0.0005 div=-5.8753 diversity=0.0217 gate_l1=0.0000 gate_repulse=-0.0675 ls_reg=0.0942 nuc=0.0015 pred=0.0686 ranking=129.3247 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=13747: val_loss=11.1804 val_ppl=71713.17
+step= 13750  loss=142.1317  ce=11.7093  lr=4.43e-06  tok/s=97  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2681 decorr=0.0005 div=-5.8752 diversity=0.0200 gate_l1=0.0000 gate_repulse=-0.0677 ls_reg=0.0942 nuc=0.0015 pred=0.0690 ranking=132.8968 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13805  loss=147.3313  ce=16.9702  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.4164 decorr=0.0006 div=-5.8752 diversity=0.0111 gate_l1=0.0000 gate_repulse=-0.0675 ls_reg=0.0942 nuc=0.0015 pred=0.0691 ranking=132.6957 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  Saved checkpoint to /content/drive/MyDrive/widebind/checkpoints/step_13818.pt
+step= 13860  loss=154.4017  ce=26.8524  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0259 decorr=0.0006 div=-5.8752 diversity=0.0154 gate_l1=0.0000 gate_repulse=-0.0673 ls_reg=0.0942 nuc=0.0015 pred=0.0765 ranking=130.2625 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13915  loss=149.3707  ce=24.7823  lr=4.41e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2059 decorr=0.0006 div=-5.8752 diversity=0.0141 gate_l1=0.0000 gate_repulse=-0.0686 ls_reg=0.0942 nuc=0.0015 pred=0.0774 ranking=127.1232 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 13970  loss=150.8407  ce=25.8198  lr=4.42e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.4965 decorr=0.0006 div=-5.8752 diversity=0.0216 gate_l1=0.0000 gate_repulse=-0.0685 ls_reg=0.0942 nuc=0.0015 pred=0.0741 ranking=127.2610 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=13980: val_loss=15.9594 val_ppl=8532362.57
+  lr_adapt: var(ls)=12.732799 |1-a|=0.096118 gate_var=0.226748 |mirror|=229.1573 tau_var=12.732801 mult=0.0498 lr=1.49e-05 ls_mult[min=1.000 max=1.001]
+step= 14025  loss=158.4430  ce=29.9950  lr=4.42e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.4842 decorr=0.0005 div=-5.8752 diversity=0.0167 gate_l1=0.0000 gate_repulse=-0.0680 ls_reg=0.0942 nuc=0.0015 pred=0.0719 ranking=130.7071 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14080  loss=158.0714  ce=32.4102  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2104 decorr=0.0005 div=-5.8752 diversity=0.0220 gate_l1=0.0000 gate_repulse=-0.0667 ls_reg=0.0942 nuc=0.0015 pred=0.0737 ranking=128.1854 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14135  loss=163.9171  ce=37.7000  lr=4.43e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.1650 decorr=0.0005 div=-5.8752 diversity=0.0230 gate_l1=0.0000 gate_repulse=-0.0656 ls_reg=0.0942 nuc=0.0015 pred=0.0755 ranking=128.7830 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14190  loss=146.1019  ce=19.0943  lr=4.43e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2028 decorr=0.0006 div=-5.8752 diversity=0.0199 gate_l1=0.0000 gate_repulse=-0.0660 ls_reg=0.0942 nuc=0.0015 pred=0.0813 ranking=129.5334 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=14213: val_loss=10.9631 val_ppl=57703.17
+step= 14245  loss=161.4551  ce=38.1663  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.9896 decorr=0.0005 div=-5.8752 diversity=0.0297 gate_l1=0.0001 gate_repulse=-0.0665 ls_reg=0.0942 nuc=0.0015 pred=0.0928 ranking=126.0070 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14300  loss=179.4667  ce=50.9487  lr=4.40e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0007 branch=2.8689 decorr=0.0005 div=-5.8752 diversity=0.0179 gate_l1=0.0001 gate_repulse=-0.0658 ls_reg=0.0942 nuc=0.0015 pred=0.0979 ranking=131.3628 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14355  loss=180.1081  ce=52.9969  lr=4.43e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.9936 decorr=0.0005 div=-5.8751 diversity=0.0187 gate_l1=0.0001 gate_repulse=-0.0663 ls_reg=0.0942 nuc=0.0015 pred=0.0980 ranking=129.8308 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14410  loss=185.5001  ce=57.0966  lr=4.39e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0248 decorr=0.0006 div=-5.8751 diversity=0.0220 gate_l1=0.0001 gate_repulse=-0.0676 ls_reg=0.0942 nuc=0.0015 pred=0.0969 ranking=131.0909 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=14446: val_loss=11.4124 val_ppl=90432.59
+step= 14465  loss=180.8989  ce=48.5776  lr=4.42e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.9041 decorr=0.0006 div=-5.8749 diversity=0.0222 gate_l1=0.0001 gate_repulse=-0.0678 ls_reg=0.0942 nuc=0.0015 pred=0.0931 ranking=135.1332 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.732109 |1-a|=0.095992 gate_var=0.226711 |mirror|=225.3154 tau_var=12.732401 mult=0.0494 lr=1.48e-05 ls_mult[min=1.000 max=1.000]
+step= 14520  loss=178.9543  ce=47.0169  lr=4.40e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0023 decorr=0.0006 div=-5.8749 diversity=0.0326 gate_l1=0.0000 gate_repulse=-0.0677 ls_reg=0.0942 nuc=0.0015 pred=0.0903 ranking=134.6432 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14575  loss=177.9967  ce=48.1226  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0826 decorr=0.0006 div=-5.8749 diversity=0.0339 gate_l1=0.0001 gate_repulse=-0.0682 ls_reg=0.0942 nuc=0.0015 pred=0.0904 ranking=132.4987 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 14630  loss=178.1061  ce=47.7187  lr=4.43e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.1629 decorr=0.0005 div=-5.8748 diversity=0.0334 gate_l1=0.0001 gate_repulse=-0.0681 ls_reg=0.0942 nuc=0.0015 pred=0.0854 ranking=132.9372 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=14679: val_loss=11.3673 val_ppl=86445.89
+step= 14685  loss=172.7589  ce=46.3544  lr=4.43e-06  tok/s=98  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.1030 decorr=0.0005 div=-5.8748 diversity=0.0270 gate_l1=0.0001 gate_repulse=-0.0682 ls_reg=0.0942 nuc=0.0015 pred=0.0799 ranking=129.0262 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14740  loss=174.4539  ce=41.6266  lr=4.43e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0923 decorr=0.0006 div=-5.8747 diversity=0.0140 gate_l1=0.0000 gate_repulse=-0.0681 ls_reg=0.0942 nuc=0.0015 pred=0.0803 ranking=135.4721 reinforce=0.0002 signal_ent=0.0141 w_m2v=0.0002
+step= 14795  loss=173.6438  ce=41.4679  lr=4.43e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.1845 decorr=0.0005 div=-5.8747 diversity=0.0201 gate_l1=0.0000 gate_repulse=-0.0684 ls_reg=0.0942 nuc=0.0015 pred=0.0848 ranking=134.7180 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  Saved checkpoint to /content/drive/MyDrive/widebind/checkpoints/step_14805.pt
+step= 14850  loss=171.2911  ce=39.4462  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.2344 decorr=0.0006 div=-5.8746 diversity=0.0157 gate_l1=0.0000 gate_repulse=-0.0692 ls_reg=0.0942 nuc=0.0015 pred=0.0869 ranking=134.3402 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 14905  loss=155.6224  ce=20.0421  lr=4.43e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0717 decorr=0.0005 div=-5.8743 diversity=0.0138 gate_l1=0.0000 gate_repulse=-0.0688 ls_reg=0.0942 nuc=0.0015 pred=0.0811 ranking=138.2453 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=14912: val_loss=11.4887 val_ppl=97606.72
+step= 14960  loss=159.9457  ce=25.9944  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.3343 decorr=0.0005 div=-5.8739 diversity=0.0217 gate_l1=0.0001 gate_repulse=-0.0697 ls_reg=0.0942 nuc=0.0015 pred=0.0787 ranking=136.3488 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.728617 |1-a|=0.096001 gate_var=0.232679 |mirror|=218.0694 tau_var=12.730179 mult=0.0499 lr=1.50e-05 ls_mult[min=1.000 max=1.001]
+step= 15015  loss=153.8968  ce=21.5357  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0042 decorr=0.0005 div=-5.8735 diversity=0.0170 gate_l1=0.0001 gate_repulse=-0.0698 ls_reg=0.0942 nuc=0.0015 pred=0.0788 ranking=135.0929 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 15070  loss=161.9576  ce=27.0381  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.9099 decorr=0.0006 div=-5.8733 diversity=0.0173 gate_l1=0.0001 gate_repulse=-0.0703 ls_reg=0.0942 nuc=0.0015 pred=0.0795 ranking=137.7448 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 15125  loss=154.1611  ce=19.5906  lr=4.39e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.1503 decorr=0.0005 div=-5.8731 diversity=0.0148 gate_l1=0.0001 gate_repulse=-0.0703 ls_reg=0.0942 nuc=0.0015 pred=0.0774 ranking=137.1600 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=15145: val_loss=12.9196 val_ppl=408216.99
+step= 15180  loss=147.7238  ce=13.7572  lr=4.41e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=3.0469 decorr=0.0005 div=-5.8728 diversity=0.0153 gate_l1=0.0001 gate_repulse=-0.0704 ls_reg=0.0942 nuc=0.0015 pred=0.0786 ranking=136.6575 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 15235  loss=147.5145  ce=11.8850  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.4729 decorr=0.0005 div=-5.8722 diversity=0.0037 gate_l1=0.0001 gate_repulse=-0.0708 ls_reg=0.0941 nuc=0.0015 pred=0.0808 ranking=138.9035 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 15290  loss=139.0091  ce=10.5788  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.3981 decorr=0.0005 div=-5.8717 diversity=0.0139 gate_l1=0.0000 gate_repulse=-0.0711 ls_reg=0.0941 nuc=0.0015 pred=0.0799 ranking=131.7697 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 15345  loss=139.3324  ce=10.6028  lr=4.42e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.4584 decorr=0.0005 div=-5.8713 diversity=0.0134 gate_l1=0.0001 gate_repulse=-0.0709 ls_reg=0.0941 nuc=0.0015 pred=0.0817 ranking=132.0068 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  EVAL step=15378: val_loss=11.1992 val_ppl=73070.47
+step= 15400  loss=155.9619  ce=23.2319  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.1896 decorr=0.0005 div=-5.8708 diversity=0.0026 gate_l1=0.0001 gate_repulse=-0.0720 ls_reg=0.0941 nuc=0.0015 pred=0.0844 ranking=136.2847 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+step= 15455  loss=142.3470  ce=10.6465  lr=4.42e-06  tok/s=99  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=2.0341 decorr=0.0006 div=-5.8701 diversity=0.0104 gate_l1=0.0001 gate_repulse=-0.0726 ls_reg=0.0941 nuc=0.0015 pred=0.0835 ranking=135.4037 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+  lr_adapt: var(ls)=12.716161 |1-a|=0.095968 gate_var=0.243556 |mirror|=208.2036 tau_var=12.719343 mult=0.0498 lr=1.49e-05 ls_mult[min=1.000 max=1.002]
+step= 15510  loss=146.3729  ce=10.6331  lr=4.41e-06  tok/s=100  mem=13.7GB
+  aux: alpha_novelty=-0.0000 balance=0.0008 branch=1.8264 decorr=0.0005 div=-5.8696 diversity=0.0031 gate_l1=0.0001 gate_repulse=-0.0734 ls_reg=0.0941 nuc=0.0015 pred=0.0850 ranking=139.6568 reinforce=0.0003 signal_ent=0.0141 w_m2v=0.0002
+```
+
+### Наблюдения из лога
+- **val_loss** держится в коридоре ~10.5-15.9 (большинство EVAL 10.7-11.5; выбросы
+  14.97@13048, 15.96@13980, 12.92@15145). Лучший за прогон ~= **10.7043@12582**.
+  best.pt (10.6008@4194) НЕ побит.
+- **CE-спайки** до 57 (step 14410), но возврат к 10.5-25 - переходная нестабильность,
+  не расходимость (mem стабильна 13.7GB, tok/s 95-100).
+- **ranking** растёт 101 -> 139 (конец лога): модель всё увереннее ранжирует.
+- **branch** падает 3.9 -> 1.8 к концу - сужение ветвления (стабилизация/локализация).
+- **w_m2v=0.0002 СТАБИЛЬНО** весь прогон (raw ~0.2 при весе 0.001) -> подтверждает,
+  что т-лестница весом 0.001 не двигается.
+- **Сохранены чекпоинты**: step_11844.pt, step_12831.pt, step_13818.pt, step_14805.pt
+  (проанализированы ранее: веса побайтово заморожены, best_val=10.5508, активации
+  разогреваются - out_norm 110->2950, CE(random) 12.6->48.9; tau_l_dev ЗАМОРОЖЕН).
+- lr_adapt: tau_var стабильно ~12.73-12.74, mult ~0.049-0.050, lr ~1.48-1.50e-05
+  (per-layer LS-модуляция активна, но в целом стабильна).
+
+### Связь с применённым фиксом (commit ba04413, 2026-08-25)
+- Прогон 11844->15510 - ДО фикса: подтверждает диагноз, что т не учится из-за
+  `w_m2v_hierarchy_weight=0.001` (и, для пути scripts/train.py, спектрального
+  зануления aux-градиента при cos<0).
+- **Эффективный рычаг для этого Colab-прогона** - подъём `w_m2v_hierarchy_weight`
+  0.001->0.01 (теперь дефолт в config.py), т.к. цикл ноутбука `loss = ce + sum(aux)`
+  уже суммирует w_m2v напрямую (spectral gate из train.py в ноутбуке отсутствует).
+  Вес 0.01 подхватится при СЛЕДУЮЩЕМ rebuild/resume ноутбука (cell 4/5 строит
+  WideBindConfig() заново, не восстанавливает cfg из чекпоинта).
+- Дополнительно в train.py добавлен `'w_m2v'` в `bypass_keys` (для пути
+  scripts/train.py, если используется) - гарантирует незанулённый градиент т.
+- Ноутбуки (notebooks/colab.ipynb, notebooks/widebind_colab.ipynb,
+  Desktop\colab.ipynb) менять не нужно - проверено: строят cfg свежим, не
+  переопределяют w_m2v_hierarchy_weight, не имеют spectral gate.
+- **Решение "перезапускать или нет" - за пользователем** (см. 2026-08-24).
+  При следующем перезапуске с новым кодом т должна начать двигаться.
