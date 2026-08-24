@@ -332,8 +332,7 @@ i_gate ×= (1 + bind_coh_gate · mean(|Z|))       # резонанс усили�
 - **Миграция старых чекпоинтов** — `core/migrate.py::migrate_state_dict`:
   W_out ресайз (первые строки копируются, хвост нули), `bind_coh_gate=0.0`,
   `freq_scale=1.0` — выход численно эквивалентен прежнему. Автоматически
-  применяется в `scripts/train.py` (resume), `scripts/generate_onnx.py`
-  и обоих ноутбуках. Новые параметры — всего ~1.4% весов (+K·D на слой
+   применяется в `scripts/train.py` (resume) и обоих ноутбуках. Новые параметры — всего ~1.4% весов (+K·D на слой
   и 2 скаляра): дообучение со старого чекпоинта начинается с прежнего
   поведения и постепенно включает когерентность.
 
@@ -799,6 +798,7 @@ summary = monitor.summary(50)         # последние 50 шагов
 WideBind/
 ├── core/                       # архитектура: весь код модели
 │   ├── config.py               # WideBindConfig + λ-иерархия
+│   ├── compression.py          # FCF-CPR: сжатие/декомпрессия чекпоинтов (~8–16×)
 │   ├── lambda_utils.py         # LambdaConfig, λ_d, fib, производные
 │   ├── block.py                # WideBindBlock (пре-kernel)
 │   ├── stack.py                # WideBindStack, AdaptiveController,
@@ -831,9 +831,10 @@ WideBind/
 │   ├── analyze.py              # единый анализатор: статика + wake + live + head + cmp
 │   ├── proj_read.py            # прогон Прожектора на чекпоинте (чтение слов)
 │   ├── checkpoint_inspector.py # быстрое дерево ключей чекпоинта
-│   ├── generate.py             # текстовая генерация (best.pt)
-│   ├── generate_onnx.py        # экспорт ONNX + миграция чекпоинта
-│   ├── check_onnx_coherence.py # проверка экспорта графа с когерентностью
+│   ├── generate.py             # генерация: FCF-CPR, --skip-compression, --smart
+│   ├── smart_controller.py     # SmartController: τ-адаптивный самонастраивающийся инференс
+│   ├── smart_infer.py          # CLI: baseline vs smart (--no-top, --compare)
+│   ├── eval_compare.py         # количественное сравнение режимов генерации
 │   ├── generate_russian.py     # генерация с разбором метрик
 │   ├── test_reasoning_synth.py # синтетический тест reasoning (адаптивная глубина)
 │   └── test_reasoning_grad.py  # проверка живых градиентов гейтов
@@ -843,10 +844,11 @@ WideBind/
 │   └── widebind_colab.ipynb    # вариант D4096/16L (24GB+ вариант)
 │
 ├── docs/                       # документы; журналы: TRAINING_JOURNAL.md (история) и LIVE_TRAINING_LOG.md (актуальный)
-├── checkpoints/                # сохранённые чекпоинты (best.pt, step_N.pt)
-├── wb/                         # BPE-токенизатор
+├── checkpoints/                # чекпоинты (best.pt, step_N.pt, step_N_fcf.pt — FCF-CPR сжатые)
+├── wb/                         # BPE-токенизатор (russian_tokenizer/) + обучающие потоки (token_stream_*_eos.bin)
 ├── tests/                      # smoke-тесты (53 passed / 9 known-fail baseline)
-├── logs/                       # логи тренировки
+├── logs/                       # логи тренировки (gitignored)
+├── archive/                    # старый код/эксперименты — локально, вне репозитория (.gitignore)
 └── README.md                   # этот файл
 ```
 
@@ -877,6 +879,9 @@ print(model.param_count())   # 140,335,360 (140.34M)
    (статика, wake-вердикт, live-разбор, head-анализ, сравнение нескольких чекпоинтов — одним вызовом);
 - **Прожектор (чтение слов из коллектива)**: `python scripts/proj_read.py checkpoints/best.pt`
    (сегментация текста по событиям записи концептов коллективного слоя → слова; см. §5.10);
+- **Генерация (FCF-CPR + smart)**: `python scripts/generate.py checkpoints/step_11844_fcf.pt --prompt "..." --tokens 80`
+   — авто-декомпрессия сжатого чекпоинта; `--skip-compression` для обычного; `--smart` для τ-адаптивного
+   режима; `--no-top` — чистый temperature-семплинг без top-p/top-k.
 - **Журналы обучения**: `docs/TRAINING_JOURNAL.md` (история, главы 1–73) и
    `docs/LIVE_TRAINING_LOG.md` (актуальный, round 0–2200) — динамика валидации,
    фазы обучения, сравнение чекпоинтов, гипотезы (резервуар, эксперты-предикторы), watchlist.
@@ -889,8 +894,7 @@ print(model.param_count())   # 140,335,360 (140.34M)
 меняться; чекпоинты совместимы между версиями только при строгой
 миграции state_dict (`core/migrate.py::migrate_state_dict` — W_out +K,
 `bind_coh_gate=0.0`, `freq_scale=1.0`). Миграция автоматически
-применяется при resume (`scripts/train.py`), экспорте ONNX
-(`scripts/generate_onnx.py`) и в ноутбуках Colab.
+   применяется при resume (`scripts/train.py`) и в ноутбуках Colab.
 
 > WideBind — исследовательский проект нейроморфной языковой архитектуры:
 > векторные символьные операции (VSA), биллинейное связывание,
@@ -926,8 +930,7 @@ print(model.param_count())   # 140,335,360 (140.34M)
   при D=256/896/4096, K=16/32/64 (RMSNorm hp, нормировка |Z|,
   лог-сетка по K) — адаптация под XL не требуется.
 - **Тесты**: большой репозиторий 53 passed / 9 known-fail (baseline),
-  Mini — 34/34; ONNX-экспорт графа с когерентностью проходит
-  (`scripts/check_onnx_coherence.py`).
+   Mini — 34/34.
 
 ---
 

@@ -3489,3 +3489,36 @@ repetition=0% в обоих режимах. Модель на step 11844 сли�
 Повторить сравнение на БОЛЕЕ ЗРЕЛОМ чекпоинте (val_loss стабилизируется), где
 разница в когерентности/повторах действительно проявляется. Либо использовать
 семантическую метрику (MAUVE/BERTScore) или human-eval — на раннем шаге бессмысленно.
+## 87. Реструктуризация репозитория и актуализация README (24.08.2026)
+
+По просьбе: навести порядок в локальной папке, убрать мусор, синхронизировать с
+гитом и актуализировать описание.
+
+### Что сделано
+- **Токенизаторы**: старый `tokenizer_v50000.json` (50k) и экспериментальный
+  `tokenizer_v65536_rumorph_math.json` (морфемный, НЕ используется нигде в коде)
+  перенесены в `archive/tokenizers/`. Активный — `wb/russian_tokenizer/tokenizer.json`
+  (65k), fallback `tokenizer_v65536.json`.
+- **compression.py** перемещён в `core/compression.py` (был в корне); импорты
+  обновлены в `scripts/generate.py` и `tests/test_infer.py`
+  (`from core.compression import FCF_CPR`).
+- **ONNX-скрипты** (`scripts/generate_onnx.py`, `scripts/check_onnx_coherence.py`)
+  перенесены в `archive/scripts/` — ONNX отброшен ещё в §80.
+- Корневые аналитические артефакты (`wb_causal.py`, `wb_emergence_report.json`,
+  `wb_region_causal_report.json`) → `archive/analysis/`.
+- Корневой мусор удалён локально (gitignored): `analyze_*.log`, `logs/`, `main-russian.7z`.
+- Мусор в `checkpoints/` удалён локально: `step_11844.onnx.data`, `*.log`,
+  `*_report.html`, `anomaly_track.json`.
+- `semantic_emergence.png` → `docs/figures/`.
+- **archive/** полностью убран из индекса git (`git rm -r --cached archive`),
+  т.к. он в `.gitignore` — теперь репозиторий соответствует `.gitignore`.
+
+### README (§14 + «Как использовать» + §15)
+- Дерево структуры актуализировано: `core/compression.py` (FCF-CPR), новые
+  `scripts/smart_controller.py`, `smart_infer.py`, `eval_compare.py`; убраны
+  ONNX-скрипты; описаны `wb/`, `checkpoints/` (в т.ч. `_fcf.pt`), `archive/`.
+- Удалены все упоминания ONNX (§5.3, §14, §15, §17).
+- Добавлен пример генерации: FCF-CPR + `--skip-compression` / `--smart` / `--no-top`.
+
+### Проверка
+`generate.py --help` и `smart_infer.py --help` работают; `from core.compression import FCF_CPR` импортируется.

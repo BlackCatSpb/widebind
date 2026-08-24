@@ -5,7 +5,7 @@ Measures: VRAM, tok/s, generation quality.
 import sys, os, time, math
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
-from compression import FCF_CPR
+from core.compression import FCF_CPR
 from core import WideBindConfig, WideBindStack
 
 

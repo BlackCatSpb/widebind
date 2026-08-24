@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from core import WideBindConfig, WideBindStack
-from compression import FCF_CPR
+from core.compression import FCF_CPR
 
 
 class AdaptiveSampler:
