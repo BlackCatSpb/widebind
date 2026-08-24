@@ -48,7 +48,8 @@ class GroupedCognitiveMirror(nn.Module):
                  delta_var_ema_min=0.8, delta_var_ema_max=0.99, tie_mirror_proj=False,
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
-                 gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256):
+                 gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256,
+                 intent_bridge=False):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -131,6 +132,15 @@ class GroupedCognitiveMirror(nn.Module):
         gate_bias_val = torch.linspace(-gate_bias_scale, gate_bias_scale, G)
         self.gate_bias = nn.Parameter(gate_bias_val)
         self._alpha_novelty_weight = alpha_novelty_weight
+
+        # ─── Intent Bridge: эксперты «ловят» восходящий intent-сигнал ───
+        # Zero-init → вклад 0 при init → чекпоинт грузится без изменений
+        # (доучивание, не с нуля). intent_state проецируется через W_proj и
+        # добавляется в gate_logits, модулируя открытость экспертов.
+        self._intent_bridge = intent_bridge
+        if intent_bridge:
+            self.w_intent = nn.Parameter(torch.zeros(G, k))
+            self.b_intent = nn.Parameter(torch.zeros(G))
 
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -231,7 +241,7 @@ class GroupedCognitiveMirror(nn.Module):
     
     def forward(self, h, mem_all, global_state=None, diff=None,
                 tanh_bias_mod=1.0, pred_scale_mod=None,
-                context_mem=None, allow_write=None, step=None):
+                context_mem=None, allow_write=None, step=None, intent=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -530,6 +540,12 @@ class GroupedCognitiveMirror(nn.Module):
         gate_logits = gate_logits + delta_gate
         gate_logits = gate_logits + grad_mod.unsqueeze(0).unsqueeze(0)
         gate_logits = gate_logits + dvar_mod.unsqueeze(0).unsqueeze(0)
+        # Intent Bridge: нисходящий intent модулирует открытость экспертов.
+        # w_intent/b_intent zero-init → без эффекта при init (checkpoint-safe).
+        if intent is not None and self._intent_bridge:
+            ik = torch.einsum('b l gd,gdk->b l gk', intent.reshape(1, 1, G, d), self.W_proj)
+            intent_gate = torch.einsum('blgk,gk->blg', hp - ik, self.w_intent) + self.b_intent
+            gate_logits = gate_logits + intent_gate
         # Contradiction signal: expert vs collective disagreement opens gate (arbiter)
         if self._has_private_mem:
             gate_logits = gate_logits + disagreement * self.w_contra.unsqueeze(0).unsqueeze(0)

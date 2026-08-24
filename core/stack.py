@@ -47,6 +47,13 @@ class WideBindStack(nn.Module):
             self.reasoning_scale_override = None
 
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
+        # ─── Intent Bridge (wrapper): восходящий intent + нисходящая трансляция ───
+        # intent_state параллелен global_state; эксперты «ловят» его через
+        # zero-init w_intent/b_intent (см. mirror.py). default-off → модель нетронута.
+        self.intent_bridge = getattr(cfg, 'intent_bridge', False)
+        if self.intent_bridge:
+            self.intent_probe = nn.Linear(cfg.D, cfg.D)
+        self._last_intent_state = None
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         # ─── Idea 4: Per-layer τ_l deviation ───
@@ -64,7 +71,7 @@ class WideBindStack(nn.Module):
     
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
                 context_mem=None, allow_write=None, step=None,
-                reasoning_buffer=None, reasoning_count=None):
+                reasoning_buffer=None, reasoning_count=None, intent_state=None):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
@@ -150,6 +157,16 @@ class WideBindStack(nn.Module):
         # Copy before in-place updates: aot_export forbids mutating graph inputs
         # that require gradients (global_state is updated per layer below).
         global_state = global_state.clone()
+
+        # ─── Intent Bridge: параллельный кросс-слойный intent_state ───
+        if self.intent_bridge:
+            if intent_state is None:
+                intent_state = torch.zeros(n_layers, 1, D, device=h.device, dtype=h.dtype)
+            if intent_state.dim() == 2:
+                intent_state = intent_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
+            elif intent_state.shape[0] != n_layers:
+                intent_state = intent_state[0:1].expand(n_layers, -1, -1).clone()
+            intent_state = intent_state.clone()
         # ─── Momentum warmup for global_state oscillation (Idea 3) ───
         momentum_beta = 0.0
         if adaptive and step is not None and step >= 5000:
@@ -184,6 +201,7 @@ class WideBindStack(nn.Module):
                 pred_scale_mod = None
             
             gs_i = global_state[i:i+1].detach().clone()  # (1, 1, D), no grad through global_state (EMA-only)
+            intent_i = intent_state[i:i+1].detach().clone() if self.intent_bridge else None
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
                 _saved_pen = layer.mirror._cached_pred_error_norm
@@ -194,7 +212,7 @@ class WideBindStack(nn.Module):
                     _saved_pen, _saved_hp,
                     mem2v_scale, l_diff, nscale,
                     tanh_bias_mod, pred_scale_mod, spectral_mod,
-                    context_mem, allow_write, vsa_tau, step,
+                    context_mem, allow_write, vsa_tau, step, intent_i,
                     use_reentrant=False,
                 )
                 h, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp = _out
@@ -204,7 +222,7 @@ class WideBindStack(nn.Module):
                                  tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                                  spectral_mod=spectral_mod,
                                  context_mem=context_mem, allow_write=allow_write,
-                                 tau_s=vsa_tau, step=step)
+                                 tau_s=vsa_tau, step=step, intent=intent_i)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -231,8 +249,13 @@ class WideBindStack(nn.Module):
                     global_state[i:i+1] = gs_i + (1.0 - alpha_l.detach()) * self._gs_velocity[i:i+1]
                 else:
                     global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
+                if self.intent_bridge:
+                    local_intent = self.intent_probe(h).mean(dim=(0, 1), keepdim=True)  # (1,1,D)
+                    intent_state[i:i+1] = alpha_l * intent_i + (1.0 - alpha_l) * local_intent
                 s_out = tuple(t.detach() if t is not None else None for t in s_out)
             new_state.append(s_out)
+            if self.intent_bridge:
+                self._last_intent_state = intent_state.detach()
             if adaptive:
                 mir = layer.mirror
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
@@ -779,7 +802,7 @@ class WideBindStack(nn.Module):
                              _cached_pred_error_norm, _cached_hp,
                              mem2v_scale, diff, noise_scale,
                              tanh_bias_mod, pred_scale_mod, spectral_mod,
-                             context_mem, allow_write, tau_s, step):
+                             context_mem, allow_write, tau_s, step, intent=None):
         """Wrapper for gradient checkpointing.
         Mirror cache is passed as explicit args/returns so checkpoint saves/restores it,
         preventing stale-cache mismatch between forward and backward recomputation."""
@@ -789,7 +812,7 @@ class WideBindStack(nn.Module):
                              mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod, context_mem=context_mem,
-                             allow_write=allow_write, tau_s=tau_s, step=step)
+                             allow_write=allow_write, tau_s=tau_s, step=step, intent=intent)
         return h_out, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp
 
     def param_count(self):

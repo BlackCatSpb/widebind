@@ -185,6 +185,12 @@ class WideBindConfig:
     traj_rebuild_interval: int = 128   # пересборка лучей каждые N переходов
     traj_gain: float = 0.05            # масштаб вклада манифолда
 
+    # ─── Intent Bridge (нисходяще-восходящая передача «намерения» экспертам) ───
+    # Эксперты «подхватывают» восходящий сигнал (то, что идёт наверх и станет
+    # логитом). Реализуется как обёртка: IntentProbe + zero-init w_intent/b_intent.
+    intent_bridge: bool = False    # True = добавить мост ( checkpoint-совместимо: ноль-эффект при init)
+    intent_topdown: bool = True    # зарезервировано: форма нисходящей трансляции intent_state
+
     # Gradient accumulation
     accum_steps: int = 1  # effective batch = batch_size * seq_len * accum_steps
 

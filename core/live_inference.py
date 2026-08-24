@@ -144,6 +144,7 @@ class LiveInference:
         self.cfg = cfg
         self.layer_states = None
         self.global_state = None
+        self.intent_state = None
         self.step = 0
 
         if monitor:
@@ -166,9 +167,11 @@ class LiveInference:
                 h = torch.zeros(1, 1, self.cfg.D,
                                 device=next(self.model.parameters()).device)
             out, new_states, self.global_state, self._reasoning = self.model(
-                h, self.layer_states, global_state=self.global_state
+                h, self.layer_states, global_state=self.global_state,
+                intent_state=self.intent_state
             )
             self.layer_states = new_states
+            self.intent_state = getattr(self.model, '_last_intent_state', None)
             self.step += 1
 
             if self.monitor is not None:
@@ -187,9 +190,11 @@ class LiveInference:
         the sequence length of h determines the context.
         """
         out, new_states, self.global_state, self._reasoning = self.model(
-            h, self.layer_states, global_state=self.global_state
+            h, self.layer_states, global_state=self.global_state,
+            intent_state=self.intent_state
         )
         self.layer_states = new_states
+        self.intent_state = getattr(self.model, '_last_intent_state', None)
         self.step += 1
 
         if self.monitor is not None:
@@ -202,6 +207,7 @@ class LiveInference:
         """Reset all internal states (layer states + global_state)."""
         self.layer_states = None
         self.global_state = None
+        self.intent_state = None
         self.step = 0
         if self.monitor is not None:
             self.monitor.clear()
