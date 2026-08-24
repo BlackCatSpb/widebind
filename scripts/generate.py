@@ -301,6 +301,10 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='')
     parser.add_argument('--skip-compression', action='store_true',
                         help='Use a non-compressed checkpoint directly, without running FCF_CPR')
+    parser.add_argument('--smart', action='store_true',
+                        help='Use tau-aware adaptive SmartController instead of static/adaptive sampling')
+    parser.add_argument('--smart-no-reasoning', action='store_true',
+                        help='Disable the per-token reasoning toggle inside smart mode')
     parser.add_argument('--show-mind', action='store_true', help='Log meta-cognitive mirror stats')
     parser.add_argument('--continuous-learn', action='store_true', help='Allow memory writes during generation')
     parser.add_argument('--context-mem', type=str, default='', help='Path to .pt file with context memory tensor (G, k)')
@@ -344,7 +348,28 @@ if __name__ == '__main__':
     model.reasoning_scale_override = {'natural': None, 'off': 0.0, 'full': 1.0}[args.reasoning]
     
     print(f'Loaded checkpoint: step={state.get("step", "?")}  params={model.param_count():,}')
-    
+
+    # Smart mode: tau-aware adaptive controller (optional replacement for normal sampling)
+    if args.smart:
+        from scripts.smart_controller import smart_generate, SmartController
+        vocab = cfg.vocab
+        ctrl = SmartController(model, vocab, reasoning_on=not args.smart_no_reasoning)
+        print(f'[smart][tau] personality={ctrl.tau_personality:.1f} norm={ctrl.tau_norm:.2f} '
+              f'temp=({ctrl.temp_lo:.2f},{ctrl.temp_hi:.2f}) trust_thr={ctrl.trust_thr:.2f}')
+        prompts = [args.prompt] if args.prompt else [
+            'Привет, как дела?', 'Москва — столица',
+            'В начале было Слово', 'Искусственный интеллект']
+        for p in prompts:
+            text, dec = smart_generate(model, p, ctrl, max_new_tokens=args.tokens,
+                                       rep_window=ctrl.rep_window)
+            print(f'> {p}')
+            print(text)
+            print()
+            print('  decisions (step, mode, H, trust, temp, top_p, top_k, rep, reason):')
+            for d in dec[::6]:
+                print('   ', d)
+        sys.exit(0)
+
     # Prompts
     context_mem = None
     if args.context_mem:
