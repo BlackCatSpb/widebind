@@ -350,6 +350,8 @@ if __name__ == '__main__':
     model.reasoning_scale_override = {'natural': None, 'off': 0.0, 'full': 1.0}[args.reasoning]
     
     print(f'Loaded checkpoint: step={state.get("step", "?")}  params={model.param_count():,}')
+    print(f'[device] model on {next(model.parameters()).device} '
+          f'(cuda_available={torch.cuda.is_available()}, requested={device})')
 
     # Smart mode: tau-aware adaptive controller (optional replacement for normal sampling)
     if args.smart:

@@ -646,3 +646,16 @@ class GroupedCognitiveMirror(nn.Module):
             info['cons_index'] = (cs * tr).tolist()
         return info
 
+    def meta_signals(self):
+        """Cheap GPU-friendly meta-cognitive signals (no per-call host sync).
+
+        Returns (trust_max, gate_ema_mean) as 0-dim tensors on the module device.
+        Used in the generation hot loop so all 24 layers can be aggregated with a
+        single .item() instead of debug_mind() (which syncs ~10x per layer and
+        stalls the GPU under autograd-less generation).
+        """
+        if not self._has_private_mem or self._trust_matrix is None:
+            dev = next(self.parameters()).device
+            return torch.zeros((), device=dev), torch.full((), 0.5, device=dev)
+        return self._trust_matrix.max(), self._gate_ema.mean()
+

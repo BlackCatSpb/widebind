@@ -230,24 +230,25 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
         else:
             logits = head(out[:, -1:, :])[0, 0]
 
-        trust_w = 0.0
-        gate_w = 0.0
-        wsum = 0.0
-        others = {}
-        for i, layer in enumerate(model.layers):
-            m = layer.mirror.debug_mind()
-            w = controller.tau_l_vec[i]
-            if 'trust_max' in m:
-                trust_w += m['trust_max'] * w
-                wsum += w
-            if 'gate_ema_mean' in m:
-                gate_w += m['gate_ema_mean'] * w
-            for k in SCALAR_KEYS:
-                if k not in ('trust_max', 'gate_ema_mean') and k in m:
-                    others[k] = others.get(k, 0.0) + m[k]
-        mind = {k: v / n for k, v in others.items()}
-        mind['trust_max'] = trust_w / wsum if wsum > 0 else 0.5
-        mind['gate_ema_mean'] = gate_w / wsum if wsum > 0 else 0.5
+        # tau-weighted trust_max aggregated from all layers WITHOUT per-layer
+        # host syncs: debug_mind() calls .item() ~10x/layer, which under
+        # no_grad generation stalls the GPU. meta_signals() returns tensors.
+        trust_ts = []
+        gate_ts = []
+        for layer in model.layers:
+            t, g = layer.mirror.meta_signals()
+            trust_ts.append(t)
+            gate_ts.append(g)
+        trust_stack = torch.stack(trust_ts)
+        gate_stack = torch.stack(gate_ts)
+        wvec = torch.tensor(controller.tau_l_vec, dtype=trust_stack.dtype,
+                            device=trust_stack.device)
+        wsum = wvec.sum()
+        trust_val = ((trust_stack * wvec).sum() / wsum).item() if wsum > 0 else 0.5
+        mind = {
+            'trust_max': trust_val,
+            'gate_ema_mean': gate_stack[-1].item(),
+        }
 
         temp, top_p, top_k, rep_pen, alpha = controller.decide(logits, mind, step)
         if set_reason:
