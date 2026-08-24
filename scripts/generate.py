@@ -255,6 +255,41 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     return detokenize(tokens.tolist())
 
 
+def load_inference_checkpoint(path, skip_compression=False, device='cpu'):
+    """Load a checkpoint for inference, transparently handling FCF_CPR-compressed
+    files. A non-compressed checkpoint is compressed on the fly into a <name>_fcf.pt
+    artifact by default (so the compressor is part of the workflow); pass
+    skip_compression=True to use the original file directly without compressing."""
+    from torch.serialization import add_safe_globals
+    add_safe_globals([WideBindConfig])
+    cpr = FCF_CPR()
+    state = torch.load(path, map_location='cpu', weights_only=False)
+
+    if 'model_compressed' in state:
+        # Already compressed: decompress in-memory (no second disk read).
+        cfg = state.get('cfg') or WideBindConfig()
+        state['model'] = cpr.decompress_sd(state['model_compressed'], state['meta'], cfg)
+        del state['model_compressed']
+        del state['meta']
+        return state
+
+    # Non-compressed checkpoint.
+    if skip_compression:
+        return state
+
+    # Compress on the fly into an artifact, then load the compressed version.
+    fcf_path = (path[:-3] + '_fcf.pt') if path.endswith('.pt') else (path + '_fcf.pt')
+    if not os.path.exists(fcf_path):
+        print(f'FCF_CPR: compressing {path} -> {fcf_path}')
+        cpr.save_compressed(state, fcf_path)
+    st = torch.load(fcf_path, map_location='cpu', weights_only=False)
+    cfg = st.get('cfg') or WideBindConfig()
+    st['model'] = cpr.decompress_sd(st['model_compressed'], st['meta'], cfg)
+    del st['model_compressed']
+    del st['meta']
+    return st
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -264,6 +299,8 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--top-k', type=int, default=0)
     parser.add_argument('--device', type=str, default='')
+    parser.add_argument('--skip-compression', action='store_true',
+                        help='Use a non-compressed checkpoint directly, without running FCF_CPR')
     parser.add_argument('--show-mind', action='store_true', help='Log meta-cognitive mirror stats')
     parser.add_argument('--continuous-learn', action='store_true', help='Allow memory writes during generation')
     parser.add_argument('--context-mem', type=str, default='', help='Path to .pt file with context memory tensor (G, k)')
@@ -295,14 +332,8 @@ if __name__ == '__main__':
     
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load checkpoint (handle FCF_CPR compressed format)
-    from torch.serialization import add_safe_globals
-    add_safe_globals([WideBindConfig])
-    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if 'model_compressed' in state:
-        cfg = state.get('cfg', WideBindConfig())
-        cpr = FCF_CPR()
-        state = cpr.load_compressed(args.checkpoint, cfg=cfg)
+    # Load checkpoint (transparently handles FCF_CPR-compressed files)
+    state = load_inference_checkpoint(args.checkpoint, skip_compression=args.skip_compression, device=device)
     cfg = state.get('cfg', WideBindConfig())
     model = WideBindStack(cfg).to(device)
     model.load_state_dict(state['model'], strict=False)
