@@ -262,9 +262,10 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
 
 def load_inference_checkpoint(path, skip_compression=False, device='cpu'):
     """Load a checkpoint for inference, transparently handling FCF_CPR-compressed
-    files. A non-compressed checkpoint is compressed on the fly into a <name>_fcf.pt
-    artifact by default (so the compressor is part of the workflow); pass
-    skip_compression=True to use the original file directly without compressing."""
+    files. By default a non-compressed checkpoint is used directly (skip_compression
+    is True unless --compress is passed); this avoids the CPU-heavy on-the-fly
+    FCF_CPR compression that makes the GPU appear idle. Pass skip_compression=False
+    (via --compress) to write/use a <name>_fcf.pt artifact instead."""
     from torch.serialization import add_safe_globals
     add_safe_globals([WideBindConfig])
     cpr = FCF_CPR()
@@ -305,7 +306,9 @@ if __name__ == '__main__':
     parser.add_argument('--top-k', type=int, default=0)
     parser.add_argument('--device', type=str, default='')
     parser.add_argument('--skip-compression', action='store_true',
-                        help='Use a non-compressed checkpoint directly, without running FCF_CPR')
+                        help='Use a non-compressed checkpoint directly, without running FCF_CPR (default behavior)')
+    parser.add_argument('--compress', action='store_true',
+                        help='Compress checkpoint to <name>_fcf.pt on load (slower first load, saves disk on reuse)')
     parser.add_argument('--smart', action='store_true',
                         help='Use tau-aware adaptive SmartController instead of static/adaptive sampling')
     parser.add_argument('--smart-no-reasoning', action='store_true',
@@ -343,8 +346,11 @@ if __name__ == '__main__':
     
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load checkpoint (transparently handles FCF_CPR-compressed files)
-    state = load_inference_checkpoint(args.checkpoint, skip_compression=args.skip_compression, device=device)
+    # Load checkpoint: by default use the file directly (no on-the-fly FCF_CPR
+    # compression, which is CPU-heavy and makes the GPU look idle). Pass --compress
+    # to create the <name>_fcf.pt artifact, or point at an existing _fcf.pt.
+    skip_compression = args.skip_compression or not args.compress
+    state = load_inference_checkpoint(args.checkpoint, skip_compression=skip_compression, device=device)
     cfg = state.get('cfg', WideBindConfig())
     model = WideBindStack(cfg).to(device)
     model.load_state_dict(state['model'], strict=False)
