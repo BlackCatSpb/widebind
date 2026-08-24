@@ -87,6 +87,19 @@ class SmartController:
         cnt = sum(1 for i in range(len(toks) - n + 1) if tuple(toks[i:i + n]) == last)
         return cnt >= 2
 
+    def _rep_pressure(self):
+        """Непрерывный сигнал зацикливания: доля токенов в окне, повторяющихся
+        ранее (0 = чисто, 1 = сплошные повторы). Считается по фикс. окну 16,
+        чтобы адаптивное rep_window не прятало само себя."""
+        look = self.recent[-16:]
+        if len(look) < 4:
+            return 0.0
+        cnt = {}
+        for t in look:
+            cnt[t] = cnt.get(t, 0) + 1
+        dup = sum(v - 1 for v in cnt.values() if v > 1)
+        return min(dup / len(look), 1.0)
+
     def decide(self, logits, mind, step):
         H = self._entropy(logits)
         Hn = min(H / math.log(self.vocab), 1.0)
@@ -99,23 +112,37 @@ class SmartController:
         temp = lerp(self.temp_lo, self.temp_hi, h)
         top_p = lerp(self.p_hi, self.p_lo, h)   # уверен -> уже (exploit)
         top_k = 0
-        rep_pen = self.rep_base
         reason = 0.0
         mode = 'exploit' if Hn < 0.4 else ('explore' if Hn < 0.7 else 'confused')
+
+        # --- непрерывно-адаптивные штрафы и окна (penalties etc.) ---
+        # давление = повторы + неуверенность (низкий trust) + высокая энтропия
+        pressure = self._rep_pressure()
+        pressure = max(pressure, 0.5 * (1.0 - trust), 0.45 * Hn)
+        pressure = min(pressure, 1.0)
+        rep_pen = lerp(self.rep_base, self.rep_max, smooth(pressure))
+        # окно и n-грамма штрафа растут с давлением: короткое/униграммное когда
+        # чисто, длинное/триграммное когда ловим петли
+        self.rep_window = int(round(lerp(6, 18, smooth(pressure))))
+        self.rep_ngram = 1 + int(round(smooth(pressure) * 2))  # 1..3
 
         if self.reasoning_on and trust < self.trust_thr:
             reason = 1.0
             mode = 'reason'
 
         if rep:
-            rep_pen = min(self.rep_max, rep_pen + 2.5)
+            rep_pen = max(rep_pen, self.rep_base + 2.5)
             top_k = 50
+            self.rep_window = max(self.rep_window, 12)
+            self.rep_ngram = 3
             reason = 1.0 if self.reasoning_on else reason
             mode = 'recover-rep'
 
         if collapse:
             temp = min(self.temp_hi + 0.4, temp + 0.5)
             top_k = 40
+            self.rep_window = 18
+            self.rep_ngram = 3
             mode = 'recover-collapse'
 
         if self.recov > 0:
@@ -134,7 +161,8 @@ class SmartController:
         self.model_reason_override = reason
         self.decisions.append((step, mode, round(H, 2), round(trust, 2),
                                round(temp, 2), round(top_p, 2), int(top_k),
-                               round(rep_pen, 2), int(reason)))
+                               round(rep_pen, 2), int(reason),
+                               int(self.rep_window), int(self.rep_ngram)))
         return temp, top_p, top_k, rep_pen
 
     def sample(self, logits, temp, top_p, top_k, rep_pen):

@@ -369,7 +369,7 @@ if __name__ == '__main__':
             print(f'> {p}')
             print(text)
             print()
-            print('  decisions (step, mode, H, trust, temp, top_p, top_k, rep, reason):')
+            print('  decisions (step, mode, H, trust, temp, top_p, top_k, rep, reason, win, ngr):')
             for d in dec[::6]:
                 print('   ', d)
         sys.exit(0)
