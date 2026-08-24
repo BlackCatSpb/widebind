@@ -121,6 +121,10 @@ class WideBindConfig:
     w_m2v_hierarchy_target: float = 1.0  # m — max target for deep layers
     w_m2v_hierarchy_weight: float = 0.01  # λ_weight for w_m2v regularisation (drives _tau_l_dev adaptation)
 
+    # Intent Bridge: own τ-ladder by τ (context integration timescale, separate from memory)
+    intent_tau_hierarchy_target: float = 0.3  # desired integration rate alpha for intent_state
+    intent_tau_hierarchy_weight: float = 0.01  # λ_weight for intent-τ regularisation (drives _tau_intent_dev adaptation)
+
     # Init stds
     w_d_init_std: float = 0.1
     conv_init_std: float = 0.01

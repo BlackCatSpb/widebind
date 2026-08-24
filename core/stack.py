@@ -58,6 +58,10 @@ class WideBindStack(nn.Module):
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         # ─── Idea 4: Per-layer τ_l deviation ───
         self._tau_l_dev = nn.Parameter(torch.zeros(cfg.n_layers))
+        # ─── Intent Bridge: own τ-ladder for context integration ───
+        # Мост контекста получает выделенный горизонт интеграции (отдельный от
+        # памяти), чтобы работать на всех диапазонах τ системы.
+        self._tau_intent_dev = nn.Parameter(torch.zeros(cfg.n_layers))
         # c_ema: global state EMA rate = write_rate * tau_mid
         tau_s = self.layers[0]._tau_s
         tau_mid = math.sqrt(tau_s[0].item() * tau_s[-1].item())
@@ -237,6 +241,10 @@ class WideBindStack(nn.Module):
                 dev = torch.tanh(self._tau_l_dev[i])
                 tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
                 alpha_l = torch.clamp(1.0 - c_ema / tau_l, min=0.0)
+                # Separate tau-ladder for the Intent Bridge context integration
+                dev_intent = torch.tanh(self._tau_intent_dev[i])
+                tau_intent_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev_intent))
+                alpha_intent_l = torch.clamp(1.0 - c_ema / tau_intent_l, min=0.0)
                 # Weighted combination of scales для global state
                 w = torch.sigmoid(layer.scale_w)  # (S, D), per-channel independent
                 if S < S_expected:
@@ -251,7 +259,7 @@ class WideBindStack(nn.Module):
                     global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
                 if self.intent_bridge:
                     local_intent = self.intent_probe(h).mean(dim=(0, 1), keepdim=True)  # (1,1,D)
-                    intent_state[i:i+1] = alpha_l * intent_i + (1.0 - alpha_l) * local_intent
+                    intent_state[i:i+1] = alpha_intent_l * intent_i + (1.0 - alpha_intent_l) * local_intent
                 s_out = tuple(t.detach() if t is not None else None for t in s_out)
             new_state.append(s_out)
             if self.intent_bridge:
@@ -628,6 +636,26 @@ class WideBindStack(nn.Module):
                     n_m2v = n_m2v + 1
             if n_m2v > 0:
                 w_m2v_loss = w_m2v_loss / n_m2v
+        # Intent Bridge: own tau-ladder regularization (gives _tau_intent_dev a gradient)
+        intent_tau_loss = 0.0
+        n_it = 0
+        if self.intent_bridge and getattr(self.cfg, 'intent_tau_hierarchy_weight', 0.0) > 0:
+            vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
+            tau_min_t = vsa_tau[0]
+            tau_max_t = vsa_tau[-1]
+            tau_mid_t = (tau_min_t * tau_max_t).sqrt()
+            c_ema_t = (1.0 / math.sqrt(self.cfg.D)) * tau_mid_t
+            for i in range(len(self.layers)):
+                lf = i / max(len(self.layers) - 1, 1)
+                dev = torch.tanh(self._tau_intent_dev[i])
+                tau_intent_l = tau_min_t * (tau_max_t / tau_min_t) ** (lf * (1.0 + 0.1 * dev))
+                actual_alpha = torch.clamp(1.0 - c_ema_t / tau_intent_l, min=0.0)
+                tgt = getattr(self.cfg, 'intent_tau_hierarchy_target', 0.3)
+                target_alpha = tgt / (1.0 + torch.exp(-(tau_intent_l.log() - tau_mid_t.log())))
+                intent_tau_loss = intent_tau_loss + (actual_alpha - target_alpha).pow(2)
+                n_it += 1
+            if n_it > 0:
+                intent_tau_loss = intent_tau_loss / n_it
         branch_loss = 0.0
         n_branch = 0
         if getattr(self.cfg, 'branch_balance_weight', 0.0) > 0:
@@ -775,6 +803,8 @@ class WideBindStack(nn.Module):
             aux_dict['orth'] = orth_loss * w_orth
         if w_m2v_loss != 0:
             aux_dict['w_m2v'] = w_m2v_loss * getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.001)
+        if intent_tau_loss != 0:
+            aux_dict['intent_tau'] = intent_tau_loss * getattr(self.cfg, 'intent_tau_hierarchy_weight', 0.01)
         if branch_loss != 0:
             aux_dict['branch'] = branch_loss * getattr(self.cfg, 'branch_balance_weight', 0.0)
         w_repulse = getattr(self.cfg, 'gate_repulse_weight', 0.3)
