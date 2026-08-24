@@ -49,6 +49,7 @@ class SmartController:
         self.rep_base, self.rep_max = 2.0, 5.0
         self.rep_window = 8
         self.rep_ngram = 3
+        self.alarm_window = 16
         self.trust_thr = 0.25
         self.collapse_H = 0.6
         self.reason_thr = 0.6
@@ -89,9 +90,8 @@ class SmartController:
 
     def _rep_pressure(self):
         """Непрерывный сигнал зацикливания: доля токенов в окне, повторяющихся
-        ранее (0 = чисто, 1 = сплошные повторы). Считается по фикс. окну 16,
-        чтобы адаптивное rep_window не прятало само себя."""
-        look = self.recent[-16:]
+        ранее (0 = чисто, 1 = сплошные повторы). Окно = адаптивный alarm_window."""
+        look = self.recent[-self.alarm_window:]
         if len(look) < 4:
             return 0.0
         cnt = {}
@@ -111,20 +111,24 @@ class SmartController:
         h = smooth(Hn)
         temp = lerp(self.temp_lo, self.temp_hi, h)
         top_p = lerp(self.p_hi, self.p_lo, h)   # уверен -> уже (exploit)
-        top_k = 0
+        # адаптивный top_k: уверен -> сужаем (фокус), неуверен -> ядро (nucleus)
+        top_k = 0 if Hn > 0.55 else int(round(lerp(50, 12, h)))
         reason = 0.0
         mode = 'exploit' if Hn < 0.4 else ('explore' if Hn < 0.7 else 'confused')
 
         # --- непрерывно-адаптивные штрафы и окна (penalties etc.) ---
+        loop_p = self._rep_pressure()                          # доля РЕАЛЬНЫХ повторов
         # давление = повторы + неуверенность (низкий trust) + высокая энтропия
-        pressure = self._rep_pressure()
-        pressure = max(pressure, 0.5 * (1.0 - trust), 0.45 * Hn)
-        pressure = min(pressure, 1.0)
+        pressure = min(max(loop_p, 0.5 * (1.0 - trust), 0.45 * Hn), 1.0)
         rep_pen = lerp(self.rep_base, self.rep_max, smooth(pressure))
         # окно и n-грамма штрафа растут с давлением: короткое/униграммное когда
         # чисто, длинное/триграммное когда ловим петли
         self.rep_window = int(round(lerp(6, 18, smooth(pressure))))
         self.rep_ngram = 1 + int(round(smooth(pressure) * 2))  # 1..3
+        # адаптивное окно «тревоги»: дальше смотрим назад при давлении
+        self.alarm_window = int(round(lerp(8, 24, smooth(pressure))))
+        # адаптивный bias_alpha: снимаем learned prior под реальными петлями/неуверенностью
+        alpha = min(max(1.0 - 1.5 * loop_p - 0.2 * (1.0 - trust), 0.0), 1.0)
 
         if self.reasoning_on and trust < self.trust_thr:
             reason = 1.0
@@ -135,6 +139,7 @@ class SmartController:
             top_k = 50
             self.rep_window = max(self.rep_window, 12)
             self.rep_ngram = 3
+            self.alarm_window = max(self.alarm_window, 16)
             reason = 1.0 if self.reasoning_on else reason
             mode = 'recover-rep'
 
@@ -143,6 +148,7 @@ class SmartController:
             top_k = 40
             self.rep_window = 18
             self.rep_ngram = 3
+            self.alarm_window = 24
             mode = 'recover-collapse'
 
         if self.recov > 0:
@@ -162,8 +168,9 @@ class SmartController:
         self.decisions.append((step, mode, round(H, 2), round(trust, 2),
                                round(temp, 2), round(top_p, 2), int(top_k),
                                round(rep_pen, 2), int(reason),
-                               int(self.rep_window), int(self.rep_ngram)))
-        return temp, top_p, top_k, rep_pen
+                               int(self.rep_window), int(self.rep_ngram),
+                               round(alpha, 2), int(self.alarm_window)))
+        return temp, top_p, top_k, rep_pen, alpha
 
     def sample(self, logits, temp, top_p, top_k, rep_pen):
         logits = logits.clone()
@@ -201,6 +208,7 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
     state = None
     rb = None
     head = model.lm_head
+    tb = getattr(head, 'token_bias', None)   # per-token learned prior (Protected)
     try:
         h_emb_ok = 'h_emb' in inspect.signature(head.forward).parameters
     except Exception:
@@ -239,9 +247,11 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
         mind['trust_max'] = trust_w / wsum if wsum > 0 else 0.5
         mind['gate_ema_mean'] = gate_w / wsum if wsum > 0 else 0.5
 
-        temp, top_p, top_k, rep_pen = controller.decide(logits, mind, step)
+        temp, top_p, top_k, rep_pen, alpha = controller.decide(logits, mind, step)
         if set_reason:
             model.reasoning_scale_override = controller.model_reason_override
+        if tb is not None:
+            logits = (logits - tb) + alpha * tb   # адаптивный bias_alpha
         nt = controller.sample(logits, temp, top_p, top_k, rep_pen)
         controller.recent.append(nt)
         if len(controller.recent) > controller.rep_window + controller.rep_ngram:

@@ -44,7 +44,7 @@ def main():
     text, dec = smart_generate(model, args.prompt, ctrl, args.tokens, no_trunc=args.no_top)
     print('SMART:', text)
     print()
-    print('DECISIONS (step, mode, H, trust, temp, top_p, top_k, rep, reason, win, ngr):')
+    print('DECISIONS (step, mode, H, trust, temp, top_p, top_k, rep, reason, win, ngr, alpha, alarm):')
     for d in dec[::6]:
         print('  ', d)
     modes = {}
