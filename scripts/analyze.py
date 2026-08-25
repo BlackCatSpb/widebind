@@ -115,25 +115,28 @@ def run_static(ckpt, cfg, model, missing, unexpected, tok=None):
     print(f'\nVSA TAU: tau[0]={vsa_tau[0].item():.2f}  tau[-1]={vsa_tau[-1].item():.2f}  '
           f'ratio={vsa_tau[-1].item() / vsa_tau[0].item():.1f}x  '
           f'tau_l_dev={td.mean().item():.4f} (std {td.std().item():.4f})')
+    ti = model._tau_intent_dev.data if hasattr(model, '_tau_intent_dev') else None
+    if ti is not None:
+        print(f'  tau_intent_dev: mean={ti.mean().item():.4f} std={ti.std().item():.4f} '
+              f'range=[{ti.min().item():.4f}, {ti.max().item():.4f}]')
     if b_d is not None:
         print(f'  b_d: mean={b_d.mean().item():.4f} range=[{b_d.min().item():.4f}, {b_d.max().item():.4f}]')
     if b_i is not None:
         print(f'  b_i: mean={b_i.mean().item():.4f} range=[{b_i.min().item():.4f}, {b_i.max().item():.4f}]')
 
-    print('\nMIRROR INTERNALS (L0, mid, last):')
+    print('\nMIRROR INTERNALS (L0, mid, last) — ВСЕ параметры зеркала:')
     for i in (0, len(model.layers) // 2, len(model.layers) - 1):
         m = model.layers[i].mirror
         print(f'  L{i}:')
-        for attr in ['W_proj', 'W_out', 'w_gate', 'b_gate', 'log_scale', 'log_skip_alpha',
-                     'w_help', 'alpha_diag', 'tanh_bias', 'mod_scale_mlp', 'mod_scale_mem']:
-            if hasattr(m, attr):
-                t = getattr(m, attr).data
-                info = f'shape={list(t.shape)} mean={t.mean().item():.4f} std={t.std().item():.4f}'
-                if t.numel() <= 10:
-                    info += f' vals={[round(v, 3) for v in t.flatten().tolist()]}'
-                elif attr == 'tanh_bias':
-                    info += f' min={t.min().item():.4f} max={t.max().item():.4f}'
-                print(f'    {attr:16s}: {info}')
+        for attr, t in m.named_parameters():
+            t = t.data
+            stdv = 0.0 if t.numel() <= 1 else t.std().item()
+            info = f'shape={list(t.shape)} mean={t.mean().item():.4f} std={stdv:.4f}'
+            if t.numel() <= 12:
+                info += f' vals={[round(v, 3) for v in t.flatten().tolist()]}'
+            elif attr == 'tanh_bias':
+                info += f' min={t.min().item():.4f} max={t.max().item():.4f}'
+            print(f'    {attr:18s}: {info}')
 
     lm = getattr(model, 'lm_head', None)
     if lm is not None:
@@ -154,6 +157,11 @@ def run_static(ckpt, cfg, model, missing, unexpected, tok=None):
     except Exception:
         pass
     print(f'  NaN: {int(torch.isnan(all_vals).sum())}  Inf: {int(torch.isinf(all_vals).sum())}')
+
+    print('\nALL PARAMETERS (grouped по шаблону имени — ВСЕ, вкл. новые):')
+    for g in _grouped_param_stats(model):
+        print(f'  {g["name"]:46s} {str(g["shape"]):24s} n={g["n"]:9d} '
+              f'mean={g["mean"]:+.5f} std={g["std"]:+.5f} [{g["min"]:+.4f}, {g["max"]:+.4f}]')
 
     if model.explicit_reasoning:
         g = getattr(model, '_reasoning_gates', None)
@@ -191,6 +199,40 @@ def run_inspector(model):
         print(f'  contra_expert: {[round(x, 3) for x in m0._cached_contra_expert.tolist()]}')
     if hasattr(m0, '_pm_step'):
         print(f'  pm_step: {int(m0._pm_step.item())}/{m0._pm_write_delay}')
+
+
+def _grouped_param_stats(model):
+    """Сводка по ВСЕМ параметрам модели, сгруппированная по шаблону имени (без номера слоя).
+    Гарантирует, что ни один параметр — в т.ч. новые (w_sal, _tau_intent_dev, ...) — не потеряется."""
+    groups = {}
+    for name, p in model.named_parameters():
+        key = re.sub(r'layers\.(\d+)\.', 'layers.L.', name)
+        t = p.data
+        n2 = t.numel()
+        mean2 = float(t.mean().item())
+        var2 = 0.0 if n2 <= 1 else float(t.var().item())
+        mn2 = float(t.min().item())
+        mx2 = float(t.max().item())
+        if key not in groups:
+            groups[key] = {'shape': list(t.shape), 'n': n2, 'mean': mean2,
+                           'M2': var2 * (n2 - 1), 'min': mn2, 'max': mx2}
+        else:
+            g = groups[key]
+            n1, m1, M2a = g['n'], g['mean'], g['M2']
+            n = n1 + n2
+            delta = mean2 - m1
+            m = m1 + delta * n2 / n
+            M2 = M2a + var2 * (n2 - 1) + (delta * delta) * n1 * n2 / n
+            g['n'], g['mean'], g['M2'] = n, m, M2
+            g['min'] = min(g['min'], mn2)
+            g['max'] = max(g['max'], mx2)
+    out = []
+    for key, g in groups.items():
+        std = math.sqrt(g['M2'] / (g['n'] - 1)) if g['n'] > 1 else 0.0
+        out.append({'name': key, 'shape': g['shape'], 'n': g['n'],
+                    'mean': g['mean'], 'std': std, 'min': g['min'], 'max': g['max']})
+    out.sort(key=lambda d: d['name'])
+    return out
 
 
 # ─────────────────────────── WAKE ───────────────────────────
@@ -395,6 +437,8 @@ def run_live(model, cfg, batch=1, seq=128, gradinfo=True):
             'mod_mlp': torch.sigmoid(m.mod_scale_mlp.data).mean().item(),
             'mod_mem': torch.sigmoid(m.mod_scale_mem.data).mean().item(),
             'gate_ema': m._gate_ema.data.mean().item(),
+            'w_sal': torch.sigmoid(m.w_sal.data).mean().item() if hasattr(m, 'w_sal') else None,
+            'w_intent': torch.sigmoid(m.w_intent.data).mean().item() if hasattr(m, 'w_intent') else None,
         }
         if m._has_private_mem:
             row['w_help'] = torch.sigmoid(m.w_help.data).mean().item()
@@ -730,6 +774,13 @@ def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None):
     best = ckpt.get('best_val_loss', float('inf'))
     params = model.param_count() / 1e6
 
+    w_sal_val = None
+    if hasattr(model.layers[0].mirror, 'w_sal'):
+        w_sal_val = torch.stack([torch.sigmoid(l.mirror.w_sal.data).mean()
+                                 for l in model.layers]).mean().item()
+    tau_intent_dev_val = (model._tau_intent_dev.data.mean().item()
+                          if hasattr(model, '_tau_intent_dev') else None)
+
     badge = lambda flag: (f'<span class="bdg b-{flag}">{flag}</span>'
                           if flag in ('PASS', 'WATCH', 'WAKE') else flag)
     ch = []
@@ -767,6 +818,10 @@ td:first-child,th:first-child{text-align:left}
     ]
     for k, v in cards:
         ch.append(f'<div class="card"><b>{v}</b><span>{k}</span></div>')
+    if w_sal_val is not None:
+        ch.append(f'<div class="card"><b>{w_sal_val:.4f}</b><span>w_sal &sigma;</span></div>')
+    if tau_intent_dev_val is not None:
+        ch.append(f'<div class="card"><b>{tau_intent_dev_val:.4f}</b><span>tau_intent_dev</span></div>')
     ch.append('</div>')
 
     ch.append('<h2>WAKE DETECTOR</h2>')
@@ -822,7 +877,8 @@ td:first-child,th:first-child{text-align:left}
     ch.append('<h2>MIRROR PARAMS (L0 / mid / last)</h2>')
     ch.append('<table><tr><th>L</th><th>α_diag</th><th>log_scale</th><th>tanh_bias</th>'
               '<th>b_gate</th><th>gate_bias</th><th>mod_mlp σ</th><th>mod_mem σ</th>'
-              '<th>gate_ema</th><th>w_help σ</th><th>w_contra</th><th>pm_norm</th></tr>')
+              '<th>gate_ema</th><th>w_sal σ</th><th>w_intent σ</th><th>w_help σ</th>'
+              '<th>w_contra</th><th>pm_norm</th></tr>')
     for r in live['mirror']:
         ch.append('<tr><td>' + str(r['layer']) + '</td><td>' +
                   f"{r['alpha_diag'][0]:.3f}" + '</td><td>' + f"{r['log_scale'][0]:.2f}" +
@@ -833,6 +889,8 @@ td:first-child,th:first-child{text-align:left}
                   (f"{r.get('w_help', 0):.3f}" if r.get('w_help') is not None else '—') +
                   '</td><td>' + (f"{r.get('w_contra', 0):.4f}" if r.get('w_contra') is not None else '—') +
                   '</td><td>' + (f"{r.get('pm_norm', 0):.3f}" if r.get('pm_norm') is not None else '—') +
+                  '</td><td>' + (f"{r.get('w_sal', 0):.4f}" if r.get('w_sal') is not None else '—') +
+                  '</td><td>' + (f"{r.get('w_intent', 0):.4f}" if r.get('w_intent') is not None else '—') +
                   '</td></tr>')
     ch.append('</table>')
 
@@ -896,6 +954,16 @@ td:first-child,th:first-child{text-align:left}
         ch.append('<div class="dim">token_bias top: ' +
                   ', '.join(H.escape(repr(t)) for t in head['token_bias_top']) +
                   f' &nbsp; log_temp={head["log_temp"]:.4f} t_eff={head["t_eff"]:.4f}</div>')
+
+    ch.append('<h2>ALL PARAMETERS (grouped — ВСЕ, вкл. новые)</h2>')
+    ch.append('<table><tr><th>name</th><th>shape</th><th>n</th><th>mean</th>'
+              '<th>std</th><th>min</th><th>max</th></tr>')
+    for g in _grouped_param_stats(model):
+        ch.append('<tr><td>' + H.escape(g['name']) + '</td><td>' + str(g['shape']) +
+                  '</td><td>' + f"{g['n']}" + '</td><td>' + f"{g['mean']:+.5f}" +
+                  '</td><td>' + f"{g['std']:+.5f}" + '</td><td>' + f"{g['min']:+.4f}" +
+                  '</td><td>' + f"{g['max']:+.4f}" + '</td></tr>')
+    ch.append('</table>')
 
     ch.append('<p class="dim">generated by analyze.py &mdash; ' +
               f'step {step}, best val {best:.4f}, {params:.2f}M params</p>')
