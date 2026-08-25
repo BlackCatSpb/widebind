@@ -395,6 +395,7 @@ class WideBindBlock(nn.Module):
                 salience=salience)
             mirror = mirror.to(h.dtype)
             mlp_mod = mlp_mod.to(h.dtype) if isinstance(mlp_mod, torch.Tensor) else mlp_mod
+            self._cache_mlp_mod = mlp_mod  # (B,L,G) per-expert MLP gate (gradalign)
             mem_mod = mem_mod.to(h.dtype) if isinstance(mem_mod, torch.Tensor) else mem_mod
         if _chk(mirror, 'mirror'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         if _chk(mlp_mod, 'mlp_mod'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
@@ -463,6 +464,7 @@ class WideBindBlock(nn.Module):
         
         # ─── MLP (per-group modulation by mlp_mod) ───
         h_mlp = self.mlp(h)
+        self._cache_mlp_out = h_mlp  # raw MLP output (gradalign target source)
         if _chk(h_mlp, 'mlp_out'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         mm2 = mlp_mod.unsqueeze(-1)  # (B, L, G, 1)
         h_mlp = (h_mlp.reshape(B, L, g, d) * mm2).reshape(B, L, D)

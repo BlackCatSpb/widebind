@@ -295,8 +295,36 @@ def train(cfg=None, resume_path=None):
                 h = model.embed_tokens(x)
         out, state, gs, _ = model(h, state, global_state=gs, step=step)
         model.observe_output(out)  # salience of THIS step -> next step's intent
-        ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
-            
+            ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
+
+            # ── Gradient-reactive governance loss (prototype) ──────────────
+            # Open the MLP gate where the MLP output actually changes the CE loss:
+            # align per-expert mlp_mod to g_target = ||∂CE/∂mlp_out|| over (B,L,d).
+            # g_target is DETACHED (target/observation) → no 2nd-order gradient.
+            # Added as a bypass aux loss (directly into grads, no spectral scaling).
+            ga_w = float(getattr(cfg, 'gradalign_weight', 0.0))
+            if ga_w > 0 and not use_amp:
+                _outs = [getattr(l, '_cache_mlp_out', None) for l in model.layers]
+                _mods = [getattr(l, '_cache_mlp_mod', None) for l in model.layers]
+                if all(o is not None for o in _outs) and all(m is not None for m in _mods):
+                    _g = torch.autograd.grad(ce_loss, _outs, retain_graph=True,
+                                             allow_unused=True)
+                    _ga = torch.zeros((), device=ce_loss.device)
+                    for _gi, _mi in zip(_g, _mods):
+                        if _gi is None or _mi is None:
+                            continue
+                        _B, _L = _mi.shape[0], _mi.shape[1]
+                        _G = _mi.shape[-1]
+                        _d = _gi.shape[-1] // _G
+                        _gt = _gi.reshape(_B, _L, _G, _d).pow(2).sum(dim=(0, 1, -1)).sqrt()  # (G,)
+                        _gt_n = _gt / (_gt.max().detach() + 1e-8)
+                        _m = _mi.mean(dim=(0, 1))                               # (G,)
+                        _m_n = _m / (_m.max().detach() + 1e-8)
+                        _ga = _ga + ((_m_n - _gt_n) ** 2).mean()
+                    aux_dict['gradalign'] = ga_w * _ga
+            elif ga_w > 0 and use_amp:
+                print('  WARN: gradalign_weight>0 ignored under AMP (needs fp32 graph)')
+
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
                 raise RuntimeError(f'NaN/Inf CE loss at step {step}')
@@ -313,7 +341,7 @@ def train(cfg=None, resume_path=None):
             w_div = getattr(cfg, 'div_weight', 0.0)
             w_rp = getattr(cfg, 'gate_repulse_weight', 0.0)
             w_nv = getattr(cfg, 'alpha_novelty_weight', 0.0)
-            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking', 'w_m2v', 'intent_tau'}
+            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking', 'w_m2v', 'intent_tau', 'gradalign'}
             bypass_losses = {k: None for k in bypass_keys}
             aligned_list = []
             if aux_dict:
@@ -460,7 +488,13 @@ def train(cfg=None, resume_path=None):
                     gates = getattr(model, '_reasoning_gates', None)
                     if gates:
                         gate_str = ' gates=' + str([round(g, 3) for g in gates])
-                print(f'  step={step:>6} loss={ce_loss.item():.4f} lr={current_lr:.2e} '
+                mod_scl = 0.0
+                try:
+                    mod_scl = torch.stack([torch.sigmoid(l.mirror.mod_scale_mlp).mean()
+                                           for l in model.layers]).mean().item()
+                except Exception:
+                    pass
+                print(f'  step={step:>6} loss={ce_loss.item():.4f} mod_mlp={mod_scl:.3f} lr={current_lr:.2e} '
                       f'tok/s={tok_s:.0f} stream={stream_idx} '
                       f'ms={mean_mirror_scale:.3f} mr={mean_ratio:.4f} | {aux_str}{gate_str}')
             

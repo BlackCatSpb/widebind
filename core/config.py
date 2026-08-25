@@ -159,6 +159,11 @@ class WideBindConfig:
     # Branch balance: equalize log-variance of conv/bind/mirror (Proposal V-3)
     branch_balance_weight: float = 0.0  # λ_B, 0=disabled
 
+    # Gradient-reactive governance loss (prototype): open MLP gate where the MLP
+    # output actually changes the CE loss. Aligns per-expert mlp_mod to
+    # g_target = ||∂CE/∂mlp_out|| (detached). 0 = disabled (default).
+    gradalign_weight: float = 0.0
+
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
     vsa_b_d_smooth: float = 0.999   # per-step lerp rate towards controller target
