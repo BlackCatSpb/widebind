@@ -2466,3 +2466,12 @@ HTML: `best_report.html`.
   (reasoning почти не меняет выход) — как и ранее. `cos_sim(diversity,CE)` опять взорван (~2e10).
 - Примечание: ||hp|| L0=66.9 / predMSE L0=8115 в anomaly-трекере — артефакт random-input
   live-forward (L0 всегда раздут при случайном входе), не тренд.
+### Повторный анализ best.pt (теперь = step 3961)
+Прогон ушёл к ~step 3961; best.pt перезаписан (val ещё лучше 10.4984). HTML: `best_report.html`.
+
+- `sigmoid(mod_scale_mlp)` mean = **0.652** (продолжение дрейфа: 0.667→0.665→0.662→0.658→0.655→**0.652**).
+  `sigmoid(mod_scale_mem)` mean = 0.664 — без изменений (gradalign бьёт только MLP-гейт).
+- Wake-детектор: WAKE-CANDIDATE (births L10-18; гейт PASS, max 0.680 < 0.75).
+- Live gate min L7 = 0.4659 — динамическая per-token модуляция жива.
+- Head: bias-decomp 0%, A/B reasoning KL ~1.84 bit; `cos_sim(diversity,CE)` взорван (~4e12, игнор).
+- Гейт монотонно «открывается вниз» уже 1000+ шагов под gradalign — разморозка устойчива.
