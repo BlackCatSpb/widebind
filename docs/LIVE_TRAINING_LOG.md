@@ -1885,3 +1885,10 @@ best.pt (step 233, val 10.99) остаётся чистой точкой отк�
 987 vs 233; `analyze.py` wake/gradinfo. План — маленький диагностический скрипт
 (read-only, без правки ядра), печатающий энергию MLP vs ядра, норму global_state,
 maturity-gate, τ-лестницы.
+
+- **Подготовлено:** `scripts/diag_mlp_core.py` (read-only) — меряет энергию MLP по слоям,
+  Δ-от-init для групп `mlp`/`mirror`/`bind`/`conv`, core-гейты (`mod_scale_mlp`, `w_sal`,
+  `_tau_l_dev`/`_tau_intent_dev`) и норму `global_state`. Smoke-тест на свежей модели
+  пройден (hooks работают, Δ-self=0, гейты=init). **Ждёт локальной копии `step_987.pt`
+  (+ `best.pt`@233 как ref).** Запуск:
+  `py -3.12 scripts/diag_mlp_core.py checkpoints/step_987.pt checkpoints/best.pt`
