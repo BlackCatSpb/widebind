@@ -236,6 +236,7 @@ class WideBindStack(nn.Module):
                     mem2v_scale, l_diff, nscale,
                     tanh_bias_mod, pred_scale_mod, spectral_mod,
                     context_mem, allow_write, vsa_tau, step, intent_i,
+                    salience=_sal,
                     use_reentrant=False,
                 )
                 h, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp = _out
@@ -245,7 +246,7 @@ class WideBindStack(nn.Module):
                                  tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                                  spectral_mod=spectral_mod,
                                  context_mem=context_mem, allow_write=allow_write,
-                                 tau_s=vsa_tau, step=step, intent=intent_i, salience=_sal)
+                                  tau_s=vsa_tau, step=step, intent=intent_i, salience=_sal)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -872,7 +873,8 @@ class WideBindStack(nn.Module):
                              _cached_pred_error_norm, _cached_hp,
                              mem2v_scale, diff, noise_scale,
                              tanh_bias_mod, pred_scale_mod, spectral_mod,
-                             context_mem, allow_write, tau_s, step, intent=None):
+                             context_mem, allow_write, tau_s, step, intent=None,
+                             salience=None):
         """Wrapper for gradient checkpointing.
         Mirror cache is passed as explicit args/returns so checkpoint saves/restores it,
         preventing stale-cache mismatch between forward and backward recomputation."""
@@ -882,7 +884,8 @@ class WideBindStack(nn.Module):
                              mem2v_scale=mem2v_scale, diff=diff, noise_scale=noise_scale,
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod, context_mem=context_mem,
-                             allow_write=allow_write, tau_s=tau_s, step=step, intent=intent)
+                             allow_write=allow_write, tau_s=tau_s, step=step,
+                             intent=intent, salience=salience)
         return h_out, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp
 
     def param_count(self):
