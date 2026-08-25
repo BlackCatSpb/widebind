@@ -141,6 +141,8 @@ class GroupedCognitiveMirror(nn.Module):
         if intent_bridge:
             self.w_intent = nn.Parameter(torch.zeros(G, k))
             self.b_intent = nn.Parameter(torch.zeros(G))
+            # Per-expert salience->gate bias (word importance -> expert openness).
+            self.w_sal = nn.Parameter(torch.zeros(G))  # zero-init => checkpoint-safe
 
         # External gradient cache (устанавливается hook'ом после backward)
         self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
@@ -241,7 +243,8 @@ class GroupedCognitiveMirror(nn.Module):
     
     def forward(self, h, mem_all, global_state=None, diff=None,
                 tanh_bias_mod=1.0, pred_scale_mod=None,
-                context_mem=None, allow_write=None, step=None, intent=None):
+                context_mem=None, allow_write=None, step=None, intent=None,
+                salience=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -543,9 +546,13 @@ class GroupedCognitiveMirror(nn.Module):
         # Intent Bridge: нисходящий intent модулирует открытость экспертов.
         # w_intent/b_intent zero-init → без эффекта при init (checkpoint-safe).
         if intent is not None and self._intent_bridge:
-            ik = torch.einsum('b l gd,gdk->b l gk', intent.reshape(1, 1, G, d), self.W_proj)
+            # intent is the per-head stream already in (…,G,k) expert space.
+            ik = intent
             intent_gate = torch.einsum('blgk,gk->blg', hp - ik, self.w_intent) + self.b_intent
             gate_logits = gate_logits + intent_gate
+        # Salience (word importance from output) -> per-expert gate bias.
+        if salience is not None and self._intent_bridge:
+            gate_logits = gate_logits + salience * self.w_sal.view(1, 1, -1)
         # Contradiction signal: expert vs collective disagreement opens gate (arbiter)
         if self._has_private_mem:
             gate_logits = gate_logits + disagreement * self.w_contra.unsqueeze(0).unsqueeze(0)

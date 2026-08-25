@@ -213,6 +213,7 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
                                   step=step,
                                   reasoning_buffer=rb[0] if rb is not None else None,
                                   reasoning_count=rb[1] if rb is not None else None)
+        model.observe_output(out)  # salience of THIS step -> next step's intent
         
         if show_mind and step % 10 == 0:
             info = model.layers[0].mirror.debug_mind()

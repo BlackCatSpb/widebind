@@ -33,7 +33,8 @@ def main():
 
     x = torch.randint(0, V, (1, 16))
     emb = m.embed_tokens(x)
-    synth = torch.randn(nL, 1, D) * 0.1
+    G = m.layers[0].mirror.G
+    synth = [torch.randn(1, 1, G, l.mirror.k) * 0.1 for l in m.layers]  # per-layer stream
 
     o, *_ = m(emb, None, adaptive=False, intent_state=synth)
     ce_loss, aux_dict = m.compute_losses(o, x, h_emb=emb)

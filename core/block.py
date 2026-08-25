@@ -185,7 +185,8 @@ class WideBindBlock(nn.Module):
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
                 tanh_bias_mod=1.0, pred_scale_mod=None, spectral_mod=1.0,
-                context_mem=None, allow_write=None, tau_s=None, step=None, intent=None):
+                context_mem=None, allow_write=None, tau_s=None, step=None, intent=None,
+                salience=None):
         mem_state = mu_state = conv_state = traj_state = pen = None
         if state is not None:
             mem_state, mu_state, conv_state = state[:3]
@@ -390,7 +391,8 @@ class WideBindBlock(nn.Module):
             mirror, mlp_mod, mem_mod, hp, pred_error_norm = self.mirror(
                 h.float(), mem_all.float(), global_state=_gs, diff=diff,
                 tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
-                context_mem=_ctx, allow_write=allow_write, step=step, intent=intent)
+                context_mem=_ctx, allow_write=allow_write, step=step, intent=intent,
+                salience=salience)
             mirror = mirror.to(h.dtype)
             mlp_mod = mlp_mod.to(h.dtype) if isinstance(mlp_mod, torch.Tensor) else mlp_mod
             mem_mod = mem_mod.to(h.dtype) if isinstance(mem_mod, torch.Tensor) else mem_mod

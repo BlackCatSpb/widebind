@@ -52,8 +52,17 @@ class WideBindStack(nn.Module):
         # zero-init w_intent/b_intent (см. mirror.py). default-off → модель нетронута.
         self.intent_bridge = getattr(cfg, 'intent_bridge', False)
         if self.intent_bridge:
-            self.intent_probe = nn.Linear(cfg.D, cfg.D)
-        self._last_intent_state = None
+            # Per-head intent probe: h -> (G, k) per expert. Mirror k VARIES
+            # per layer, so we project to G*K_max and slice per layer below.
+            # Each expert owns its own intent subspace => no shared D-source,
+            # heads don't contend for parameters and complement each other.
+            self._n_experts = int(self.layers[0].mirror.G)
+            self._K_max = max(int(l.mirror.k) for l in self.layers)
+            self.intent_probe = nn.Linear(cfg.D, self._n_experts * self._K_max)
+        # Intent stream: per-layer list of (1,1,G,k_i) per-head contexts.
+        # Flows layer->layer (depth) within a step and recurs in time.
+        self._intent_stream = None
+        self._last_salience = None
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         # ─── Idea 4: Per-layer τ_l deviation ───
@@ -162,15 +171,25 @@ class WideBindStack(nn.Module):
         # that require gradients (global_state is updated per layer below).
         global_state = global_state.clone()
 
-        # ─── Intent Bridge: параллельный кросс-слойный intent_state ───
+        # ─── Intent Bridge: depth-flowing per-head intent stream ───
+        # Per-layer list of (1,1,G,k_i): one k-dim intent per expert, flows
+        # through layers within a step (depth) and recurs across steps (time).
+        # Mirror k varies per layer, so the stream is per-layer. No shared
+        # source => no parameter contention between heads.
         if self.intent_bridge:
-            if intent_state is None:
-                intent_state = torch.zeros(n_layers, 1, D, device=h.device, dtype=h.dtype)
-            if intent_state.dim() == 2:
-                intent_state = intent_state.unsqueeze(0).expand(n_layers, -1, -1).clone()
-            elif intent_state.shape[0] != n_layers:
-                intent_state = intent_state[0:1].expand(n_layers, -1, -1).clone()
-            intent_state = intent_state.clone()
+            if isinstance(self._intent_stream, list) and len(self._intent_stream) == n_layers:
+                intent_streams = list(self._intent_stream)
+            elif isinstance(intent_state, list) and len(intent_state) == n_layers:
+                intent_streams = list(intent_state)
+            else:
+                intent_streams = [
+                    torch.zeros(1, 1, self._n_experts, self.layers[i].mirror.k,
+                                device=h.device, dtype=h.dtype)
+                    for i in range(n_layers)]
+            _sal = self._last_salience
+        else:
+            intent_streams = None
+            _sal = None
         # ─── Momentum warmup for global_state oscillation (Idea 3) ───
         momentum_beta = 0.0
         if adaptive and step is not None and step >= 5000:
@@ -205,7 +224,7 @@ class WideBindStack(nn.Module):
                 pred_scale_mod = None
             
             gs_i = global_state[i:i+1].detach().clone()  # (1, 1, D), no grad through global_state (EMA-only)
-            intent_i = intent_state[i:i+1].detach().clone() if self.intent_bridge else None
+            intent_i = intent_streams[i].detach().clone() if self.intent_bridge else None
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
                 _saved_pen = layer.mirror._cached_pred_error_norm
@@ -226,7 +245,7 @@ class WideBindStack(nn.Module):
                                  tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                                  spectral_mod=spectral_mod,
                                  context_mem=context_mem, allow_write=allow_write,
-                                 tau_s=vsa_tau, step=step, intent=intent_i)
+                                 tau_s=vsa_tau, step=step, intent=intent_i, salience=_sal)
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -258,12 +277,20 @@ class WideBindStack(nn.Module):
                 else:
                     global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
                 if self.intent_bridge:
-                    local_intent = self.intent_probe(h).mean(dim=(0, 1), keepdim=True)  # (1,1,D)
-                    intent_state[i:i+1] = alpha_intent_l * intent_i + (1.0 - alpha_intent_l) * local_intent
+                    ki = self.layers[i].mirror.k
+                    local_intent = self.intent_probe(h).reshape(
+                        h.shape[0], h.shape[1], self._n_experts, self._K_max) \
+                        [:, :, :, :ki].mean(dim=(0, 1), keepdim=True)  # (1,1,G,k_i) per-head
+                    if self._last_salience is not None:
+                        # Word-importance (from previous step's sigmoid output field)
+                        # scales how strongly the current context enters the stream.
+                        _sw = self._last_salience.mean().clamp(min=1e-3)
+                        local_intent = local_intent * _sw
+                    intent_streams[i] = alpha_intent_l * intent_streams[i] + (1.0 - alpha_intent_l) * local_intent
                 s_out = tuple(t.detach() if t is not None else None for t in s_out)
             new_state.append(s_out)
             if self.intent_bridge:
-                self._last_intent_state = intent_state.detach()
+                self._intent_stream = [s.detach() for s in intent_streams]
             if adaptive:
                 mir = layer.mirror
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
@@ -494,6 +521,19 @@ class WideBindStack(nn.Module):
         else:
             ce_loss = ce_m.sum() / mask.sum().clamp(min=1)
         return ce_loss
+
+    @torch.no_grad()
+    def compute_salience(self, logits):
+        # Word importance from the sigmoid output field (head_mode='sigmoid_coded'):
+        # how strongly the model responds at each position. Detached => no gradient
+        # feedback loop; the intent path is instead regularized via _tau_intent_dev.
+        return logits.sigmoid().norm(dim=-1, keepdim=True)  # (B, L, 1)
+
+    @torch.no_grad()
+    def observe_output(self, logits):
+        # Store salience of THIS step's output for use as the next step's
+        # intent signal (1-step delay). Keeps the loop stable and geometry clean.
+        self._last_salience = self.compute_salience(logits).detach()
 
     def compute_losses(self, h, targets, pred_weight=None, h_emb=None):
         """Compute CE and auxiliary losses separately. Returns raw (unweighted) values.

@@ -62,7 +62,8 @@ def main():
         for lay in br.layers:
             lay.mirror.w_intent.copy_(0.3 * torch.randn_like(lay.mirror.w_intent))
             lay.mirror.b_intent.copy_(0.1 * torch.randn_like(lay.mirror.b_intent))
-    synth = torch.randn(nL, 1, D) * 0.1
+    G = br.layers[0].mirror.G
+    synth = [torch.randn(1, 1, G, l.mirror.k) * 0.1 for l in br.layers]  # per-layer stream
     with torch.no_grad():
         o2, *_ = br(emb, None, adaptive=False, intent_state=synth)
     assert not torch.isnan(o2).any(), 'NaN in intent-modulated output'

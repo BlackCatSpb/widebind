@@ -293,8 +293,9 @@ def train(cfg=None, resume_path=None):
             # в”Ђв”Ђв”Ђ Forward (with optional AMP) в”Ђв”Ђв”Ђ
             with autocast('cuda', enabled=use_amp):
                 h = model.embed_tokens(x)
-                out, state, gs, _ = model(h, state, global_state=gs, step=step)
-                ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
+        out, state, gs, _ = model(h, state, global_state=gs, step=step)
+        model.observe_output(out)  # salience of THIS step -> next step's intent
+        ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
             
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
