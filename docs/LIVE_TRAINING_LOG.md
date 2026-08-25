@@ -2070,9 +2070,11 @@ maturity-gate, τ-лестницы.
 там позже запустим симуляцию. Уточнилось: **полное соответствие** — Mini должен стать точной
 копией архитектуры основного WideBind (включая `compression.py`/`projector.py`/`word_num.py` и
 голову основного), а не своей вариацией.
-- Сделано `robocopy /MIR` основного → Mini для `core/` (20 файлов, удалены Mini-уникальные
-  `cognitive_head.py`/`sigmoid_head.py`/`amp_codec.py`), `scripts/` (18), `notebooks/` (2, с уже
-  выключенным AMP).
+- Сделано зеркало основного → Mini для `core/` (методы идентичны; Mini-уникальные
+  `cognitive_head.py`/`sigmoid_head.py`/`amp_codec.py` сохранены как доп. модули, зеркальным
+  core не используются). `scripts/`/`notebooks/`: добавлены версии основного ПОВЕРХ
+  Mini-инструментов (Mini-специфичные `sim_*`/`debug_*`/`colab_mini.ipynb` восстановлены,
+  чтобы не потерять инструменты симуляции).
 - Проверка (py -3.12, маленький cfg D=64/n_layers=4): импорт OK; `intent_bridge=True`;
   `_tau_l_dev`/`_tau_intent_dev` на месте (shape (4,)); прямой проход (1,32,64)+`compute_loss`
   работают. `Mini/train.py` уже содержал обработку aux-лоссов (`intent_tau`/`w_m2v` в bypass_keys)
