@@ -3561,3 +3561,12 @@ print('WINTENT_GRAD', 'NONE' if g is None else round(g.norm().item(), 3))
   optimizer.param_groups и не зануляется clip_grad_norm_).
 
 Пока не пофикшено — мост не даёт вклада; модель учится БЕЗ него.
+
+**ROOT CAUSE найден (2026-08-26):** \GradientClipper.clip\ (AGC) обнуляет градиент
+нулевых весов: при \||theta||=0\ формула \g *= c*||theta||/(||g||+eps)\ даёт 0.
+Мост (w_intent/b_intent/w_sal — все zero-init для checkpoint-совместимости) +
+\_tau_l_dev\/\_tau_intent_dev\ навсегда убиты AGC. Это почему intent_w=0 и
+\мост заработал\ ложно. ФИКС: в \clip()\ добавлен \if p_norm < eps: continue\
+(commit 201b6c2). Требует перезапуска Colab-runtime, чтобы core.adaptation
+перезагрузился. С фиксом w_intent проверенно двигается (0.0->0.0195 даже с
+clipper.clip в живом цикле).
