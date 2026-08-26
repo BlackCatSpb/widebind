@@ -200,13 +200,20 @@ class GroupedCognitiveMirror(nn.Module):
         # Residual variance EMA for adaptive tau (self-organizing timescales)
         self.register_buffer('_residual_var_ema', torch.ones(G, k) * 0.1, persistent=False)
         
-        # ─── Per-expert learned modulation (геометрическая init по φ) ───
-        # skip_alpha: L0≈17, L31≈0.10 (из чекпоинта step 50000)
-        # ρ=0.6: сенсорный слой L0≈17, глубокий L31≈0.10
+        # ─── Per-expert learned modulation ───
+        # skip_alpha: uniform init 0 → exp(0)=1 (tanh(linear)+linear).
+        # Старый градиент L0≈17 / L31≈0.10 УБРАН — это корень коллапса
+        # эффективной глубины (L0 доминирует, глубина «спит»). Параметр
+        # оставлен (checkpoint-safe), но без межслойного перекоса.
+        self.log_skip_alpha = nn.Parameter(torch.zeros(G))
+        # ─── SMF: Sequential-Modulated Fusion gate (scoped to mirror) ───
+        # Два пути: P = h (последовательный, RMS=1), T = mirror (параллельный).
+        # α = σ(einsum(cat([h̄, T̄]), W_α) + b_α) ∈ [0,1]^(B,L,G);
+        # hℓ₊₁ = hℓ + α·Tℓ.  b_α=0 → uniform 0.5 (без L0-перекоса).
+        self.w_alpha = nn.Parameter(torch.zeros(self.G, 2 * self.d))
+        self.b_alpha = nn.Parameter(torch.zeros(self.G))
+        # mod_scale: L0≈-0.81, L31≈-2.30 (геометрия init; rho=0.6**layer_idx)
         rho = 0.6 ** layer_idx
-        log_skip_init = math.log(0.10) + (math.log(17.0) - math.log(0.10)) * rho
-        self.log_skip_alpha = nn.Parameter(torch.full((G,), log_skip_init))
-        # mod_scale: L0≈-0.81, L31≈-2.30 (из чекпоинта)
         log_mod_init = -2.30 + (-0.81 - (-2.30)) * rho
         self.log_dvar_mod_scale = nn.Parameter(torch.full((G,), log_mod_init))
         self.log_grad_mod_scale = nn.Parameter(torch.full((G,), log_mod_init))
@@ -533,7 +540,18 @@ class GroupedCognitiveMirror(nn.Module):
         delta_norm = delta.norm(dim=-1).mean(dim=(0, 1)).detach().clamp(min=1e-8)  # (G,)
         adapt_scale = (1.0 / (1.0 + 0.1 * delta_norm)).view(1, 1, -1, 1)  # (1, 1, G, 1)
         mirror = mirror * torch.exp(self.log_scale) * adapt_scale
-        
+
+        # ─── SMF gate (scoped to mirror only) ───
+        # Убирает доминирование L0: α зависит от h (последовательный путь)
+        # и от mirror (параллельный путь); deep-слои могут «открыться».
+        _hg = h.reshape(B, L, G, d)
+        _hn = torch.nn.functional.normalize(_hg, dim=-1)
+        _mn = torch.nn.functional.normalize(mirror, dim=-1)
+        _gin = torch.cat([_hn, _mn], dim=-1)              # (B, L, G, 2d)
+        alpha = torch.sigmoid(torch.einsum('blgk,gk->blg', _gin, self.w_alpha) + self.b_alpha)
+        self._cached_alpha = alpha.detach()
+        mirror = mirror * alpha.unsqueeze(-1)
+
         # ─── K-Space Gate (per-token, per-expert) ───
         gate_signal = torch.abs(pred_error)  # (B, L, G, k)
         gate_logits = torch.einsum('blgk,gk->blg', gate_signal, self.w_gate) + self.b_gate
@@ -552,6 +570,20 @@ class GroupedCognitiveMirror(nn.Module):
             gate_logits = gate_logits + intent_gate
         # Salience (word importance from output) -> per-expert gate bias.
         if salience is not None and self._intent_bridge:
+            Lg = gate_logits.shape[1]
+            if salience.shape[1] != Lg:
+                # In recurrent/autoregressive generation `_last_salience` carries the
+                # previous step's sequence length (S), which differs from the current
+                # forward length (L). Align it: keep the last L positions, or broadcast
+                # the (single/newest) salience across positions. No-op in training (S==L).
+                if salience.dim() == 2:
+                    salience = salience.unsqueeze(-1)
+                if salience.shape[1] >= Lg:
+                    salience = salience[:, -Lg:, :]
+                else:
+                    reps = Lg - salience.shape[1]
+                    last = salience[:, -1:, :].expand(-1, reps, -1)
+                    salience = torch.cat([salience, last], dim=1)
             gate_logits = gate_logits + salience * self.w_sal.view(1, 1, -1)
         # Contradiction signal: expert vs collective disagreement opens gate (arbiter)
         if self._has_private_mem:

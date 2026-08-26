@@ -462,12 +462,12 @@ class WideBindBlock(nn.Module):
             h = h + (h_dct @ self.V_dct).to(h.dtype)
         if _chk(h, 'spectral'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         
-        # ─── MLP (per-group modulation by mlp_mod) ───
-        h_mlp = self.mlp(h)
+        # ─── MLP (mirror-conditioned SwiGLU, variant A) ───
+        # mirror_gate = mlp_mod (из зеркала) управляет воротами SwiGLU.
+        # Старый пост-множитель h_mlp *= mlp_mod убран (двойное гейтирование).
+        h_mlp = self.mlp(h, mirror_gate=mlp_mod)
         self._cache_mlp_out = h_mlp  # raw MLP output (gradalign target source)
         if _chk(h_mlp, 'mlp_out'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
-        mm2 = mlp_mod.unsqueeze(-1)  # (B, L, G, 1)
-        h_mlp = (h_mlp.reshape(B, L, g, d) * mm2).reshape(B, L, D)
         h = h + h_mlp
         if _chk(h, 'post_mlp'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         

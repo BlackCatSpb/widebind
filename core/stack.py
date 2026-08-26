@@ -1399,7 +1399,7 @@ class MirrorLRScheduler:
             mag_factor = min(1.0, max(0.2, 1.0 / max(mag_ratio, 1e-10)))
 
             mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
-            mult = max(0.05, min(1.0, mirror_mult))
+            mult = max(0.2, min(1.0, mirror_mult))
             if hasattr(self, '_loss_lr_factor'):
                 mult = mult * self._loss_lr_factor
             self._update_ls_mult()

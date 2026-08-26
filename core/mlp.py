@@ -40,8 +40,14 @@ class GroupedMLP(nn.Module):
             self.W_up = nn.Parameter(torch.randn(groups, d, e * d) * up_std)
             self.W_down = nn.Parameter(torch.randn(groups, e * d, d) * down_std)
         self.norm_w = nn.Parameter(torch.ones(D))
+        # ─── Variant A: mirror-conditioned SwiGLU ───
+        # Когнитивное (зеркало) управление воротами ассоциативного MLP.
+        # gate = silu(W_gate·h) · (a + b·mirror_gate). init a=1, b=0 → чистый
+        # SwiGLU при init; b растёт, обучая MLP откликаться на сигнал зеркала.
+        self.mlp_gate_a = nn.Parameter(torch.ones(1))
+        self.mlp_gate_b = nn.Parameter(torch.zeros(1))
 
-    def forward(self, h):
+    def forward(self, h, mirror_gate=None):
         B, L, D = h.shape
         h = self.norm_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
         h = h.reshape(B, L, self.G, self.d)
@@ -51,6 +57,14 @@ class GroupedMLP(nn.Module):
         hg = h.permute(2, 0, 1, 3).reshape(self.G, BL, self.d)  # (G, BL, d)
         if self.swiglu:
             gate = F.silu(torch.matmul(hg, self.W_gate))  # (G, BL, f)
+            if mirror_gate is not None:
+                # mirror_gate: (B, L, G) → (G, BL, 1) — когнитивное управление
+                mg = mirror_gate.float()
+                if mg.dim() == 3:
+                    mg = mg.permute(2, 0, 1).reshape(self.G, BL, 1)
+                else:
+                    mg = mg.reshape(self.G, BL, 1)
+                gate = gate * (self.mlp_gate_a + self.mlp_gate_b * mg)
             up = torch.matmul(hg, self.W_up)              # (G, BL, f)
             hf = (gate * up).permute(1, 0, 2).reshape(B, L, self.G, -1)
         else:
