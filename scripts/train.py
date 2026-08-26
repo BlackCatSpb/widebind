@@ -518,8 +518,8 @@ def train(cfg=None, resume_path=None):
                     torch.save({
                         'step': step,
                         'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'param_names': _opt_param_names(model),
+                        'optimizer': optimizer.state_dict() if not args.no_save_optimizer else None,
+                        'param_names': _opt_param_names(model) if not args.no_save_optimizer else None,
                         'scheduler': scheduler.state_dict(),
                         'best_val_loss': best_val_loss,
                         'cfg': cfg,
@@ -534,8 +534,8 @@ def train(cfg=None, resume_path=None):
                 torch.save({
                     'step': step,
                     'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'param_names': _opt_param_names(model),
+                    'optimizer': optimizer.state_dict() if not args.no_save_optimizer else None,
+                    'param_names': _opt_param_names(model) if not args.no_save_optimizer else None,
                     'scheduler': scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                     'cfg': cfg,
@@ -549,8 +549,8 @@ def train(cfg=None, resume_path=None):
         torch.save({
             'step': step,
             'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'param_names': _opt_param_names(model),
+            'optimizer': optimizer.state_dict() if not args.no_save_optimizer else None,
+            'param_names': _opt_param_names(model) if not args.no_save_optimizer else None,
             'scheduler': scheduler.state_dict(),
             'best_val_loss': best_val_loss,
             'cfg': cfg,
@@ -627,6 +627,8 @@ if __name__ == '__main__':
     parser.add_argument('--traj-gain', type=float, default=0.05, help='Manifold: РјР°СЃС€С‚Р°Р± РІРєР»Р°РґР°')
     parser.add_argument('--reset-skip-alpha', action='store_true',
                         help='Zero log_skip_alpha in all mirror layers after resume (SMF L0-depth fix)')
+    parser.add_argument('--no-save-optimizer', action='store_true',
+                        help='Do NOT save optimizer state in checkpoints (avoids resume OOM on <=16GB GPU)')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
