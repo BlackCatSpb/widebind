@@ -4,6 +4,7 @@ WideBind training: streaming from token_stream_{GENRE}.bin files.
 
 import os, sys, math, time, json, glob, pickle
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.dirname(__file__))
 import torch
 from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
@@ -12,11 +13,23 @@ from torch.serialization import add_safe_globals
 
 from core import WideBindConfig, WideBindStack, MirrorLRScheduler
 try:
-    from analyze_checkpoint import generate_report
-except ImportError:
-    from scripts.analyze_checkpoint import generate_report
+    from analyze import save_html_report as generate_report
+except Exception:
+    # Report generation is optional; training must run without it.
+    generate_report = lambda *a, **k: None
 
 add_safe_globals([WideBindConfig])
+
+
+def _detach_state(st):
+    """Recursively detach a (possibly nested) state structure of tensors."""
+    if st is None:
+        return None
+    if isinstance(st, torch.Tensor):
+        return st.detach()
+    if isinstance(st, (list, tuple)):
+        return type(st)(_detach_state(x) for x in st)
+    return st
 
 
 class TokenStream:
@@ -170,9 +183,20 @@ def train(cfg=None, resume_path=None):
     model._phase_ratio_ema = [0.0] * cfg.n_layers
     model._phase_ratio_std = [1.0] * cfg.n_layers
     
-    # Optimizer
-    param_groups = model.param_groups()
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
+    # Optimizer (LLRD) + cosine warmup + progressive unfreeze + watchdog (anti-collapse)
+    from core.training_guard import (build_optimizer, CosineWarmup, ReadinessActivator,
+                                     Watchdog, set_active_depth)
+
+    def _make_opt(lr):
+        return build_optimizer(model, lr, llrd_decay=cfg.llrd,
+                               weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+
+    optimizer = _make_opt(cfg.lr)
+    activator = ReadinessActivator(model, init_active_layers=cfg.init_active_layers,
+                                   stage_steps=cfg.stage_steps, readiness_full=cfg.readiness_full,
+                                   mode=cfg.stage_mode)
+    watchdog = Watchdog(model, _make_opt, os.path.join(cfg.save_dir, 'best.pt'),
+                        cfg.lr, cfg.watchdog_ce, cfg.recover_lr_mult, cfg.recover_max)
 
     # AMP (Automatic Mixed Precision)
     use_amp = getattr(cfg, 'use_amp', False) and device == 'cuda'
@@ -180,17 +204,10 @@ def train(cfg=None, resume_path=None):
     if use_amp:
         print('  AMP: ON (mixed precision)')
 
-    # Scheduler: mirror-adaptive or cosine
-    if cfg.scheduler == 'mirror':
-        scheduler = MirrorLRScheduler(model, optimizer, cfg.lr,
-            warmup=cfg.warmup_steps, target_var=cfg.target_var,
-            mag_threshold=cfg.mag_threshold, lr_min_ratio=cfg.lr_min_ratio,
-            max_decay_steps=cfg.max_decay_steps,
-            var_min_for_lr_decay=cfg.var_min_for_lr_decay)
-        print(f'Scheduler: MirrorLRScheduler (target_var={cfg.target_var}, mag_threshold={cfg.mag_threshold})')
-    else:
-        scheduler = create_lr_scheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr)
-        print(f'Scheduler: cosine decay')
+    # Scheduler: cosine warmup (LLRD base lrs preserved)
+    scheduler = CosineWarmup(optimizer, cfg.warmup_steps, cfg.max_steps)
+    print(f'Scheduler: cosine warmup + LLRD(={cfg.llrd}) + progressive unfreeze '
+          f'(init={cfg.init_active_layers}, mode={cfg.stage_mode}) + watchdog(ce>{cfg.watchdog_ce})')
     
     # Resume
     start_step = 0
@@ -224,25 +241,17 @@ def train(cfg=None, resume_path=None):
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
             print(f'  Unexpected keys (old arch): {len(unexpected)}')
-        if not _restore_optimizer(optimizer, model, ckpt['optimizer']):
-            print('  WARNING: optimizer state could not be restored (fresh Adam)')
-        if 'scheduler' in ckpt:
-            sched_sd = ckpt['scheduler']
-            if sched_sd.get('type') == 'MirrorLRScheduler':
-                scheduler.load_state_dict(sched_sd)
-            elif cfg.scheduler == 'mirror':
-                # Switching from cosine to mirror вЂ” use step only
-                scheduler._step = ckpt['step']
-                print(f'  Switched to MirrorLRScheduler at step {ckpt["step"]}')
-            else:
-                scheduler.load_state_dict(sched_sd)
-        else:
-            if cfg.scheduler == 'mirror':
-                scheduler._step = ckpt['step']
-            else:
-                scheduler.last_epoch = ckpt['step'] + 1
-                for pg, lr in zip(optimizer.param_groups, scheduler.get_lr()):
-                    pg['lr'] = lr
+        # Fresh optimizer/scheduler (NO momentum restore) — avoids resume-OOM &
+        # Adam momentum runaway that caused the step-~1000 CE collapse.
+        optimizer = _make_opt(cfg.lr)
+        scheduler = CosineWarmup(optimizer, cfg.warmup_steps, cfg.max_steps)
+        scheduler.set_step(ckpt['step'])
+        activator = ReadinessActivator(model, init_active_layers=cfg.init_active_layers,
+                                       stage_steps=cfg.stage_steps, readiness_full=cfg.readiness_full,
+                                       mode=cfg.stage_mode)
+        watchdog = Watchdog(model, _make_opt, os.path.join(cfg.save_dir, 'best.pt'),
+                            cfg.lr, cfg.watchdog_ce, cfg.recover_lr_mult, cfg.recover_max)
+        print('  Optimizer/scheduler rebuilt FRESH (no momentum restore)')
         start_step = ckpt['step']
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
     reasoning_enabled_step = ckpt.get('reasoning_enabled_step', 0) if resume_path and os.path.exists(resume_path) else 0
@@ -299,9 +308,21 @@ def train(cfg=None, resume_path=None):
             # в”Ђв”Ђв”Ђ Forward (with optional AMP) в”Ђв”Ђв”Ђ
             with autocast('cuda', enabled=use_amp):
                 h = model.embed_tokens(x)
-        out, state, gs, _ = model(h, state, global_state=gs, step=step)
-        model.observe_output(out)  # salience of THIS step -> next step's intent
+            out, state, gs, _ = model(h, state, global_state=gs, step=step)
+            model.observe_output(out)  # salience of THIS step -> next step's intent
             ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
+
+            ce_val = ce_loss.item()
+            # Progressive unfreeze (meta-readiness driven)
+            activator.update(step)
+            # Watchdog: CE explosion -> rollback to last healthy + fresh Adam
+            if watchdog.check(ce_val, step):
+                optimizer = watchdog.optimizer
+                scheduler = CosineWarmup(optimizer, cfg.warmup_steps, cfg.max_steps)
+                scheduler.set_step(step)
+                optimizer.zero_grad(set_to_none=True)
+                model.zero_grad(set_to_none=True)
+                continue
 
             # ── Gradient-reactive governance loss (prototype) ──────────────
             # Open the MLP gate where the MLP output actually changes the CE loss:
@@ -335,7 +356,7 @@ def train(cfg=None, resume_path=None):
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
                 raise RuntimeError(f'NaN/Inf CE loss at step {step}')
             
-            state = tuple(s.detach() for s in state) if state is not None else None
+            state = _detach_state(state)
             if gs is not None:
                 gs = gs.detach()
             
@@ -600,7 +621,20 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--seq-len', type=int, default=128)
     parser.add_argument('--n-layers', type=int, default=24)
-    parser.add_argument('--bottleneck', type=int, default=896)
+    parser.add_argument('--D', type=int, default=4096, help='model width')
+    parser.add_argument('--vocab', type=int, default=50000)
+    parser.add_argument('--mirror-k', type=int, default=32)
+    parser.add_argument('--grad-clip', type=float, default=0.5)
+    parser.add_argument('--llrd', type=float, default=0.9, help='layer-wise LR decay per depth (deeper=smaller LR)')
+    parser.add_argument('--init-active-layers', type=int, default=8, help='blocks trained from step 0 (rest frozen)')
+    parser.add_argument('--stage-steps', type=int, default=15000, help='unlock next block every N steps (backstop)')
+    parser.add_argument('--readiness-full', type=float, default=0.6, help='meta-maturity (differentiation) to unlock deepest block')
+    parser.add_argument('--stage-mode', type=str, default='readiness', choices=['readiness', 'fixed'])
+    parser.add_argument('--watchdog-ce', type=float, default=15.0, help='CE above this => rollback + fresh Adam')
+    parser.add_argument('--recover-lr-mult', type=float, default=0.5)
+    parser.add_argument('--recover-max', type=int, default=20)
+    parser.add_argument('--no-grad-ckpt', action='store_true',
+                        help='Disable gradient checkpointing (avoids CheckpointError if recompute mismatches)')
     parser.add_argument('--bind-K', type=int, default=64)
     parser.add_argument('--mlp-groups', type=int, default=8)
     parser.add_argument('--mlp-expand', type=int, default=8)
@@ -637,26 +671,35 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         n_layers=args.n_layers,
-        bottleneck=args.bottleneck,
+        D=args.D,
+        vocab=args.vocab,
+        mirror_k=args.mirror_k,
         bind_K=args.bind_K,
         mlp_groups=args.mlp_groups,
         mlp_expand=args.mlp_expand,
         lr=args.lr,
+        grad_clip=args.grad_clip,
+        llrd=args.llrd,
+        init_active_layers=args.init_active_layers,
+        stage_steps=args.stage_steps,
+        readiness_full=args.readiness_full,
+        stage_mode=args.stage_mode,
+        watchdog_ce=args.watchdog_ce,
+        recover_lr_mult=args.recover_lr_mult,
+        recover_max=args.recover_max,
         max_steps=args.max_steps,
         warmup_steps=args.warmup,
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         scheduler=args.scheduler,
-        per_layer_ls_lr=args.per_layer_ls_lr,
-        amp_codec=(args.head == 'codec'),
-        amp_obj=args.amp_obj,
-        amp_pred=not args.no_amp_pred,
+        per_layer_ls_lr=False,
         traj_manifold=args.traj_manifold,
         traj_beams=args.traj_beams,
         traj_buffer_size=args.traj_buffer,
         traj_gain=args.traj_gain,
         reset_skip_alpha=args.reset_skip_alpha,
+        gradient_checkpointing=(not args.no_grad_ckpt),
     )
     
     train(cfg, resume_path=args.resume)

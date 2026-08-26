@@ -121,6 +121,16 @@ class WideBindConfig:
     gate_lr_mult: float = 5.0
     lambda_lr_hierarchy: bool = True  # True = LR mult по степеням λ_d^p
 
+    # Optimizer hardening / progressive unfreeze (anti-collapse guard)
+    llrd: float = 0.9              # layer-wise LR decay per depth (deeper => smaller LR)
+    init_active_layers: int = 8    # blocks trainable from step 0 (rest frozen at init)
+    stage_steps: int = 15000       # fixed backstop: unlock next block every N steps
+    readiness_full: float = 0.6    # meta-maturity (differentiation) that unlocks deepest block
+    stage_mode: str = 'readiness'  # 'readiness' (meta-driven) or 'fixed' (schedule only)
+    watchdog_ce: float = 15.0      # CE above this => rollback to best.pt + fresh Adam
+    recover_lr_mult: float = 0.5   # LR multiplier applied on each recovery
+    recover_max: int = 20          # abort after this many recoveries
+
     # w_m2v hierarchy by τ (Proposal IV)
     w_m2v_hierarchy_target: float = 1.0  # m — max target for deep layers
     w_m2v_hierarchy_weight: float = 0.01  # λ_weight for w_m2v regularisation (drives _tau_l_dev adaptation)

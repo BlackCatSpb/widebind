@@ -3278,3 +3278,38 @@ pred aux вырос 0.03->0.46 (предсказательное зеркало 
 прошлом коллапс-прогоне, где pred был ~0.20 к моменту взрыва).
 step_987.pt теперь валидный чекпоинт (в отличие от битого прошлого).
 mod_mlp 0.634->0.608 — MLP ещё «не проснулся» (гипотеза: сначала метаядро).
+## ИНТЕЛЛЕКТУАЛЬНЫЙ МЕТОД ПРОТИВ КОЛЛАПСА (решение пользователя)
+
+Коллапс ПОВТОРИЛСЯ на ~step 1210 (run @699, fresh Adam). Вывод:
+- fresh Adam только ОТСРОЧИЛ (932->1210) => корень НЕ только momentum, а СТАДИЯ
+  весов (~step 1000-1200). aux стабильны, ce/логиты взрываются => положительная
+  обратная связь в residual/mirror-пути (рост нормы по глубине 24 слоёв).
+- Пользователь: последовательное включение слоёв И/ИЛИ правка оптимизатора.
+  Уточнение: слои активируются где метакогнитивный слой СОЗРЕЛ (сигнал готовности).
+
+РЕАЛИЗОВАНО (core/training_guard.py + scripts/train.py):
+1) LLRD: lr = base * role_mult * llrd^depth. Глубокие слои -> меньше LR =>
+   демпфирование роста residual-стрима (корень взрыва).
+2) Прогрессивный unfreeze ПО ЗРЕЛОСТИ МЕТА-ЯДРА (ReadinessActivator): слои [0,k)
+   активны сразу, остальные заморожены. Блок i активируется когда meta-maturity
+   (AdaptiveController differentiation = дисперсия log_scale зеркал) >= порога,
+   ИЛИ по расписанию (stage_steps, backstop). Метрика зрелости = готовность
+   метакогнитивного слоя => слои онлайнятся по мере созревания ядра.
+3) grad_clip (уже в cfg, теперь применяется) — режет градиентный выброс в корне.
+4) Watchdog: ce > watchdog_ce => rollback к best.pt + FRESH Adam (LLRD) + LR*0.5.
+   Самовосстанавливающийся 300k-прогон.
+5) CosineWarmup (сохраняет LLRD-базу) вместо старых scheduler.
+
+ПОЧИНЕН train.py (был НЕРАБОЧИМ — гнали ноутбук): убран баг bottleneck=, фикс
+импорта analyze_checkpoint, amp-поля, indent-ошибка, detach state; добавлены CLI:
+--D --vocab --mirror-k --grad-clip --llrd --init-active-layers --stage-steps
+--readiness-full --stage-mode --watchdog-ce --recover-lr-mult --recover-max
+--no-grad-ckpt. Smoke (tiny model, 12 steps) прошёл; watchdog-rollback протестирован.
+
+КОМАНДА (Colab, клон репо):
+  python scripts/train.py --data-dir /content/drive/.../streams \
+    --D 2560 --n-layers 24 --vocab 65536 --mirror-k 32 --batch-size 1 --seq-len 256 \
+    --lr 1e-4 --max-steps 300000 --grad-clip 1.0 --llrd 0.9 \
+    --init-active-layers 8 --stage-steps 15000 --watchdog-ce 15 \
+    --scheduler cosine --no-save-optimizer
+  (если CheckpointError от gradient_checkpointing — добавить --no-grad-ckpt)
