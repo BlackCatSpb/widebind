@@ -490,7 +490,14 @@ class LossBalancer:
         ``parameters``: iterable of model parameters.  Caller must NOT also call
         ``loss.backward()``.
         """
-        params = list(parameters)
+        # Only differentiate w.r.t. parameters that actually require grad.
+        # Progressive unfreezing freezes deep blocks (requires_grad=False);
+        # passing them to autograd.grad as inputs raises
+        # "One of the differentiated Tensors does not require grad".
+        params = [p for p in parameters if p.requires_grad]
+        if not params:
+            ce_loss.backward(retain_graph=retain_graph)
+            return
         ce_grads = torch.autograd.grad(ce_loss, params, retain_graph=True,
                                        allow_unused=True)
         aux_tensors = [v for v in aux_dict.values() if isinstance(v, torch.Tensor)]
