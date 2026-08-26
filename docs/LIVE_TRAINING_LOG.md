@@ -3237,3 +3237,27 @@ step_987.pt сохранён внутри коллапса — НЕ исполь
  SMF w_alpha~0/b_alpha~0). Файл под .gitignore (рядом с чекпоинтом) — в репо не коммитится.
 
 [буду дописывать сюда каждый новый сегмент лога]
+## RESUME @699 (fresh Adam, OOM-fix) — step 699 -> 932+  [ПРОШЁЛ зону коллапса]
+
+Предыстория: первый запуск (с нуля) collapSED на step 932 (val 89.4, ce 46->82).
+Резюм с best.pt@699 упал на OOM (optimizer-state blob на 15GB GPU).
+Фикс: torch.load(map_location='cpu') + ckpt['optimizer']=None (fresh Adam).
+Репозиторий: notebooks/widebind_colab.ipynb @ e7f3a46 + f0ca455 (+ train.py --no-save-optimizer).
+
+Траектория (после резюма, fresh Adam):
+  EVAL step 699: val=11.1547 (ppl 69894)  [отличается от 10.9046 => вероятно др. eval-батч, не веса]
+  step 715: ce=10.9133 mod_mlp=0.634  (diversity ВСПЛЕСК 12.56 -> next step 0.07, транзиент)
+  step 770: ce=10.8698 mod_mlp=0.632
+  step 825: ce=10.9006 mod_mlp=0.629
+  step 880: ce=10.7357 mod_mlp=0.625  [ЛУЧШИЙ train ce]
+  EVAL step 932: val=10.8843 (ppl 53330)  *** ПРОШЁЛ зону коллапса (было 89.4) ***
+
+ВЫВОД: коллапс первого запуска = Adam momentum runaway (накопленная скорость
+усилила градиентный выброс ~step 900). Fresh Adam сбросил momentum => 699->932
+прошёл здорово. Архитектура SMF+variant A ЗДОРОВА — НЕ системный дефект.
+
+НО: momentum пересобирается. К ~step 1400+ (эквивалент накопления) риск повтора
+остаётся => grad-clip / LR-cap / откат при ce>15 всё ещё желательны как страховка
+(не срочно, но для длинного прогона нужны).
+
+val 10.8843 = НОВЫЙ BEST (было 10.9046@699, 10.9133@466). Train ce 10.7357@880 = лучший.
