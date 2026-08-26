@@ -224,7 +224,27 @@ class WideBindStack(nn.Module):
                 pred_scale_mod = None
             
             gs_i = global_state[i:i+1].detach().clone()  # (1, 1, D), no grad through global_state (EMA-only)
-            intent_i = intent_streams[i].detach().clone() if self.intent_bridge else None
+            # Intent Bridge: derive this layer's intent from its INPUT hidden state
+            # BEFORE the block so the bridge gate computed inside the block carries
+            # gradient back into intent_probe. (The old .detach() froze the probe:
+            # it must stay trainable as the layer params evolve.) The carried
+            # intent_streams[i] is detached (saved per-step at the end of forward),
+            # so only local_intent (probe) contributes gradient — no cross-step BPTT.
+            intent_i = None
+            if self.intent_bridge:
+                _lf = i / max(n_layers - 1, 1)
+                _dev_i = torch.tanh(self._tau_intent_dev[i])
+                _tau_i = tau_min * (tau_max / tau_min) ** (_lf * (1.0 + 0.1 * _dev_i))
+                _alpha_i = torch.clamp(1.0 - c_ema / _tau_i, min=0.0)
+                _ki = self.layers[i].mirror.k
+                local_intent = self.intent_probe(h).reshape(
+                    h.shape[0], h.shape[1], self._n_experts, self._K_max) \
+                    [:, :, :, :_ki].mean(dim=(0, 1), keepdim=True)  # (1,1,G,k_i)
+                if self._last_salience is not None:
+                    _sw = self._last_salience.mean().clamp(min=1e-3)
+                    local_intent = local_intent * _sw
+                intent_streams[i] = _alpha_i * intent_streams[i] + (1.0 - _alpha_i) * local_intent
+                intent_i = intent_streams[i]
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
                 _saved_pen = layer.mirror._cached_pred_error_norm
@@ -261,10 +281,7 @@ class WideBindStack(nn.Module):
                 dev = torch.tanh(self._tau_l_dev[i])
                 tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
                 alpha_l = torch.clamp(1.0 - c_ema / tau_l, min=0.0)
-                # Separate tau-ladder for the Intent Bridge context integration
-                dev_intent = torch.tanh(self._tau_intent_dev[i])
-                tau_intent_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev_intent))
-                alpha_intent_l = torch.clamp(1.0 - c_ema / tau_intent_l, min=0.0)
+                # (intent tau now computed before the block; see intent_i setup above)
                 # Weighted combination of scales для global state
                 w = torch.sigmoid(layer.scale_w)  # (S, D), per-channel independent
                 if S < S_expected:
@@ -277,17 +294,8 @@ class WideBindStack(nn.Module):
                     global_state[i:i+1] = gs_i + (1.0 - alpha_l.detach()) * self._gs_velocity[i:i+1]
                 else:
                     global_state[i:i+1] = alpha_l * gs_i + (1.0 - alpha_l) * mem_avg
-                if self.intent_bridge:
-                    ki = self.layers[i].mirror.k
-                    local_intent = self.intent_probe(h).reshape(
-                        h.shape[0], h.shape[1], self._n_experts, self._K_max) \
-                        [:, :, :, :ki].mean(dim=(0, 1), keepdim=True)  # (1,1,G,k_i) per-head
-                    if self._last_salience is not None:
-                        # Word-importance (from previous step's sigmoid output field)
-                        # scales how strongly the current context enters the stream.
-                        _sw = self._last_salience.mean().clamp(min=1e-3)
-                        local_intent = local_intent * _sw
-                    intent_streams[i] = alpha_intent_l * intent_streams[i] + (1.0 - alpha_intent_l) * local_intent
+                # (intent_streams now updated BEFORE the block so intent_probe
+                #  receives gradient; see the intent_i setup above the forward.)
                 s_out = tuple(t.detach() if t is not None else None for t in s_out)
             new_state.append(s_out)
             if self.intent_bridge:
