@@ -703,17 +703,25 @@ def run_anomaly(live, wake, ckpt):
 
 # ─────────────────────────── GRAD INFO ───────────────────────────
 
-def _flat_grad_stats(params, grad_map):
-    dot = nce = ndiv = 0.0
+def _grad_cos(params, map_a, map_b):
+    """Proper cosine similarity of two gradient sets, computed over the params
+    that have BOTH gradients (None entries from ``allow_unused`` are skipped).
+
+    Returns ``(cos, ||a||, ||b||, <a,b>)`` where ``<a,b> = Σ_p g_a·g_b`` is the
+    true dot product (NOT a sum of squared norms)."""
+    a2 = b2 = dot = 0.0
     for p in params:
-        g = grad_map.get(id(p))
-        if g is None:
+        ga = map_a.get(id(p))
+        gb = map_b.get(id(p))
+        if ga is None or gb is None:
             continue
-        g = g.flatten()
-        dot += float(g @ g)
-        nce += float((g ** 2).sum())
-    n = math.sqrt(nce)
-    return n, dot
+        ga = ga.flatten().float()
+        gb = gb.flatten().float()
+        a2 += float((ga * ga).sum())
+        b2 += float((gb * gb).sum())
+        dot += float((ga * gb).sum())
+    na, nb = math.sqrt(a2), math.sqrt(b2)
+    return (dot / (na * nb)) if na > 0 and nb > 0 else 0.0, na, nb, dot
 
 
 def run_grad_info(model, ce_loss, aux):
@@ -738,13 +746,9 @@ def run_grad_info(model, ce_loss, aux):
         ce_grads = torch.autograd.grad(ce_loss, model.parameters(), allow_unused=True)
         map_ce = {id(p): g for p, g in zip(model.parameters(), ce_grads)}
         map_div = {id(p): g for p, g in zip(model.parameters(), div_grads)}
-        n_ce, dot = _flat_grad_stats(model.parameters(), map_ce)
-        n_div, _ = _flat_grad_stats(model.parameters(), map_div)
-        cos = dot / math.sqrt(n_ce * n_div) if n_ce > 0 and n_div > 0 else 0.0
+        cos, n_ce, n_div, dot = _grad_cos(model.parameters(), map_ce, map_div)
+        cos16, n_ce16, n_div16, _ = _grad_cos(model.layers[16].parameters(), map_ce, map_div)
         scale = max(0.0, min(10.0, cos)) * n_ce / max(n_div, 1e-8)
-        n_ce16, dot16 = _flat_grad_stats(model.layers[16].parameters(), map_ce)
-        n_div16, _ = _flat_grad_stats(model.layers[16].parameters(), map_div)
-        cos16 = dot16 / math.sqrt(n_ce16 * n_div16) if n_ce16 > 0 and n_div16 > 0 else 0.0
         info.update(cos_global=cos, cos_l16=cos16, scale=scale,
                     n_ce=n_ce, n_div=n_div, diversity_aux=div.item())
         print(f'  diversity aux={div.item():.3f}')

@@ -3313,3 +3313,85 @@ mod_mlp 0.634->0.608 — MLP ещё «не проснулся» (гипотез�
     --init-active-layers 8 --stage-steps 15000 --watchdog-ce 15 \
     --scheduler cosine --no-save-optimizer
   (если CheckpointError от gradient_checkpointing — добавить --no-grad-ckpt)
+
+---
+
+## Новый прогон (2026-08-26): единый адаптивный модуль `core/adaptation`
+
+> Это СВЕЖИЙ старт с нуля на новом, математически обоснованном адаптивном
+> модуле. Предыдущие записи (Run A/B, коллапсы, tau-расследования) — история;
+> текущий прогон идёт на `core.adaptation` и fp32.
+
+### Что изменилось (рефакторинг)
+- Вся адаптация сведена в ОДИН модуль `core/adaptation.py` (без маг. чисел):
+  `LossBalancer` (PCGrad/GradNorm + spectral alignment), `DepthController`
+  (plateau EWMA+σ), `LRController` (warmup + MirrorLRScheduler + rewind),
+  `FailureDetector` (3σ относительный + min_consecutive), `GradientClipper`
+  (AGC, Brock 2021), `build_optimizer` (LLRD, Devlin 2019).
+- `compute_losses` теперь возвращает **RAW aux** (убраны `*w_*`); единственный
+  источник взвешивания — `LossBalancer`. Это устранило коренную дивергенцию
+  (aux `ranking` ~21850 душил CE).
+- `core/training_guard.py` → shim re-export; `scripts/train.py` и оба ноутбука
+  переведены на `core.adaptation`.
+- Коммиты: `761bd94` (рефактор), `1accf0d` (fix frozen-params в
+  `balancer.backward`), `ef9d10d` (`math.isfinite` в cell 9).
+
+### Конфиг нового прогона (`notebooks/colab.ipynb`, cell 4)
+- D=2560, n_layers=24, bind_K=32, vocab=65536, mask_eos=False, head sigmoid_coded.
+- scheduler='mirror', per_layer_ls_lr=True (ls_mult 0.5–2.0), warmup_steps=101,
+  eval_interval=233, lr=3e-4.
+- **fp32 (AMP OFF)**, seq_len=256, batch=1 → 256 ток/шаг, max_steps=300000,
+  log_interval=55, save_interval=987.
+- init-active-layers 8 (progressive unfreeze; DepthController раскрывает глубже
+  по plateau).
+
+### Старт обучения (лог пользователя, step 0 → 233)
+- **CE стабилен ~11.45** на всём участке — без взрыва/коллапса (в отличие от
+  ранних fp32-прогонов, где ce улетал в 46–89).
+- `mod_mlp` (sigmoid(mod_scale_mlp)) **ДВИНУЛСЯ: 0.667 → 0.666** — зеркальный
+  гейт получает градиент, модель «жива» (раньше был заморожен в Run B).
+- EVAL step 233: **val_loss=11.3043, val_ppl=81173.49** (чуть выше
+  ln(65536)=11.09 — уровень случая для 233 шагов; ожидаемо).
+- ⚠️ Путь `checkpoints/best.pt` **перезаписан** новым прогоном (1.63 GB, step 233);
+  старый 2.2 GB (step 1165, эпоха Run B) более не актуален.
+
+### Глубокий анализ `best.pt`@233 (`scripts/analyze.py`, 2026-08-26)
+HTML: `checkpoints/best_report.html`. Ключевое (после исправления бага «cos»):
+
+- **NaN/Inf = 0.** `active_depth = 8` (слои 0–7 активны, 8–23 заморожены) —
+  progressive unfreeze работает.
+- **WAKE-DETECTOR: все PASS (verdict OK).** Модель ещё «спит»: MLP
+  W_std=0.0707 (dev +0.0001 к кривой decay), sigmoid(mod_scale_mlp)=0.665,
+  gate max 0.67 (<0.75), slots 35/192, births none, _temp=2.0. На 233 шага — норма.
+- **ANOMALY TRACK: OK.** max ||hp||=3.894 (×1.4 медианы, <10), predMSE max 3.5,
+  gate_min 0.4744 (>0.25), births none. Здорово.
+- **LIVE (forward на случайном входе):** все 24 слоя участвуют; замороженные
+  8–23 консистентны (ls_expM~17000, |mirror| 143→332 по глубине), mod_scale_mlp
+  gate 0.47–0.55.
+- **GRAD INFO:**
+  - `pred` — DEAD (requires_grad=False, детачен в `_pred_cache`) → на обучение
+    не влияет (штатно).
+  - `diversity aux=30.5`, `||gCE||=4.65e5`, `||gDIV||=8.96e5`.
+  - **cos_sim(diversity, CE): global=−0.9997, L16=+0.7301** (после фикса бага —
+    ранее выдавал 57585). Глобально diversity анти-выровнен с CE → LossBalancer
+    его подавит (scale→0); на слое 16 — выровнен. Spectral-alignment работает.
+- **HEAD (на 233 шага модель случайна):** bias-decomp argmax==bias 0/32 (0%);
+  POSMAP top-1~0.001, H~14.3 bit (почти равномерно) → уровень шума, согласуется
+  с val 11.30≈ln(65536). A/B reasoning: FULL чуть снижает энтропию (12.9 vs 14.5
+  bit) — слабый, корректный эффект.
+- **VSA tau [8.01, 517.84]** (~65× лестница) — самоорганизующиеся временны́е
+  шкалы на месте.
+
+### ⚠️ Исправлен баг `scripts/analyze.py` (2026-08-26)
+`run_grad_info` считал «cos_sim» как `||gCE||²/√(...)` (отношение норм), давая
+~57585. Заменено на корректный `_grad_cos` = `Σ(gCE·gDIV)/(||gCE||·||gDIV||)`
+∈ [−1,1]. Перезапуск подтвердил осмысленное значение. `scripts/analyze.py`
+объявлен **ЕДИНСТВЕННЫМ основным анализатором** чекпоинтов (логику не дублировать).
+
+### Вердикт: ЗДОРОВ (старт)
+Свежий прогон на новом `core.adaptation` стартует штатно: без коллапса, без
+зацикливания, CE на уровне случая, активные слои 0–7 двигаются (mod_mlp ожил),
+замороженные корректно исключены из градиента. Модель «спит» (WAKE не
+сработал) — на 233 шага норма. Следующий разбор при новом best.pt (после EVAL
+~466 / раскрытия глубины DepthController-ом).
+
