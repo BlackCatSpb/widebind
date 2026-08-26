@@ -214,6 +214,12 @@ def train(cfg=None, resume_path=None):
         if n_migrated:
             print(f'  MIGRATED {n_migrated} keys (W_out +K, bind_coh_gate=0, freq_scale=1.0) — старое поведение сохранено')
         missing, unexpected = model.load_state_dict(sd, strict=False)
+        if getattr(cfg, 'reset_skip_alpha', False):
+            nzero = 0
+            for layer in model.layers:
+                layer.mirror.log_skip_alpha.data.zero_()
+                nzero += 1
+            print(f'  reset_skip_alpha: zeroed log_skip_alpha in {nzero} mirror layers (SMF L0-fix)')
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
@@ -619,6 +625,8 @@ if __name__ == '__main__':
     parser.add_argument('--traj-beams', type=int, default=0, help='Manifold: С‡РёСЃР»Рѕ Р»СѓС‡РµР№ (0 = Р°РІС‚Рѕ = ceil(sqrt(buffer)))')
     parser.add_argument('--traj-buffer', type=int, default=1024, help='Manifold: Р±СѓС„РµСЂ РїРµСЂРµС…РѕРґРѕРІ')
     parser.add_argument('--traj-gain', type=float, default=0.05, help='Manifold: РјР°СЃС€С‚Р°Р± РІРєР»Р°РґР°')
+    parser.add_argument('--reset-skip-alpha', action='store_true',
+                        help='Zero log_skip_alpha in all mirror layers after resume (SMF L0-depth fix)')
     args = parser.parse_args()
     
     cfg = WideBindConfig(
@@ -646,6 +654,7 @@ if __name__ == '__main__':
         traj_beams=args.traj_beams,
         traj_buffer_size=args.traj_buffer,
         traj_gain=args.traj_gain,
+        reset_skip_alpha=args.reset_skip_alpha,
     )
     
     train(cfg, resume_path=args.resume)

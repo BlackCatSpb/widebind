@@ -57,6 +57,10 @@ class WideBindConfig:
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
     mlp_expand: int = 4
+    # Force uniform log_skip_alpha=0 on build/resume (SMF L0-depth fix).
+    # Default False: only matters when resuming an OLD checkpoint that carries
+    # the 17.8x L0 bias — set True to neutralize it without retraining from scratch.
+    reset_skip_alpha: bool = False
     private_mem: bool = True  # cross-expert private memory bank (meta-cognitive layer)
 
     # ─── Spec 1: Asymmetric expert init ───
