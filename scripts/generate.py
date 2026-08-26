@@ -172,6 +172,9 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
              bias_alpha=0.0):
     """Generate tokens from prompt string."""
     model.eval()
+    # Reset cross-call recurrent state so each prompt is independent.
+    if hasattr(model, '_last_salience'):
+        model._last_salience = None
     device = next(model.parameters()).device
     L = model.cfg.seq_len
     
