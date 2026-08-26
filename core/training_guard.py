@@ -16,6 +16,7 @@ The forward pass always runs ALL blocks; frozen blocks just don't receive
 gradients (they stay near-identity at init until unfrozen).
 """
 
+import gc
 import math
 import os
 
@@ -277,6 +278,13 @@ class Watchdog:
         new_lr = self.base_lr * (self.recover_lr_mult ** self.recover_count)
         self.optimizer = self.make_optimizer_fn(new_lr)
         self.base_lr = new_lr
+        # Release the just-loaded checkpoint (CPU) and, crucially, let the OLD
+        # optimizer's CUDA momentum buffers be collected BEFORE the next forward
+        # allocates — otherwise we transiently hold two optimizers' worth of GPU
+        # memory and OOM on the very next step after rollback.
+        del ckpt
+        gc.collect()
+        torch.cuda.empty_cache()
         self._cooldown = self.cooldown
         if self.recover_count > self.recover_max:
             raise RuntimeError(
