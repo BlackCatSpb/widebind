@@ -3517,3 +3517,47 @@ HTML: `checkpoints/best_report.html`. Ключевое (после исправ�
 сработал) — на 233 шага норма. Следующий разбор при новом best.pt (после EVAL
 ~466 / раскрытия глубины DepthController-ом).
 
+
+### ИНСПЕКЦИЯ \checkpoints/step_987.pt\: LR re-anchor понятен, НО мост мёртв (2026-08-26)
+Прямая инспекция чекпоинта (torch.load + forward/backward) по двум вопросам:
+
+**LR (вопрос закрыт):** \scheduler\-state в чекпоинте **НЕ содержит** \est_val_loss\/
+\loss_lr_factor\ — файл сохранён ДО первого eval@1165. Поэтому при резюме
+\_best_val_loss\ отсутствовал -> \
+eport_val_loss\ на EVAL@1165 пере-анкорил на
+val=12.44 -> damp не сработал -> \_loss_lr_factor\ остался 1.0 (lr ~2.9e-4, а не 1.5e-4,
+как ошибочно предполагалось). Это ХОРОШО для разогрева (LR не режется преждевременно).
+\est_val_loss\ в чекпоинте = 11.3043 (от step 233), но НЕ в scheduler-state ->
+при резюме потерян. EVAL@1398 val=11.7979 (улучшение vs 12.44) подтверждает
+здоровую турбулентность; фактор остаётся 1.0 (11.7979 < 12.44*0.98 -> restore, уже 1.0).
+
+**МОСТ (Intent Bridge) — ПРОБЛЕМА:** \layers.*.mirror.w_intent\ / \_intent\ = **0.0**
+(все 24 слоя) — эффектор (модуляция гейтов экспертов) мёртв. \intent_probe.weight\
+= 18.47 — ~random-init Линейного слоя (probe НЕ имеет градиента: поток intent
+detaches на каждом слое, stack.py:227). Итого мост НЕ влияет на модель.
+**\мост заработал\ пользователя весами НЕ подтверждается.**
+
+Что доказано эмпирически (на step_987.pt):
+- w_intent/b_intent/w_sal ЕСТЬ в оптимизаторе (24+24+24, по \param_names\).
+- Градиент до w_intent ИДЁТ: 2.55e5 (direct) / 3.67e4 (gradient_checkpointing=True).
+- optimizer.step() двигает w_intent: 0.0->0.0088.
+- Точное воспроизведение resume (\_restore_optimizer\ из ноутбука) + 3 шага ->
+  w_intent=0.0039 (двигается). Модули/оптимизатор/resume корректны.
+
+**ВЫВОД:** в живом прогоне w_intent не шагается при том, что математика работает, —
+причина в интеграции цикла, не в коде модулей. Ведущая гипотеза: \intent\,
+приходящий в mirror.forward, в живом цикле = None -> блок
+\if intent is not None and self._intent_bridge\ (mirror.py:566) пропускается ->
+w_intent grad=None -> не обучается (probe тоже, из-за detach потока).
+
+**Диагностика для Colab** (после loss.backward(), раз в ~500 шагов):
+\\\python
+g = model.layers[0].mirror.w_intent.grad
+print('WINTENT_GRAD', 'NONE' if g is None else round(g.norm().item(), 3))
+\\\
+- NONE -> intent не доходит до mirror (проверить stack.intent_bridge и что intent_i
+  не None в stack.py:227); мост целиком выключен.
+- non-zero, но вес остаётся 0.0 -> оптимизатор не шагает (w_intent в
+  optimizer.param_groups и не зануляется clip_grad_norm_).
+
+Пока не пофикшено — мост не даёт вклада; модель учится БЕЗ него.
