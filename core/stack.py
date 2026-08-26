@@ -817,55 +817,49 @@ class WideBindStack(nn.Module):
                 pred_w_loss = F.mse_loss(pw, torch.eye(pw.shape[0], device=pw.device))
                 n_pred_w += 1
 
+        # Raw auxiliary losses — NO per-loss magic weights.  All weighting is
+        # done principledly by the training LossBalancer (core.adaptation),
+        # either via spectral gradient alignment (default) or magnitude
+        # balancing.  Returning raw values also removes the previous
+        # double-weighting bug (weights were baked here AND reapplied in the
+        # training loop).
         aux_dict = {}
-        w_pred = getattr(self.cfg, 'pred_weight', 0.0) or 0.01
-        w_pred_w = getattr(self.cfg, 'pred_w_weight', 0.01)
-        if pred_w_loss != 0 and w_pred_w > 0:
-            aux_dict['pred_w'] = pred_w_loss * w_pred_w
+        if pred_w_loss != 0:
+            aux_dict['pred_w'] = pred_w_loss
         if pred_loss != 0:
-            aux_dict['pred'] = pred_loss * w_pred
-        w_gate = getattr(self.cfg, 'gate_l1_weight', 0.0001)
-        if gate_l1 != 0 and w_gate > 0:
-            aux_dict['gate_l1'] = gate_l1 * w_gate
-        w_reinf = getattr(self.cfg, 'reinforce_weight', 0.001)
+            aux_dict['pred'] = pred_loss
+        if gate_l1 != 0:
+            aux_dict['gate_l1'] = gate_l1
         if reinforce_loss != 0:
-            aux_dict['reinforce'] = reinforce_loss * w_reinf
-        w_bal = getattr(self.cfg, 'balance_weight', 0.026)
+            aux_dict['reinforce'] = reinforce_loss
         if balance_loss != 0:
-            aux_dict['balance'] = balance_loss * w_bal
-        w_div = getattr(self.cfg, 'diversity_weight', 0.001)
+            aux_dict['balance'] = balance_loss
         if diversity_loss != 0:
-            aux_dict['diversity'] = diversity_loss * w_div
-        w_nuc = getattr(self.cfg, 'nuclear_weight', 1e-5)
+            aux_dict['diversity'] = diversity_loss
         if nuc_loss != 0:
-            aux_dict['nuc'] = nuc_loss * w_nuc
-        w_orth = getattr(self.cfg, 'orth_weight', 1e-4)
+            aux_dict['nuc'] = nuc_loss
         if orth_loss != 0:
-            aux_dict['orth'] = orth_loss * w_orth
+            aux_dict['orth'] = orth_loss
         if w_m2v_loss != 0:
-            aux_dict['w_m2v'] = w_m2v_loss * getattr(self.cfg, 'w_m2v_hierarchy_weight', 0.001)
+            aux_dict['w_m2v'] = w_m2v_loss
         if intent_tau_loss != 0:
-            aux_dict['intent_tau'] = intent_tau_loss * getattr(self.cfg, 'intent_tau_hierarchy_weight', 0.01)
+            aux_dict['intent_tau'] = intent_tau_loss
         if branch_loss != 0:
-            aux_dict['branch'] = branch_loss * getattr(self.cfg, 'branch_balance_weight', 0.0)
-        w_repulse = getattr(self.cfg, 'gate_repulse_weight', 0.3)
+            aux_dict['branch'] = branch_loss
         if div_loss_raw != 0:
-            aux_dict['div'] = div_loss_raw * getattr(self.cfg, 'div_weight', 50.0)
+            aux_dict['div'] = div_loss_raw
         if gate_repulse_loss != 0:
-            aux_dict['gate_repulse'] = gate_repulse_loss * w_repulse
-        w_novelty = getattr(self.cfg, 'alpha_novelty_weight', 0.05)
+            aux_dict['gate_repulse'] = gate_repulse_loss
         if alpha_novelty_loss != 0:
-            aux_dict['alpha_novelty'] = alpha_novelty_loss * w_novelty
-        w_rank = getattr(self.cfg, 'ranking_weight', 0.01)
+            aux_dict['alpha_novelty'] = alpha_novelty_loss
         if ranking_loss != 0:
-            aux_dict['ranking'] = ranking_loss * w_rank
+            aux_dict['ranking'] = ranking_loss
         if n_decorr > 0:
-            aux_dict['decorr'] = decorr_loss * 0.01
+            aux_dict['decorr'] = decorr_loss
         if n_sig > 0:
-            aux_dict['signal_ent'] = signal_entropy * 0.01
-        w_ls = getattr(self.cfg, 'log_scale_l2_weight', 0.01)
+            aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
-            aux_dict['ls_reg'] = log_scale_reg * w_ls
+            aux_dict['ls_reg'] = log_scale_reg
         return ce_loss, aux_dict
     
     @staticmethod

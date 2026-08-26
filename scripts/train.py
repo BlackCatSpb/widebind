@@ -183,20 +183,31 @@ def train(cfg=None, resume_path=None):
     model._phase_ratio_ema = [0.0] * cfg.n_layers
     model._phase_ratio_std = [1.0] * cfg.n_layers
     
-    # Optimizer (LLRD) + cosine warmup + progressive unfreeze + watchdog (anti-collapse)
-    from core.training_guard import (build_optimizer, CosineWarmup, ReadinessActivator,
-                                     Watchdog, set_active_depth)
+    # Unified principled adaptation (core.adaptation) — single source of truth.
+    # Replaces the old scattered guard: cosine/CosineWarmup LR, ReadinessActivator
+    # fixed schedule, Watchdog ce>15, and the inline bypass/aligned aux weighting.
+    from core.adaptation import (LossBalancer, DepthController, LRController,
+                                 FailureDetector, GradientClipper,
+                                 set_active_depth, build_optimizer)
 
     def _make_opt(lr):
         return build_optimizer(model, lr, llrd_decay=cfg.llrd,
                                weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
 
     optimizer = _make_opt(cfg.lr)
-    activator = ReadinessActivator(model, init_active_layers=cfg.init_active_layers,
-                                   stage_steps=cfg.stage_steps, readiness_full=cfg.readiness_full,
-                                   mode=cfg.stage_mode)
-    watchdog = Watchdog(model, _make_opt, os.path.join(cfg.save_dir, 'best.pt'),
-                        cfg.lr, cfg.watchdog_ce, cfg.recover_lr_mult, cfg.recover_max)
+    # LR controller: linear warmup + mirror-adaptive multiplier + plateau damping.
+    scheduler = LRController(model, optimizer, cfg=cfg)
+    # Progressive unfreeze: validation-loss plateau drives capacity expansion.
+    depth = DepthController(model, n_layers=cfg.n_layers, init_k=cfg.init_active_layers,
+                            unfreeze_inc=4, eval_interval=cfg.eval_interval)
+    # Aux-loss balancer: spectral alignment (bounds aux grad by ||g_CE||).
+    balancer = LossBalancer(align=True, align_cap=10.0, eval_interval=cfg.eval_interval)
+    # Statistical failure detector (3-sigma) + fresh Adam + LR rewind.
+    watchdog = FailureDetector(model, scheduler, _make_opt,
+                               os.path.join(cfg.save_dir, 'best.pt'), cfg.lr,
+                               k_sigma=3.0, warmup=cfg.warmup_steps)
+    # Adaptive gradient clipping (AGC, scale-free ratio).
+    clipper = GradientClipper(c=0.01)
 
     # AMP (Automatic Mixed Precision)
     use_amp = getattr(cfg, 'use_amp', False) and device == 'cuda'
@@ -204,10 +215,8 @@ def train(cfg=None, resume_path=None):
     if use_amp:
         print('  AMP: ON (mixed precision)')
 
-    # Scheduler: cosine warmup (LLRD base lrs preserved)
-    scheduler = CosineWarmup(optimizer, cfg.warmup_steps, cfg.max_steps)
-    print(f'Scheduler: cosine warmup + LLRD(={cfg.llrd}) + progressive unfreeze '
-          f'(init={cfg.init_active_layers}, mode={cfg.stage_mode}) + watchdog(ce>{cfg.watchdog_ce})')
+    print(f'Adaptation: LLRD(={cfg.llrd}) + mirror-adaptive LR + plateau depth '
+          f'(init={cfg.init_active_layers}) + 3-sigma watchdog + AGC + spectral aux')
     
     # Resume
     start_step = 0
@@ -244,13 +253,14 @@ def train(cfg=None, resume_path=None):
         # Fresh optimizer/scheduler (NO momentum restore) — avoids resume-OOM &
         # Adam momentum runaway that caused the step-~1000 CE collapse.
         optimizer = _make_opt(cfg.lr)
-        scheduler = CosineWarmup(optimizer, cfg.warmup_steps, cfg.max_steps)
+        scheduler = LRController(model, optimizer, cfg=cfg)
         scheduler.set_step(ckpt['step'])
-        activator = ReadinessActivator(model, init_active_layers=cfg.init_active_layers,
-                                       stage_steps=cfg.stage_steps, readiness_full=cfg.readiness_full,
-                                       mode=cfg.stage_mode)
-        watchdog = Watchdog(model, _make_opt, os.path.join(cfg.save_dir, 'best.pt'),
-                            cfg.lr, cfg.watchdog_ce, cfg.recover_lr_mult, cfg.recover_max)
+        depth = DepthController(model, n_layers=cfg.n_layers, init_k=cfg.init_active_layers,
+                                unfreeze_inc=4, eval_interval=cfg.eval_interval)
+        depth.set_depth(min(8 + (ckpt['step'] // 15000) * 4, cfg.n_layers))
+        watchdog = FailureDetector(model, scheduler, _make_opt,
+                                   os.path.join(cfg.save_dir, 'best.pt'), cfg.lr,
+                                   k_sigma=3.0, warmup=cfg.warmup_steps)
         print('  Optimizer/scheduler rebuilt FRESH (no momentum restore)')
         start_step = ckpt['step']
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
@@ -313,13 +323,12 @@ def train(cfg=None, resume_path=None):
             ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
 
             ce_val = ce_loss.item()
-            # Progressive unfreeze (meta-readiness driven)
-            activator.update(step)
-            # Watchdog: CE explosion -> rollback to last healthy + fresh Adam
+            # Progressive unfreeze (validation-plateau driven)
+            depth.update(step)
+            # Statistical watchdog: CE explosion -> rollback + fresh Adam + LR rewind
             if watchdog.check(ce_val, step):
                 optimizer = watchdog.optimizer
-                scheduler = CosineWarmup(optimizer, cfg.warmup_steps, cfg.max_steps)
-                scheduler.set_step(step)
+                cfg.lr = watchdog.base_lr
                 optimizer.zero_grad(set_to_none=True)
                 model.zero_grad(set_to_none=True)
                 continue
@@ -348,92 +357,28 @@ def train(cfg=None, resume_path=None):
                         _m = _mi.mean(dim=(0, 1))                               # (G,)
                         _m_n = _m / (_m.max().detach() + 1e-8)
                         _ga = _ga + ((_m_n - _gt_n) ** 2).mean()
-                    aux_dict['gradalign'] = ga_w * _ga
+                    aux_dict['gradalign'] = _ga
             elif ga_w > 0 and use_amp:
                 print('  WARN: gradalign_weight>0 ignored under AMP (needs fp32 graph)')
 
             # NaN guard
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
                 raise RuntimeError(f'NaN/Inf CE loss at step {step}')
-            
+
             state = _detach_state(state)
             if gs is not None:
                 gs = gs.detach()
-            
-            # CE gradients (retain graph for aux backward)
-            ce_grads = torch.autograd.grad(ce_loss, model.parameters(),
-                                           retain_graph=bool(aux_dict), allow_unused=True)
 
-            # Separate bypass losses from spectral alignment
-            w_div = getattr(cfg, 'div_weight', 0.0)
-            w_rp = getattr(cfg, 'gate_repulse_weight', 0.0)
-            w_nv = getattr(cfg, 'alpha_novelty_weight', 0.0)
-            bypass_keys = {'div', 'gate_repulse', 'alpha_novelty', 'ranking', 'w_m2v', 'intent_tau', 'gradalign'}
-            bypass_losses = {k: None for k in bypass_keys}
-            aligned_list = []
-            if aux_dict:
-                for k, v in aux_dict.items():
-                    w = 1.0
-                    if k == 'div': w = w_div
-                    if k == 'gate_repulse': w = w_rp
-                    if k == 'alpha_novelty': w = w_nv
-                    if not (isinstance(v, torch.Tensor) and v.requires_grad):
-                        continue
-                    if k in bypass_keys and w > 0:
-                        bypass_losses[k] = v * w
-                    elif w > 0:
-                        aligned_list.append(v * w)
-
-            # Bypass gradients: single backward to avoid freeing graph multiple times
-            bypass_list = [v for v in bypass_losses.values() if v is not None]
-            if bypass_list:
-                bypass_total = sum(bypass_list)
-                bypass_retain = bool(aligned_list)  # keep graph for aux_total if needed
-                bypass_grads = torch.autograd.grad(
-                    bypass_total, model.parameters(), retain_graph=bypass_retain, allow_unused=True)
-            else:
-                bypass_grads = None
-
-            # Spectral gradient alignment for non-bypass aux
-            if aligned_list:
-                aux_total = sum(aligned_list)
-                aux_grads = torch.autograd.grad(aux_total, model.parameters(), allow_unused=True)
-                ce_list, aux_list = [], []
-                for gce, gaux in zip(ce_grads, aux_grads):
-                    if gce is not None and gaux is not None:
-                        ce_list.append(gce.flatten())
-                        aux_list.append(gaux.flatten())
-                if ce_list:
-                    ce_flat = torch.cat(ce_list)
-                    aux_flat = torch.cat(aux_list)
-                    cos_sim = F.cosine_similarity(ce_flat.unsqueeze(0), aux_flat.unsqueeze(0))
-                    scale = max(0, min(10.0, cos_sim.item())) * ce_flat.norm() / (aux_flat.norm() + 1e-8)
-                else:
-                    scale = 0.0
-            else:
-                aux_grads = None
-                scale = 0.0
-
-            # Combine: g = g_CE + scale * g_aligned + bypass_grads
-            with torch.no_grad():
-                for p, cg in zip(model.parameters(), ce_grads):
-                    if cg is not None:
-                        p.grad = cg.clone()
-                    else:
-                        p.grad = None
-                if aux_grads is not None and scale > 0:
-                    for p, ag in zip(model.parameters(), aux_grads):
-                        if p.grad is not None and ag is not None:
-                            p.grad.add_(ag, alpha=scale)
-                        elif ag is not None:
-                            p.grad = ag * scale
-                if bypass_grads is not None:
-                    for p, bg in zip(model.parameters(), bypass_grads):
-                        if bg is not None:
-                            if p.grad is not None:
-                                p.grad.add_(bg)
-                            else:
-                                p.grad = bg.clone()
+            # Principled aux balancing via spectral gradient alignment
+            # (core.adaptation.LossBalancer). All aux weighting is data-derived —
+            # no per-loss magic constants, and the aux gradient is bounded by
+            # ||g_CE|| so it can never hijack the update. Under AMP the losses are
+            # scaled so the grads survive GradScaler.unscale_/step.
+            gscale = scaler.get_scale() if use_amp else 1.0
+            ce_s = ce_loss * gscale
+            aux_s = {k: (v * gscale if isinstance(v, torch.Tensor) else v)
+                     for k, v in aux_dict.items()}
+            balancer.backward(ce_s, aux_s, model.parameters())
             
             # Adaptive phase scaling: EMA-based mirror/base gradient balance
             phase_scales = []
@@ -478,11 +423,10 @@ def train(cfg=None, resume_path=None):
                                 p.grad.mul_(total / mir_s)
             tokens_seen += cfg.batch_size * seq_len
             
-            # Clip gradients
-            if cfg.grad_clip > 0:
-                if use_amp:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # Clip gradients (AGC — scale-free ratio, replaces magic grad_clip)
+            if use_amp:
+                scaler.unscale_(optimizer)
+            clipper.clip(model.parameters())
 
             if use_amp:
                 scaler.step(optimizer)
@@ -532,6 +476,7 @@ def train(cfg=None, resume_path=None):
                 if device == 'cuda':
                     torch.cuda.empty_cache()
                 scheduler.report_val_loss(val_loss)
+                depth.update(step, val_loss)
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
