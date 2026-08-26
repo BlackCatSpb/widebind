@@ -93,18 +93,30 @@ class ReadinessActivator:
         return taus
 
     def update(self, step):
+        if self.mode == 'fixed':
+            # Staircase unfreeze: unlock `unfreeze_inc` blocks every `stage_steps`.
+            # Pure function of step (cheap), so we do NOT throttle it — the
+            # depth target must stay correct even if called sparsely.
+            stages = (step // self.stage_steps) if self.stage_steps > 0 else 0
+            target = min(self.init_k + stages * self.unfreeze_inc, self.n)
+            if target > self.active:
+                self.active = target
+                set_active_depth(self.model, self.active)
+                print(f'  [Activator] step={step} (schedule) '
+                      f'-> active_depth={self.active}/{self.n}')
+            return self.active
+
+        # readiness mode: throttle the (relatively expensive) meta_maturity call.
         if step - self._last_step < self.readiness_interval and step > 0:
             return self.active
         self._last_step = step
         taus = self._thresholds()
-        maturity = meta_maturity(self.model) if self.mode == 'readiness' else 0.0
+        maturity = meta_maturity(self.model)
         progressed = False
         for i in range(self.n):
             if i < self.active:
                 continue
-            by_readiness = (self.mode == 'readiness' and maturity >= taus[i])
-            by_schedule = (step >= (i - self.init_k + 1) * self.stage_steps)
-            if by_readiness or by_schedule:
+            if maturity >= taus[i]:
                 self.active = i + 1
                 progressed = True
         if progressed:
