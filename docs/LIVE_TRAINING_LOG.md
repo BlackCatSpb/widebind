@@ -3570,3 +3570,16 @@ print('WINTENT_GRAD', 'NONE' if g is None else round(g.norm().item(), 3))
 (commit 201b6c2). Требует перезапуска Colab-runtime, чтобы core.adaptation
 перезагрузился. С фиксом w_intent проверенно двигается (0.0->0.0195 даже с
 clipper.clip в живом цикле).
+
+## analyze(step_987.pt) — 2026-08-26 (HTML: checkpoints/step_987_report.html)
+
+- **Мост мёртв (веса):** w_intent/b_intent/w_sal=0 во всех 24 слоях; tau_intent_dev=0.
+  Причина — AGC (фикс 201b6c2). intent_probe.weight=std 0.011 (norm 18.47) — random-init,
+  не обучен (градиент обрывается detach intent_i, stack.py:227).
+- **diversity aux:** cos_sim(diversity, CE) = -1.0000 (анти-коррелирован) → балансер
+  зануляет вклад (scale=0). Diversity конфликтует с CE и фактически отключён.
+- **pred aux:** requires_grad=False → БЕЗ ГРАДИЕНТА (dead head).
+- **Здорово:** verdict OK (нет коллапса), anomaly-track стабилен vs step 233.
+  mod_scale~0.66-0.69 (wake), w_gate/gate_bias живые. reasoning_gate ~init, reasoning OFF в сэмпле.
+- **Вывод:** на step 987 модель = turbo без моста; учится base CE + mirror-gate + mod_scale.
+  Мост/диверсити/pred инертны. AGC-фикс разбудит мост после restart runtime + новой ячейки.
