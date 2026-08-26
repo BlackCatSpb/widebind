@@ -1323,22 +1323,36 @@ class MirrorLRScheduler:
         pass
 
     def report_val_loss(self, val_loss):
-        """Adaptive LR: λ_d-scaled thresholds, EMA-based improvement detection."""
+        """Adaptive LR damping — anchored to the historical best, no one-way ratchet.
+
+        Replaces the old fixed thresholds (regress if val > EMA*1.0123; restore only
+        if val < best*0.889). The old rule was unreachable at chance level (val never
+        improves 11% early) so ``_loss_lr_factor`` could only ratchet down to the 0.05
+        floor on ordinary eval noise — exactly the Run B LR-collapse trap.
+
+        New rule, anchored to ``_best_val_loss`` (the known-good level, which does NOT
+        chase a regression upward):
+          - **regression** (damp ×0.5) only if ``val > best*(1+lr_regress_rel)``
+            (default 5% — a real divergence, not the ~1% eval noise seen at chance);
+          - **improvement** (full restore to 1.0) when ``val < best*lr_improve_thresh``
+            (default 0.98, reachable) — learning is clearly working, so no damping.
+
+        Because the baseline is the historical best (not a fast EMA) and the restore
+        threshold is reachable, LR is damped only for genuine divergence and recovers
+        whenever the model improves — the asymmetric ratchet is gone.
+        """
         if not hasattr(self, '_best_val_loss'):
             self._best_val_loss = val_loss
             self._loss_lr_factor = 1.0
-            self._loss_ema = val_loss
-        if not hasattr(self, '_loss_ema'):
-            self._loss_ema = val_loss
-        self._loss_ema = 0.9 * self._loss_ema + 0.1 * val_loss
-        lam = getattr(self.cfg, 'lambda_d', 3)
-        improve_thresh = 1.0 - 1.0 / (lam ** 2)
-        regress_thresh = 1.0 + 1.0 / (lam ** 4)
-        if val_loss < self._best_val_loss * improve_thresh:
-            self._best_val_loss = val_loss
-            self._loss_lr_factor = min(1.0, self._loss_lr_factor * 1.05)
-        elif val_loss > self._loss_ema * regress_thresh:
+        regress_rel = getattr(self.cfg, 'lr_regress_rel', 0.05)
+        improve_thresh = getattr(self.cfg, 'lr_improve_thresh', 0.98)
+        if val_loss > self._best_val_loss * (1.0 + regress_rel):
+            # genuine divergence relative to best -> damp
             self._loss_lr_factor = max(0.05, self._loss_lr_factor * 0.5)
+        elif val_loss < self._best_val_loss * improve_thresh:
+            # genuine improvement -> restore base LR
+            self._best_val_loss = val_loss
+            self._loss_lr_factor = 1.0
 
     def step(self):
         self._step += 1

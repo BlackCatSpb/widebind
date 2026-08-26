@@ -96,6 +96,8 @@ class WideBindConfig:
     lr_min_ratio: float = 0.05
     max_decay_steps: int = 50000
     var_min_for_lr_decay: float = 0.005
+    lr_improve_thresh: float = 0.98   # restore _loss_lr_factor to 1.0 when val < best*this (reachable)
+    lr_regress_rel: float = 0.05      # damp LR only if val > best*(1+this) (5% — real divergence, not eval noise)
 
     # Per-layer LS-based LR modulation (индивидуальная адаптация по var(log_scale))
     per_layer_ls_lr: bool = False  # True = per-layer mult из fast/slow EMA var(ls)
