@@ -577,10 +577,16 @@ class WideBindStack(nn.Module):
 
     @torch.no_grad()
     def compute_salience(self, logits):
-        # Word importance from the sigmoid output field (head_mode='sigmoid_coded'):
-        # how strongly the model responds at each position. Detached => no gradient
-        # feedback loop; the intent path is instead regularized via _tau_intent_dev.
-        return logits.sigmoid().norm(dim=-1, keepdim=True)  # (B, L, 1)
+        # Word importance from the head's output field (head_mode='sigmoid_coded'):
+        # how strongly / confidently the model responds at each position. Now fed
+        # the actual head log-probs (via model.lm_head(out)), so this is true
+        # prediction confidence rather than a proxy of the hidden state. Normalized
+        # to mean 1 => relative per-position weighting in O(1), robust to the head's
+        # output scale (log-prob norms are ~0.01-0.5, far smaller than the old h-based
+        # ~15-25). Detached => no gradient feedback loop; the intent path is instead
+        # regularized via _tau_intent_dev.
+        s = logits.sigmoid().norm(dim=-1, keepdim=True)  # (B, L, 1)
+        return s / s.mean().clamp_min(1e-6)
 
     @torch.no_grad()
     def observe_output(self, logits):
