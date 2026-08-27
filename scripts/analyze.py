@@ -762,6 +762,124 @@ def run_grad_info(model, ce_loss, aux):
     return info
 
 
+# ─────────────────────────── BRIDGE ───────────────────────────
+
+def run_bridge(model, cfg, batch=1, seq=128):
+    """Runtime-метрики Intent Bridge: салайенс от головы, поток intent по слоям,
+    кросс-слойная избыточность шины, head-stencil (bus_head_proj) и τ-лесенка
+    интеграции intent. Требует intent_bridge=True (иначе возвращает None)."""
+    sec('BRIDGE: runtime intent-bus metrics')
+    if not getattr(model, 'intent_bridge', False):
+        print('  Intent Bridge ОТКЛЮЧЁН (cfg.intent_bridge=False) — метрики недоступны')
+        return None
+    model.train()
+    x = torch.randint(0, cfg.vocab, (batch, seq), device='cpu')
+    h = model.embed_tokens(x)
+    out, _, _, _ = model(h)                       # заполняет _intent_stream, _last_bus
+    B, L, D = out.shape
+
+    # --- Salience из РЕАЛЬНОГО выхода головы ---
+    with torch.no_grad():
+        logits = model.lm_head(out)
+    raw = logits.sigmoid().norm(dim=-1, keepdim=True)        # (B,L,1)
+    sal = raw.flatten()
+    sal_norm = raw / raw.mean().clamp_min(1e-6)
+    p = sal_norm.flatten() / sal_norm.flatten().sum().clamp_min(1e-9)
+    H = -(p * torch.log2(p.clamp_min(1e-12))).sum().item()
+    Hmax = math.log2(sal.numel())
+    print(f'  SALIENCE (от head logits): mean={sal.mean().item():.4e} '
+          f'min={sal.min().item():.4e} max={sal.max().item():.4e} std={sal.std().item():.4e}')
+    print(f'    max/min={sal.max().item() / max(sal.min().item(), 1e-12):.1f}  '
+          f'норм.энтропия H/Hmax={H / Hmax:.3f}  (1=равномерно, 0=сфокус на токенах)')
+
+    # --- Intent stream (per-layer carried gist) ---
+    stream = model._intent_stream
+    if not isinstance(stream, list) or len(stream) != len(model.layers):
+        print('  [warn] _intent_stream не заполнен после forward — пропуск stream-метрик')
+        layer_norms, expert_norm, off = [], [], 0.0
+    else:
+        layer_norms = [s.norm().item() for s in stream]
+        stacked = torch.stack([s.reshape(-1, model._n_experts, model._K_max)
+                               for s in stream], 0)        # (L,G,Kmax)
+        expert_norm = stacked.norm(dim=-1).mean(dim=0)     # (G,)
+        flat = stacked.reshape(len(stream), -1)
+        flat = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        cos = torch.matmul(flat, flat.t())
+        off = cos[~torch.eye(len(stream), dtype=torch.bool)].mean().item() \
+            if len(stream) > 1 else 0.0
+        print(f'  INTENT STREAM: per-layer norm mean={sum(layer_norms)/len(layer_norms):.4f} '
+              f'min={min(layer_norms):.4f} max={max(layer_norms):.4f}')
+        en = expert_norm.flatten().tolist()
+        if model._n_experts > 8:
+            print(f'    per-expert mean norm (первые 8): '
+                  f'{[round(v, 4) for v in en[:8]]} ...')
+        else:
+            print(f'    per-expert norm: {[round(v, 4) for v in en]}')
+        print(f'    cross-layer cosine (redundancy): mean_offdiag={off:.4f} '
+              f'(1=слои несут одно и то же, 0=дополняют)')
+
+    # --- Bus ---
+    if model._last_bus is not None:
+        bus = model._last_bus
+        print(f'  BUS (_last_bus): norm={bus.norm().item():.4f}  '
+              f'per-expert mean='
+              f'{bus.reshape(-1, model._n_experts, model._K_max).norm(dim=-1).mean().item():.4f}')
+
+    # --- Head stencil (bus_head_proj) ---
+    bhp = model.bus_head_proj
+    w = bhp.weight.data
+    print(f'  HEAD STENCIL bus_head_proj: weight_norm={w.norm().item():.4f} '
+          f'(zero-init => 0 на старте, рост = стенсил обучается)')
+    if model._last_bus is not None:
+        _bus = model._last_bus.expand(B, L, -1, -1).reshape(B, L, -1)
+        bus_bias = bhp(_bus)
+        print(f'    bus_bias (вклад в логиты головы): norm/pos='
+              f'{bus_bias.norm(dim=-1).mean().item():.5f}')
+
+    # --- Bridge params per layer ---
+    print('  BRIDGE PARAMS (L0 / mid / last):')
+    for i in (0, len(model.layers) // 2, len(model.layers) - 1):
+        m = model.layers[i].mirror
+        wi = m.w_intent.norm().item() if hasattr(m, 'w_intent') else 0.0
+        bi = m.b_intent.norm().item() if hasattr(m, 'b_intent') else 0.0
+        ws = torch.sigmoid(m.w_sal).mean().item() if hasattr(m, 'w_sal') else 0.0
+        print(f'    L{i}: ||w_intent||={wi:.4f} ||b_intent||={bi:.4f} w_sal(sig)={ws:.4f}')
+
+    ip = model.intent_probe
+    print(f'  intent_probe: W_norm={ip.weight.data.norm().item():.4f} '
+          f'b_norm={ip.bias.data.norm().item() if ip.bias is not None else 0.0:.4f}')
+
+    # --- τ-ladder (intent integration timescales) ---
+    vsa_tau = torch.exp(torch.cumsum(F.softplus(model._vsa_log_param), 0)) + 1.0
+    tau_min, tau_max = vsa_tau[0], vsa_tau[-1]
+    c_ema = (1.0 / math.sqrt(cfg.D)) * (tau_min * tau_max).sqrt()
+    n = len(model.layers)
+    taus, alphas = [], []
+    for i in range(n):
+        lf = i / max(n - 1, 1)
+        dev = torch.tanh(model._tau_intent_dev[i])
+        tau_i = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
+        alpha_i = torch.clamp(1.0 - c_ema / tau_i, min=0.0)
+        taus.append(tau_i.item())
+        alphas.append(alpha_i.item())
+    print(f'  TAU LADDER (intent): tau[0]={taus[0]:.3f} tau[-1]={taus[-1]:.3f} '
+          f'alpha[0]={alphas[0]:.4f} alpha[-1]={alphas[-1]:.4f} '
+          f'(alpha = доля свежего intent в EMA)')
+
+    return {
+        'salience': {'mean': sal.mean().item(), 'min': sal.min().item(),
+                     'max': sal.max().item(),
+                     'ratio': sal.max().item() / max(sal.min().item(), 1e-12),
+                     'entropy_norm': H / Hmax},
+        'stream_layer_norm': layer_norms,
+        'stream_expert_norm': expert_norm.tolist() if isinstance(expert_norm, torch.Tensor) else [],
+        'cross_layer_cos': off,
+        'bus_norm': model._last_bus.norm().item() if model._last_bus is not None else None,
+        'stencil_w_norm': w.norm().item(),
+        'tau': taus, 'alpha': alphas,
+    }
+
+
 # ─────────────────────────── HTML ───────────────────────────
 
 def _hue(v, vmin, vmax):
@@ -769,7 +887,7 @@ def _hue(v, vmin, vmax):
     return 120 * (1.0 - t)
 
 
-def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None):
+def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=None):
     import html as H
     path = ckpt.get('_path', '?')
     step = ckpt.get('step', '?')
@@ -826,6 +944,12 @@ td:first-child,th:first-child{text-align:left}
         ch.append(f'<div class="card"><b>{w_sal_val:.4f}</b><span>w_sal &sigma;</span></div>')
     if tau_intent_dev_val is not None:
         ch.append(f'<div class="card"><b>{tau_intent_dev_val:.4f}</b><span>tau_intent_dev</span></div>')
+    if bridge is not None:
+        b = bridge['salience']
+        ch.append(f'<div class="card"><b>{b["entropy_norm"]:.3f}</b><span>salience H/Hmax</span></div>')
+        ch.append(f'<div class="card"><b>{bridge["cross_layer_cos"]:.3f}</b><span>bus cos</span></div>')
+        ch.append(f'<div class="card"><b>{bridge["stencil_w_norm"]:.4f}</b><span>stencil ‖W‖</span></div>')
+        ch.append(f'<div class="card"><b>{bridge["alpha"][-1]:.4f}</b><span>intent α[-1]</span></div>')
     ch.append('</div>')
 
     ch.append('<h2>WAKE DETECTOR</h2>')
@@ -938,6 +1062,19 @@ td:first-child,th:first-child{text-align:left}
     else:
         ch.append('<div class="dim">grad info пропущен (--no-gradinfo)</div>')
 
+    if bridge:
+        ch.append('<h2>BRIDGE (intent bus)</h2>')
+        s = bridge['salience']
+        ch.append(f'<div>salience (от head): mean={s["mean"]:.2e} max/min={s["ratio"]:.1f} '
+                  f'норм.энтропия={s["entropy_norm"]:.3f} '
+                  f'(1=равномерно, 0=сфокус на токенах)</div>')
+        ch.append(f'<div>intent stream cross-layer cosine={bridge["cross_layer_cos"]:.4f} '
+                  f'(bus redundancy) &nbsp; bus_norm={bridge["bus_norm"]}</div>')
+        ch.append(f'<div>head stencil bus_head_proj weight_norm='
+                  f'{bridge["stencil_w_norm"]:.4f} (0 = не обучен)</div>')
+        ch.append(f'<div>tau_intent ladder: alpha[0]={bridge["alpha"][0]:.4f} '
+                  f'alpha[-1]={bridge["alpha"][-1]:.4f}</div>')
+
     if head:
         ch.append('<h2>HEAD</h2>')
         bd = head['bias_decomp']
@@ -1041,10 +1178,16 @@ def main():
                     head_data = run_head(model, ckpt, args, tok)
                 except Exception as e:
                     print(f'[error] head: {e}')
+        bridge_data = None
+        if not args.quick and getattr(model, 'intent_bridge', False):
+            try:
+                bridge_data = run_bridge(model, cfg, seq=args.seq)
+            except Exception as e:
+                print(f'[error] bridge: {e}')
         if not args.no_html and wake_data is not None:
             try:
                 save_html_report(ckpt, cfg, model, wake_data, live_data, head_data,
-                                 anomaly_data)
+                                 anomaly_data, bridge_data)
             except Exception as e:
                 print(f'[error] html: {e}')
 
