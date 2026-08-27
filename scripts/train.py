@@ -499,38 +499,9 @@ def train(cfg=None, resume_path=None):
                     print(f'  Saved best model to {save_path}')
                     generate_report(save_path)
             
-            # Save
-            if step > 0 and step % cfg.save_interval == 0:
-                save_path = os.path.join(cfg.save_dir, f'step_{step}.pt')
-                torch.save({
-                    'step': step,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict() if not args.no_save_optimizer else None,
-                    'param_names': _opt_param_names(model) if not args.no_save_optimizer else None,
-                    'scheduler': scheduler.state_dict(),
-                    'best_val_loss': best_val_loss,
-                    'cfg': cfg,
-                    'reasoning_enabled_step': reasoning_enabled_step,
-                    'active_depth': depth.active,
-                }, save_path)
-                print(f'  Saved checkpoint to {save_path}')
-                generate_report(save_path)
+            # Periodic step_*.pt checkpoints DISABLED: only best.pt is written (saves space).
     except KeyboardInterrupt:
-        print('\n[WideBind] Ctrl+C detected, saving checkpoint...')
-        save_path = os.path.join(cfg.save_dir, f'interrupt_step_{step}.pt')
-        torch.save({
-            'step': step,
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict() if not args.no_save_optimizer else None,
-            'param_names': _opt_param_names(model) if not args.no_save_optimizer else None,
-            'scheduler': scheduler.state_dict(),
-            'best_val_loss': best_val_loss,
-            'cfg': cfg,
-            'reasoning_enabled_step': reasoning_enabled_step,
-            'active_depth': depth.active,
-        }, save_path)
-        print(f'[WideBind] Saved interrupt checkpoint to {save_path}')
-        generate_report(save_path)
+        print('\n[WideBind] Ctrl+C detected - keeping last best.pt (no separate checkpoint written)')
         print('[WideBind] Exiting gracefully.')
         sys.exit(0)
     
