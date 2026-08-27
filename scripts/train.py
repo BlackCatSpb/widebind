@@ -257,7 +257,11 @@ def train(cfg=None, resume_path=None):
         scheduler.set_step(ckpt['step'])
         depth = DepthController(model, n_layers=cfg.n_layers, init_k=cfg.init_active_layers,
                                 unfreeze_inc=4, eval_interval=cfg.eval_interval)
-        depth.set_depth(min(8 + (ckpt['step'] // 15000) * 4, cfg.n_layers))
+        _saved_depth = ckpt.get('active_depth', None)
+        if _saved_depth is not None:
+            depth.set_depth(_saved_depth)
+        else:
+            depth.set_depth(min(8 + (ckpt['step'] // 15000) * 4, cfg.n_layers))  # legacy fallback (pre-fix ckpts)
         watchdog = FailureDetector(model, scheduler, _make_opt,
                                    os.path.join(cfg.save_dir, 'best.pt'), cfg.lr,
                                    k_sigma=3.0, warmup=cfg.warmup_steps)
@@ -490,6 +494,7 @@ def train(cfg=None, resume_path=None):
                         'best_val_loss': best_val_loss,
                         'cfg': cfg,
                         'reasoning_enabled_step': reasoning_enabled_step,
+                        'active_depth': depth.active,
                     }, save_path)
                     print(f'  Saved best model to {save_path}')
                     generate_report(save_path)
@@ -506,6 +511,7 @@ def train(cfg=None, resume_path=None):
                     'best_val_loss': best_val_loss,
                     'cfg': cfg,
                     'reasoning_enabled_step': reasoning_enabled_step,
+                    'active_depth': depth.active,
                 }, save_path)
                 print(f'  Saved checkpoint to {save_path}')
                 generate_report(save_path)
@@ -521,6 +527,7 @@ def train(cfg=None, resume_path=None):
             'best_val_loss': best_val_loss,
             'cfg': cfg,
             'reasoning_enabled_step': reasoning_enabled_step,
+            'active_depth': depth.active,
         }, save_path)
         print(f'[WideBind] Saved interrupt checkpoint to {save_path}')
         generate_report(save_path)
