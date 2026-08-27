@@ -1335,6 +1335,12 @@ class MirrorLRScheduler:
         self._ls_fast = None
         self._ls_slow = None
         self._ls_mult = None
+        # Observability / last-computed multipliers (for diagnostics & tests)
+        self.last_mirror_mult = 1.0
+        self.last_mult = 1.0
+        # Trend signal: is validation actually on a downtrend? (hysteresis between evals)
+        self._val_ema = None
+        self._val_improving = False
 
     def _mirror_stats(self):
         var_sum = 0.0
@@ -1411,6 +1417,8 @@ class MirrorLRScheduler:
         if not hasattr(self, '_best_val_loss'):
             self._best_val_loss = val_loss
             self._loss_lr_factor = 1.0
+            self._val_ema = val_loss
+            self._val_improving = False
         regress_rel = getattr(self.cfg, 'lr_regress_rel', 0.05)
         improve_thresh = getattr(self.cfg, 'lr_improve_thresh', 0.98)
         if val_loss > self._best_val_loss * (1.0 + regress_rel):
@@ -1420,6 +1428,13 @@ class MirrorLRScheduler:
             # genuine improvement -> restore base LR
             self._best_val_loss = val_loss
             self._loss_lr_factor = 1.0
+        # Downtrend detector (the "is learning actually happening?" signal that
+        # gates the upward LR path). Retained between evals (hysteresis) so a boost
+        # window stays open for a while after an improving eval. Small tolerance
+        # avoids flicker on eval noise.
+        tol = getattr(self.cfg, 'lr_improve_tol', 0.002)
+        self._val_improving = bool(val_loss < self._val_ema * (1.0 + tol))
+        self._val_ema = 0.9 * self._val_ema + 0.1 * val_loss
 
     def step(self):
         self._step += 1
@@ -1474,9 +1489,23 @@ class MirrorLRScheduler:
             mag_factor = min(1.0, max(0.2, 1.0 / max(mag_ratio, 1e-10)))
 
             mirror_mult = (var_mult * alpha_mult * gate_mult) ** (1/3) * mag_factor
-            mult = max(0.2, min(1.0, mirror_mult))
+            boost_max = getattr(self.cfg, 'lr_boost_max', 2.0)
+            m = max(0.2, mirror_mult)
+            # Upward path: allow LR to climb ABOVE base. The old code hard-capped
+            # at 1.0, so the adaptive multiplier could only ever DAMP. Boost is
+            # permitted ONLY when validation is on a genuine downtrend
+            # (self._val_improving) — otherwise a stalled/"dead" model would be
+            # boosted and destabilized. Self-limiting: a boost raises the loss
+            # landscape variance -> var_ratio>1 -> var_mult<1 -> multiplier falls
+            # back on its own (negative feedback via the EMA baselines).
+            if m > 1.0 and not getattr(self, '_val_improving', False):
+                m = 1.0
+            m = min(m, boost_max)
+            self.last_mirror_mult = mirror_mult
+            mult = m
             if hasattr(self, '_loss_lr_factor'):
                 mult = mult * self._loss_lr_factor
+            self.last_mult = mult
             self._update_ls_mult()
 
             if self._step - self._last_log >= 500:
@@ -1511,6 +1540,9 @@ class MirrorLRScheduler:
         if hasattr(self, '_best_val_loss'):
             sd['best_val_loss'] = self._best_val_loss
             sd['loss_lr_factor'] = self._loss_lr_factor
+        if self._val_ema is not None:
+            sd['val_ema'] = self._val_ema
+            sd['val_improving'] = self._val_improving
         if self._ls_enabled and self._ls_fast is not None:
             sd['ls_fast'] = self._ls_fast
             sd['ls_slow'] = self._ls_slow
@@ -1528,6 +1560,9 @@ class MirrorLRScheduler:
         if 'best_val_loss' in sd:
             self._best_val_loss = sd['best_val_loss']
             self._loss_lr_factor = sd.get('loss_lr_factor', 1.0)
+        if 'val_ema' in sd:
+            self._val_ema = sd['val_ema']
+            self._val_improving = sd.get('val_improving', False)
         if self._ls_enabled:
             self._ls_fast = sd.get('ls_fast')
             self._ls_slow = sd.get('ls_slow')

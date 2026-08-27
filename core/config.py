@@ -98,6 +98,8 @@ class WideBindConfig:
     var_min_for_lr_decay: float = 0.005
     lr_improve_thresh: float = 0.98   # restore _loss_lr_factor to 1.0 when val < best*this (reachable)
     lr_regress_rel: float = 0.05      # damp LR only if val > best*(1+this) (5% — real divergence, not eval noise)
+    lr_boost_max: float = 2.0         # upward-path ceiling: LR may climb above base up to this (0=disable boost)
+    lr_improve_tol: float = 0.002     # val downtrend tolerance for the boost gate (hysteresis vs eval noise)
 
     # Per-layer LS-based LR modulation (индивидуальная адаптация по var(log_scale))
     per_layer_ls_lr: bool = False  # True = per-layer mult из fast/slow EMA var(ls)
