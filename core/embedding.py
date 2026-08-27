@@ -185,7 +185,7 @@ class SigmoidCodedHead(nn.Module):
         self.token_bias = nn.Parameter(torch.zeros(cfg.vocab))
         self.normalize = bool(getattr(cfg, 'head_normalize', True))
 
-    def _gates(self, h, temp_factor=None):
+    def _gates(self, h, temp_factor=None, bus_bias=None):
         if h.dim() == 2:
             h = h.unsqueeze(1)
             squeeze = True
@@ -198,6 +198,10 @@ class SigmoidCodedHead(nn.Module):
         if temp_factor is not None:
             T = T * temp_factor
         zt = z / T + self.bit_bias
+        if bus_bias is not None:
+            # Phase-2 stencil: cross-layer gist biases the projector readout.
+            # bus_bias shape matches zt's (B,L,K) or (N,1,K) -> broadcasts cleanly.
+            zt = zt + bus_bias
         if squeeze:
             zt = zt.squeeze(1)
         return zt
@@ -210,13 +214,13 @@ class SigmoidCodedHead(nn.Module):
         base = lms.sum(-1)
         return u, base
 
-    def forward(self, h):
+    def forward(self, h, bus_bias=None):
         if h.dim() == 2:
             h = h.unsqueeze(1)
             squeeze = True
         else:
             squeeze = False
-        u, base = self._su(self._gates(h))
+        u, base = self._su(self._gates(h, bus_bias=bus_bias))
         logits = u @ self.codes.T + base[..., None] + self.token_bias
         if self.normalize:
             logits = logits - logits.logsumexp(dim=-1, keepdim=True)
@@ -224,7 +228,7 @@ class SigmoidCodedHead(nn.Module):
             logits = logits.squeeze(1)
         return logits
 
-    def log_probs_for_target(self, h, targets):
+    def log_probs_for_target(self, h, targets, bus_bias=None):
         if h.dim() == 2:
             h_2d = True
             h_in = h.unsqueeze(1)
@@ -232,12 +236,12 @@ class SigmoidCodedHead(nn.Module):
             h_2d = False
             h_in = h
         if self.normalize:
-            raw = self.forward(h_in)
+            raw = self.forward(h_in, bus_bias=bus_bias)
             if h_2d:
                 return raw[0, 0, targets] + self.token_bias[targets]
             idx = torch.arange(raw.shape[1], device=raw.device)
             return raw[:, idx, targets] + self.token_bias[targets]
-        zt = self._gates(h_in)
+        zt = self._gates(h_in, bus_bias=bus_bias)
         sig = torch.sigmoid(zt)
         ls = torch.log(sig.clamp_min(1e-9))
         lms = torch.log((1 - sig).clamp_min(1e-9))

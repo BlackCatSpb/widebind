@@ -59,10 +59,20 @@ class WideBindStack(nn.Module):
             self._n_experts = int(self.layers[0].mirror.G)
             self._K_max = max(int(l.mirror.k) for l in self.layers)
             self.intent_probe = nn.Linear(cfg.D, self._n_experts * self._K_max)
-        # Intent stream: per-layer list of (1,1,G,k_i) per-head contexts.
-        # Flows layer->layer (depth) within a step and recurs in time.
+        # Intent stream: per-layer list of (1,1,G,_K_max) per-head contexts.
+        # Stored in the PROBE's full _K_max space (not per-layer k) so a single
+        # cross-layer bus can be averaged across layers; truncated to k_i at the
+        # mirror gate. Flows layer->layer (depth) within a step and recurs in time.
         self._intent_stream = None
         self._last_salience = None
+        # Phase-2 stencil: the aggregated cross-layer bus biases the head's group
+        # readout -> a "template of connections hidden->projector" (free cache
+        # without a cache, complement to VSA memory). Zero-init => head unchanged
+        # at start (checkpoint-safe); bus inputs are detached (no cross-step BPTT).
+        _head_K = getattr(self.lm_head, 'K', self._n_experts)
+        self.bus_head_proj = nn.Linear(self._n_experts * self._K_max, _head_K, bias=False)
+        nn.init.zeros_(self.bus_head_proj.weight)
+        self._last_bus = None
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         # ─── Idea 4: Per-layer τ_l deviation ───
@@ -177,13 +187,20 @@ class WideBindStack(nn.Module):
         # Mirror k varies per layer, so the stream is per-layer. No shared
         # source => no parameter contention between heads.
         if self.intent_bridge:
+            def _to_kmax(s):
+                if s is None:
+                    return None
+                s = s.detach().to(device=h.device, dtype=h.dtype)
+                if s.shape[-1] != self._K_max:
+                    s = s.new_zeros(1, 1, self._n_experts, self._K_max)
+                return s
             if isinstance(self._intent_stream, list) and len(self._intent_stream) == n_layers:
-                intent_streams = list(self._intent_stream)
+                intent_streams = [_to_kmax(s) for s in self._intent_stream]
             elif isinstance(intent_state, list) and len(intent_state) == n_layers:
-                intent_streams = list(intent_state)
+                intent_streams = [_to_kmax(s) for s in intent_state]
             else:
                 intent_streams = [
-                    torch.zeros(1, 1, self._n_experts, self.layers[i].mirror.k,
+                    torch.zeros(1, 1, self._n_experts, self._K_max,
                                 device=h.device, dtype=h.dtype)
                     for i in range(n_layers)]
             _sal = self._last_salience
@@ -201,6 +218,21 @@ class WideBindStack(nn.Module):
                 self._gs_velocity = self._gs_velocity.to(global_state.device)
         new_state = []
         self._pred_cache = []
+        # ─── Cross-layer bus scratch (intent bridge) ───
+        # Carried streams are the previous step's gist (detached). The bus is
+        # STREAMING: layer i sees FRESH intent of already-processed layers (j<=i)
+        # and CARRIED intent of downstream layers (j>i) — a flow, not a storage.
+        # No cross-step BPTT (carried detached); self-term carries probe gradient.
+        _bus_carried = None
+        _bus_sum = None
+        _bus_running = None
+        _bus_le_carried = None
+        if self.intent_bridge and intent_streams is not None:
+            _bus_carried = list(intent_streams)
+            _bus_sum = torch.stack([c.detach() for c in _bus_carried], 0).sum(0)  # (1,1,G,Kmax)
+            _bus_running = torch.zeros_like(_bus_sum)
+            _bus_le_carried = torch.zeros_like(_bus_sum)
+        _last_bus = None
         for i, (layer, s) in enumerate(zip(self.layers, state)):
             if adaptive:
                 l_expl, l_diff = AdaptiveController.layer_stats(layer,
@@ -237,14 +269,25 @@ class WideBindStack(nn.Module):
                 _tau_i = tau_min * (tau_max / tau_min) ** (_lf * (1.0 + 0.1 * _dev_i))
                 _alpha_i = torch.clamp(1.0 - c_ema / _tau_i, min=0.0)
                 _ki = self.layers[i].mirror.k
-                local_intent = self.intent_probe(h).reshape(
-                    h.shape[0], h.shape[1], self._n_experts, self._K_max) \
-                    [:, :, :, :_ki].mean(dim=(0, 1), keepdim=True)  # (1,1,G,k_i)
-                if self._last_salience is not None:
-                    _sw = self._last_salience.mean().clamp(min=1e-3)
-                    local_intent = local_intent * _sw
-                intent_streams[i] = _alpha_i * intent_streams[i] + (1.0 - _alpha_i) * local_intent
-                intent_i = intent_streams[i]
+                probe_out = self.intent_probe(h).reshape(
+                    h.shape[0], h.shape[1], self._n_experts, self._K_max)  # (B,L,G,Kmax)
+                if self._last_salience is not None and \
+                   self._last_salience.shape[0] == h.shape[0] and \
+                   self._last_salience.shape[1] == h.shape[1]:
+                    # Per-position salience weighting: highlight the semantically
+                    # important parts of each expert's intent (word importance from
+                    # the head). (B,L,1) -> (B,L,1,1) broadcasts over (G,Kmax).
+                    probe_out = probe_out * self._last_salience.unsqueeze(-1)
+                fresh_i = probe_out.mean(dim=(0, 1), keepdim=True)  # (1,1,G,Kmax), grad
+                intent_streams[i] = _alpha_i * _bus_carried[i] + (1.0 - _alpha_i) * fresh_i.detach()
+                # Streaming cross-layer bus (Bus): network-wide gist = mean over
+                # layers; FRESH for j<=i, CARRIED for j>i. Self-term (fresh_i)
+                # keeps the probe trainable; others give cross-layer communication.
+                _bus_running = _bus_running + fresh_i
+                _bus_le_carried = _bus_le_carried + _bus_carried[i]
+                bus_i = (_bus_running + (_bus_sum - _bus_le_carried)) / n_layers  # (1,1,G,Kmax)
+                _last_bus = bus_i
+                intent_i = bus_i[..., :_ki]  # truncate to layer k
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
                 _saved_pen = layer.mirror._cached_pred_error_norm
@@ -300,6 +343,7 @@ class WideBindStack(nn.Module):
             new_state.append(s_out)
             if self.intent_bridge:
                 self._intent_stream = [s.detach() for s in intent_streams]
+                self._last_bus = _last_bus.detach() if _last_bus is not None else None
             if adaptive:
                 mir = layer.mirror
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
@@ -555,8 +599,17 @@ class WideBindStack(nn.Module):
         """
         if hasattr(self.lm_head, 'log_probs_for_target'):
             B, L, D = h.shape
+            bus_bias = None
+            if self.intent_bridge and getattr(self, 'bus_head_proj', None) is not None \
+                    and self._last_bus is not None:
+                # Phase-2 stencil: broadcast cross-layer gist to every position and
+                # project to head group space -> biases the projector readout (the
+                # "template of connections hidden->projector"). bus inputs detached.
+                _bus = self._last_bus.expand(B, L, -1, -1).reshape(B, L, -1)
+                bus_bias = self.bus_head_proj(_bus)            # (B, L, K_head)
+                bus_bias = bus_bias.reshape(B * L, 1, -1)      # (N,1,K) align h(-1,D)
             log_probs = self.lm_head.log_probs_for_target(
-                h.reshape(-1, D), targets.reshape(-1))
+                h.reshape(-1, D), targets.reshape(-1), bus_bias=bus_bias)
             ce_loss = -log_probs.mean()
         else:
             logits = self.lm_head(h)
