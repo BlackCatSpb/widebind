@@ -892,7 +892,7 @@ def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=No
     path = ckpt.get('_path', '?')
     step = ckpt.get('step', '?')
     stem = os.path.splitext(path)[0]
-    out = stem + '_report.html'
+    out = f'{stem}_{step}_report.html' if step != '?' else stem + '_report.html'
     best = ckpt.get('best_val_loss', float('inf'))
     params = model.param_count() / 1e6
 
