@@ -18,7 +18,7 @@ class GroupedMLP(nn.Module):
     G=32, d=128, expand=4 → 4× per-group expansion.
     With SwiGLU: gate and up projections both d → expand*d, down expand*d → d.
     """
-    def __init__(self, D, expand, groups, swiglu=True):
+    def __init__(self, D, expand, groups, swiglu=True, gate_b_init=0.25):
         super().__init__()
         assert D % groups == 0
         self.D = D
@@ -45,7 +45,7 @@ class GroupedMLP(nn.Module):
         # gate = silu(W_gate·h) · (a + b·mirror_gate). init a=1, b=0 → чистый
         # SwiGLU при init; b растёт, обучая MLP откликаться на сигнал зеркала.
         self.mlp_gate_a = nn.Parameter(torch.ones(1))
-        self.mlp_gate_b = nn.Parameter(torch.zeros(1))
+        self.mlp_gate_b = nn.Parameter(torch.full((1,), float(gate_b_init)))
 
     def forward(self, h, mirror_gate=None):
         B, L, D = h.shape

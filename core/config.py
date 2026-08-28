@@ -181,6 +181,13 @@ class WideBindConfig:
     # output actually changes the CE loss. Aligns per-expert mlp_mod to
     # g_target = ||∂CE/∂mlp_out|| (detached). 0 = disabled (default).
     gradalign_weight: float = 0.0
+    # Cognitive MLP gate opening (fix for "MLP asleep"): init mlp_gate_b > 0 so the
+    # mirror-gated MLP modulation (mlp_mod) actually scales the SwiGLU gate and
+    # mod_scale_mlp receives a CE-gradient path (can open/close). 0 disables.
+    mlp_gate_b_init: float = 0.25
+    # Per-depth MLP gradient boost (fix for vanishing gradient to deep MLP):
+    # scales MLP gradient by exp(mlp_depth_lr_exp * layer_idx). 0 = disabled.
+    mlp_depth_lr_exp: float = 0.15
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

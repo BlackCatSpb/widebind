@@ -952,6 +952,30 @@ class WideBindStack(nn.Module):
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
 
+    def apply_mlp_depth_gradient_boost(self, exp=None):
+        """Counter vanishing gradient to deep MLP layers (diagnostic: ~10k-20k x
+        collapse of MLP gradient by depth 8). Scales the gradient of every MLP
+        param in layer i by exp(exp * i) via a backward hook — optimizer- and
+        resume-safe (hooks live on the params, not the optimizer state).
+        exp defaults to cfg.mlp_depth_lr_exp; 0 disables."""
+        import math
+        exp = float(exp if exp is not None else getattr(self.cfg, 'mlp_depth_lr_exp', 0.0))
+        if exp <= 0:
+            return
+        n_applied = 0
+        for i, layer in enumerate(self.layers):
+            boost = math.exp(exp * i)
+            if abs(boost - 1.0) < 1e-6:
+                continue
+            for p in layer.mlp.parameters():
+                if p.requires_grad:
+                    p.register_hook(lambda grad, b=boost: grad * b)
+                    n_applied += 1
+        print(f'[mlp-boost] deep-MLP gradient x{math.exp(exp):.2f}/layer '
+              f'(L0=1.0 .. L{len(self.layers)-1}={math.exp(exp*(len(self.layers)-1)):.1f}), '
+              f'{n_applied} params hooked')
+
+
     @torch.no_grad()
     def collective_stats(self):
         """Per-layer summary of the Collective Concept Layer (col: log).

@@ -4191,3 +4191,25 @@ attention-кэшей классического LLM — подсветка ре�
   gradient highway / per-depth MLP lr boost so deep MLP receives gradient; (c) audit alpha-gate /
   contractive ops in backward for the attenuation source.
 
+
+
+## FIX: open cognitive MLP gate + deep-MLP gradient boost (2026-08-28)
+
+Root cause of "MLP asleep" confirmed: gradient to MLP weights and mod_scale_mlp collapses
+~10k-20k x from L0 to L8+ (depth-24 forced diagnostic). Gates cannot open where needed.
+
+Changes (commit pending):
+- A) Open the cognitive gate: mlp_gate_b init 0 -> cfg.mlp_gate_b_init=0.25 (core/mlp.py,
+  core/block.py). Previously mlp_mod was wired through mlp_gate_b=0, so mod_scale_mlp had
+  NO effect on forward and no CE-gradient path (structurally frozen, cosmetic in logs).
+  With b>0, mod_scale_mlp receives CE gradient and can open/close. On resume, checkpoint
+  saved mlp_gate_b=0 -> reinit to cfg.mlp_gate_b_init in train.py and notebook resume cell.
+- B) Deep-MLP gradient boost: WideBindStack.apply_mlp_depth_gradient_boost() registers a
+  backward hook scaling MLP gradient by exp(cfg.mlp_depth_lr_exp * layer_idx)
+  (default mlp_depth_lr_exp=0.15 -> L23 x31.5). Optimizer- and resume-safe (hooks live on
+  params). Called in train.py after model build and in notebook cell 7.
+- gradalign_weight was already 0.3 in the notebook but IGNORED under AMP (train.py:365);
+  with b>0 the gate now opens via the main CE loss, so gradalign is no longer required.
+- Default mlp_depth_lr_exp=0.15 is conservative; raise if deep MLP still asleep (monitor
+  mod_mlp and MLP W_std). Live collapse is likely milder than the init-artifact measurement.
+

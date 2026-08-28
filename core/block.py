@@ -157,7 +157,8 @@ class WideBindBlock(nn.Module):
         
         # ─── MLP (grouped: per-group 4× expansion, half params) ───
         self.mlp = GroupedMLP(cfg.D, expand=cfg.mlp_expand, groups=cfg.mlp_groups,
-                              swiglu=getattr(cfg, 'mlp_swiglu', True))
+                              swiglu=getattr(cfg, 'mlp_swiglu', True),
+                              gate_b_init=getattr(cfg, 'mlp_gate_b_init', 0.25))
 
         # ─── Variable Precision Memory ───
         self.precision_gate = PrecisionGate(cfg.D)

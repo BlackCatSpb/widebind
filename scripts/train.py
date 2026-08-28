@@ -182,6 +182,9 @@ def train(cfg=None, resume_path=None):
     # Phase tracking state (EMA-based adaptive threshold)
     model._phase_ratio_ema = [0.0] * cfg.n_layers
     model._phase_ratio_std = [1.0] * cfg.n_layers
+
+    # Fix for "MLP asleep": boost deep-MLP gradients to counter vanishing gradient.
+    model.apply_mlp_depth_gradient_boost()
     
     # Unified principled adaptation (core.adaptation) — single source of truth.
     # Replaces the old scattered guard: cosine/CosineWarmup LR, ReadinessActivator
@@ -246,6 +249,12 @@ def train(cfg=None, resume_path=None):
                 layer.mirror.log_skip_alpha.data.zero_()
                 nzero += 1
             print(f'  reset_skip_alpha: zeroed log_skip_alpha in {nzero} mirror layers (SMF L0-fix)')
+        # Fix for "MLP asleep": reopen the cognitive gate on resume (checkpoint saved
+        # mlp_gate_b=0, which froze mod_scale_mlp / disconnected the MLP modulation).
+        if getattr(cfg, 'mlp_gate_b_init', 0.0) > 0:
+            for layer in model.layers:
+                layer.mlp.mlp_gate_b.data.fill_(cfg.mlp_gate_b_init)
+            print(f'  reopened cognitive gate: mlp_gate_b -> {cfg.mlp_gate_b_init}')
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
