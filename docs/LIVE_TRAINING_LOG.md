@@ -4152,3 +4152,15 @@ attention-кэшей классического LLM — подсветка ре�
 - Expected next expansions: plateau at depth 12 -> 16, then 20, 24 (plateau-eval every ~233 steps).
 - DepthController fix (persist active_depth + expand only on plateau) validated on live training.
 
+
+
+## Depth expansion 12->16 at step 9553 (2026-08-28)
+
+- Next plateau (EVAL step=9553, val_loss=8.9635) -> DepthController expanded active_depth 12 -> 16
+  (slope=-0.0426 ~0 vs sigma=0.1227).
+- best.pt overwritten with active_depth=16. Sequence 8->12->16 confirmed; next expected 16->20 (~step 9786),
+  then 20->24 (~step 10000) on subsequent plateaus.
+- val 9.0061 -> 8.9635; ce ~7.87 (9570); ppl 8152 -> 7812. Steady improvement with depth.
+- mem 12.6 -> 13.0GB at depth 16. Watch T4 ~15GB ceiling approaching at depth 20-24.
+- mod_mlp=0.661 still (MLP asleep). tok/s ~60-63 stable.
+
