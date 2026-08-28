@@ -10,19 +10,19 @@ from .vsa_utils import fib_sigmoid_init, dct_basis
 class BridgeGLU(nn.Module):
     """GLU-style gating tooling that lives INSIDE the mirror/bridge.
 
-    Takes the semantic delta (B,L,G,d) and produces a per-expert gate (B,L,G)
-    in (0,1):  glu = sigmoid(Wg·delta) * sigmoid(Wv·delta).
+    Takes the semantic delta (B,L,G,k) in K-space and produces a per-expert gate
+    (B,L,G) in (0,1):  glu = sigmoid(Wg·delta) * sigmoid(Wv·delta).
     Replaces the frozen mod_scale_mlp scale, so the MLP gate becomes a live
     function of the bridge's semantic state instead of a stuck parameter.
     """
-    def __init__(self, G, d):
+    def __init__(self, G, k):
         super().__init__()
-        self.Wg = nn.Linear(G * d, G)
-        self.Wv = nn.Linear(G * d, G)
+        self.Wg = nn.Linear(G * k, G)
+        self.Wv = nn.Linear(G * k, G)
 
     def forward(self, delta):
-        B, L, G, d = delta.shape
-        flat = delta.reshape(B, L, G * d)                     # (B, L, G*d)
+        B, L, G, k = delta.shape
+        flat = delta.reshape(B, L, G * k)                    # (B, L, G*k)
         g = torch.sigmoid(self.Wg(flat))                     # (B, L, G)
         v = torch.sigmoid(self.Wv(flat))                     # (B, L, G)
         return g * v                                         # (B, L, G)
@@ -263,7 +263,7 @@ class GroupedCognitiveMirror(nn.Module):
         self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
         # BridgeGLU: GLU gating tooling inside the mirror (experimental; replaces
         # the mod_scale_mlp scale with a live gate when enabled).
-        self.bridge_glu_net = BridgeGLU(self.G, self.d) if bridge_glu else None
+        self.bridge_glu_net = BridgeGLU(self.G, self.k) if bridge_glu else None
         # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
         self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)
         # Error-gated damping: порог резонансного демпфирования α на инференсе
