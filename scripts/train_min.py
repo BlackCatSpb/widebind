@@ -148,7 +148,16 @@ def train(args):
             x = torch.tensor([[gen[-1]]]).to(device)
             h = model.embed_tokens(x)
             o, st, _, _ = model(h, st, step=0, intent_state=getattr(model, "_last_intent_state", None))
-            nxt = int(model.lm_head(o)[:, -1].argmax())
+            logits = model.lm_head(o)[:, -1]
+            if args.temperature and args.temperature > 0:
+                if args.top_k and args.top_k > 0:
+                    k = min(args.top_k, logits.size(-1))
+                    thr = torch.topk(logits, k).values.min()
+                    logits = logits.masked_fill(logits < thr, -1e9)
+                probs = torch.softmax(logits / args.temperature, -1)
+                nxt = int(torch.multinomial(probs, 1).item())
+            else:
+                nxt = int(logits.argmax())
             gen.append(nxt)
             if nxt == v2i.get(".", 0):
                 break
@@ -166,7 +175,21 @@ def main():
     ap.add_argument("--bridge_glu", action="store_true",
                     help="BridgeGLU: relocate SwiGLU gating into the mirror (semantic gate)")
     ap.add_argument("--log", type=int, default=100)
+    ap.add_argument("--temperature", type=float, default=0.8,
+                    help="generation sampling temperature (0 = greedy)")
+    ap.add_argument("--top_k", type=int, default=8,
+                    help="generation top-k (0 = disabled)")
     args = ap.parse_args()
+    # Tee stdout -> console + file (window closes after run, persist results)
+    tag = f"bglu{int(args.bridge_glu)}_wake{int(args.mlp_wake)}_bc{args.bridge_conn}"
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"mini_result_{tag}.txt")
+    _logf = open(log_path, "w", encoding="utf-8")
+    class Tee:
+        def write(self, s):
+            sys.stdout.write(s); _logf.write(s); _logf.flush()
+        def flush(self):
+            sys.stdout.flush(); _logf.flush()
+    sys.stdout = Tee()
     print(f"[mini] bridge_conn={args.bridge_conn} mlp_wake={args.mlp_wake} bridge_glu={args.bridge_glu} steps={args.steps}")
     train(args)
 
