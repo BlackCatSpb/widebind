@@ -202,6 +202,13 @@ class WideBindConfig:
     # keeps its SwiGLU; BridgeGLU is the *outer* semantic gate. Experimental.
     bridge_glu: bool = False
 
+    # bridge_conn: weight of the lightweight bridge-connectivity aux loss. The
+    # bridge predicts the NEXT token's embedding (via a small head defined in the
+    # training loop) so it learns "rules of connection" without a 168M softmax
+    # head. 0.0 = off. Used by the notebook/colab training loop, not by the core
+    # model forward (the head is external). 0.1 is a sane default.
+    bridge_conn: float = 0.0
+
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
     vsa_b_d_smooth: float = 0.999   # per-step lerp rate towards controller target
