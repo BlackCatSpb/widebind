@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .block import WideBindBlock, PrecisionGate, ExactSequenceMemory
+from .bridge import SemanticBridge
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
@@ -73,6 +74,17 @@ class WideBindStack(nn.Module):
         self.bus_head_proj = nn.Linear(self._n_experts * self._K_max, _head_K, bias=False)
         nn.init.zeros_(self.bus_head_proj.weight)
         self._last_bus = None
+        # ─── Semantic Bridge (in-pipeline per-layer) ───
+        # Runs INSIDE the forward (train + inference). At every layer a shared
+        # probe emits a semantic vector, a persistent cross-layer stream is
+        # injected back into the hidden state, and (training only) the probe is
+        # self-supervised to predict the next token's embedding. Off unless
+        # cfg.bridge_conn > 0. default-off => model untouched when disabled.
+        self.bridge = SemanticBridge(
+            cfg.D, cfg.n_layers,
+            bridge_dim=getattr(cfg, 'bridge_dim', 256),
+            depth=getattr(cfg, 'bridge_depth', True),
+        ) if getattr(cfg, 'bridge_conn', 0.0) > 0.0 else None
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         # ─── Idea 4: Per-layer τ_l deviation ───
@@ -233,6 +245,8 @@ class WideBindStack(nn.Module):
             _bus_running = torch.zeros_like(_bus_sum)
             _bus_le_carried = torch.zeros_like(_bus_sum)
         _last_bus = None
+        if self.bridge is not None:
+            self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):
             if adaptive:
                 l_expl, l_diff = AdaptiveController.layer_stats(layer,
@@ -287,7 +301,18 @@ class WideBindStack(nn.Module):
                 _bus_le_carried = _bus_le_carried + _bus_carried[i]
                 bus_i = (_bus_running + (_bus_sum - _bus_le_carried)) / n_layers  # (1,1,G,Kmax)
                 _last_bus = bus_i
-                intent_i = bus_i[..., :_ki]  # truncate to layer k
+                intent_i = bus_i[..., :_ki]            # truncate to layer k
+            # ─── Semantic Bridge (in-pipeline per-layer) ───
+            # Inject the carried cross-layer stream into this layer's hidden state,
+            # then emit + record the layer's semantic vector and EMA-update the
+            # persistent stream (so lower layers see a FRESH bridge from it within
+            # this step, and upper layers a CARRIED one — same streaming pattern as
+            # the Intent Bridge). Runs in train and inference alike.
+            if self.bridge is not None:
+                h = self.bridge.inject_layer(i, h)
+                _s_l = self.bridge.probe_layer(h)        # (B, L, bridge_dim), grad
+                self.bridge.record(_s_l)
+                self.bridge.update_stream(i, _s_l)
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
                 _saved_pen = layer.mirror._cached_pred_error_norm
@@ -927,6 +952,14 @@ class WideBindStack(nn.Module):
             aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
             aux_dict['ls_reg'] = log_scale_reg
+        # ─── Semantic Bridge aux loss (per-layer next-token embedding prediction) ───
+        # Each layer's probe is self-supervised to predict the next token's
+        # embedding (cosine). Dense, well-distributed gradient at every depth;
+        # weights/balances the rest of the aux suite via the training LossBalancer.
+        if self.bridge is not None and self.bridge._preds is not None:
+            _bl = self.bridge.loss(targets, self.embed)
+            if _bl is not None:
+                aux_dict['bridge_conn'] = _bl
         return ce_loss, aux_dict
     
     @staticmethod

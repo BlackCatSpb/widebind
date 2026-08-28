@@ -1,13 +1,14 @@
 """Mini testbed for WideBind semantic-connectivity experiments.
 
-Goal: try the "double signal" idea cheaply, locally, on CPU.
+Goal: try the per-layer semantic bridge cheaply, locally, on CPU.
 - Head is UNTOUCHED: training uses plain CE (model.compute_losses).
-- Bridge gets an optional self-supervised aux loss (--bridge_conn): predict the
-  next element from the bridge/stream signal. Deterministic tokenization => the
-  next element is a free label, so the bridge learns "how things connect".
+- Bridge gets an optional self-supervised aux loss (--bridge_conn): the IN-CORE
+  SemanticBridge (core/bridge.py) runs a per-layer probe inside the model forward
+  and model.compute_losses() returns 'bridge_conn' (each layer predicts the next
+  token's embedding via cosine). Deterministic tokenization => the next token is a
+  free label, so the bridge learns "how things connect" at every depth.
 - MLP wake (reopen mod_scale_mlp + depth gradient boost) is toggled via
   --mlp_wake (uses the already-implemented core hooks/reinit).
-No core changes: the aux head lives here, outside the model.
 """
 import argparse
 import math
@@ -60,7 +61,7 @@ def to_batches(ids, seq_len, batch, n_batches):
     return torch.tensor(X), torch.tensor(Y)
 
 
-def build_model(vocab_size, bridge_glu=False):
+def build_model(vocab_size, bridge_glu=False, bridge_conn=0.0):
     cfg = WideBindConfig(
         D=256, n_layers=4, orth_weight=0.0,
         bind_K=32, mlp_groups=4, mlp_expand=2,
@@ -71,6 +72,8 @@ def build_model(vocab_size, bridge_glu=False):
         explicit_reasoning=False,
         intent_bridge=True,
         bridge_glu=bridge_glu,
+        bridge_conn=bridge_conn,
+        bridge_dim=128,
     )
     model = WideBindStack(cfg)
     return model, cfg
@@ -79,19 +82,17 @@ def build_model(vocab_size, bridge_glu=False):
 def train(args):
     ids, vocab, v2i = make_corpus()
     V = len(vocab)
-    model, cfg = build_model(V, bridge_glu=args.bridge_glu)
+    model, cfg = build_model(V, bridge_glu=args.bridge_glu, bridge_conn=args.bridge_conn)
     device = "cpu"
     model.to(device)
     if args.mlp_wake:
         model.apply_mlp_depth_gradient_boost()
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
 
-    # external bridge aux head (separate, head untouched)
-    if args.bridge_conn > 0:
-        bridge_head = torch.nn.Linear(cfg.D, V).to(device)
-        bopt = torch.optim.AdamW(bridge_head.parameters(), lr=cfg.lr)
-    else:
-        bridge_head = None
+    # In-core SemanticBridge: if cfg.bridge_conn > 0 the model already runs a
+    # per-layer semantic probe inside forward and model.compute_losses() returns
+    # the 'bridge_conn' aux loss. No external head needed.
+    bridge = getattr(model, "bridge", None)
 
     n_batches = 200
     batch = 8
@@ -107,23 +108,17 @@ def train(args):
         state = None
         intent_state = getattr(model, "_last_intent_state", None)
         out, state, _, _ = model(h, state, step=step, intent_state=intent_state)
-        ce_loss, _ = model.compute_losses(out, y, h_emb=h)
+        ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
         loss = ce_loss
-        if bridge_head is not None:
-            sig = out[:, -1]  # bridge/stream signal proxy (grad flows into bridge)
-            lc = F.cross_entropy(bridge_head(sig), y[:, -1])
+        lc_val = float("nan")
+        if bridge is not None and "bridge_conn" in aux_dict:
+            lc = aux_dict["bridge_conn"]
             loss = loss + args.bridge_conn * lc
             lc_val = lc.item()
-        else:
-            lc_val = float("nan")
         opt.zero_grad(set_to_none=True)
-        if bridge_head is not None:
-            bopt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if bridge_head is not None:
-            bopt.step()
 
         if step % args.log == 0:
             # gate spread (wake check)
@@ -135,7 +130,7 @@ def train(args):
                     ms = torch.stack([torch.sigmoid(l.mirror.mod_scale_mlp).mean()
                                       for l in model.layers])
                     mlp_s = f"mod_mlp_mean={ms.mean().item():.3f} mod_mlp_std={ms.std().item():.3f}"
-            lc_s = "" if bridge_head is None else f" Lconn={lc_val:.3f}"
+            lc_s = "" if bridge is None else f" Lconn={lc_val:.3f}"
             print(f"step={step:>5} ce={ce_loss.item():.3f} {mlp_s}{lc_s} t={time.time()-t0:.0f}s")
     # generation sample (greedy) with bridge stream carried
     print("\n--- generation (prompt: 'cat') ---")

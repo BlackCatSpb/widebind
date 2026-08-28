@@ -215,12 +215,20 @@ class WideBindConfig:
     # keeps its SwiGLU; BridgeGLU is the *outer* semantic gate. Experimental.
     bridge_glu: bool = False
 
-    # bridge_conn: weight of the lightweight bridge-connectivity aux loss. The
-    # bridge predicts the NEXT token's embedding (via a small head defined in the
-    # training loop) so it learns "rules of connection" without a 168M softmax
-    # head. 0.0 = off. Used by the notebook/colab training loop, not by the core
-    # model forward (the head is external). 0.1 is a sane default.
+    # bridge_conn: weight of the per-layer in-pipeline semantic bridge aux loss.
+    # When > 0 a SemanticBridge runs inside the core forward (every layer emits a
+    # semantic vector, predicts the NEXT token's embedding via cosine loss, and a
+    # persistent cross-layer stream is injected back into each layer). This makes
+    # the bridge part of the live pipeline in BOTH training and inference. 0.0 =
+    # off. 0.1 is a sane default.
     bridge_conn: float = 0.0
+
+    # bridge_dim: semantic vector width for the in-core SemanticBridge probe.
+    bridge_dim: int = 256
+    # bridge_depth: inject cross-layer (bottom-up + top-down) stream neighbours
+    # back into each layer. If False the bridge still predicts next-token
+    # embeddings but does not inject a spatial stream signal.
+    bridge_depth: bool = True
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
