@@ -184,11 +184,12 @@ def main():
     tag = f"bglu{int(args.bridge_glu)}_wake{int(args.mlp_wake)}_bc{args.bridge_conn}"
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"mini_result_{tag}.txt")
     _logf = open(log_path, "w", encoding="utf-8")
+    _orig = sys.stdout
     class Tee:
         def write(self, s):
-            sys.stdout.write(s); _logf.write(s); _logf.flush()
+            _orig.write(s); _logf.write(s); _logf.flush()
         def flush(self):
-            sys.stdout.flush(); _logf.flush()
+            _orig.flush(); _logf.flush()
     sys.stdout = Tee()
     print(f"[mini] bridge_conn={args.bridge_conn} mlp_wake={args.mlp_wake} bridge_glu={args.bridge_glu} steps={args.steps}")
     train(args)
