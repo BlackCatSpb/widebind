@@ -255,7 +255,7 @@ def run_wake(model, ckpt):
     n_layers = len(model.layers)
     report = [f'Wake-up scan: step={step} layers={n_layers}']
 
-    mlp_wstd, gate_mlp, gate_mem, slot_occ, temp_vals, mat_counts = [], [], [], {}, [], []
+    mlp_wstd, gate_mlp, gate_mem, slot_occ, temp_vals, mat_counts, birth_gates = [], [], [], {}, [], [], []
     for i, layer in enumerate(model.layers):
         mlp = layer.mlp
         if hasattr(mlp, 'W_up'):
@@ -275,6 +275,8 @@ def run_wake(model, ckpt):
             mat = getattr(cl, '_mature_count', None)
             if mat is not None:
                 mat_counts.append(mat)
+            bg = cl.birth_gate_mean()
+            birth_gates.append(bg.item() if hasattr(bg, 'item') else float(bg))
 
     wstd = sum(mlp_wstd) / len(mlp_wstd)
     expected = W_STD_REF * torch.exp(torch.tensor(-DECAY_RATE * (step - REF_STEP))).item()
@@ -304,6 +306,15 @@ def run_wake(model, ckpt):
              f'modulation gate (marker #2, >0.75 = WAKE, baseline 0.668)')
     if abs(g_mlp - g_mem) > 0.2:
         _verdict(report, 'WAKE', [], f'mlp/mem gate divergence {abs(g_mlp - g_mem):.2f}')
+
+    if birth_gates:
+        bmean = sum(birth_gates) / len(birth_gates)
+        bmax = max(birth_gates)
+        report.append(f'  concept-birth gate mean={bmean:.4f} max={bmax:.4f}')
+        _verdict(report, 'PASS' if bmean > 1e-4 else 'WATCH',
+                 [f'L{i}: {bg:.4f}' for i, bg in sorted(enumerate(birth_gates),
+                                                          key=lambda t: -t[1])[:3]],
+                 f'concept-birth (режим Б): mean {bmean:.4f} (спит если ~0)')
 
     births = [i for i in EMPTY_SLOT_LAYERS if i in slot_occ and slot_occ[i] > 0]
     full = [i for i, o in slot_occ.items() if o >= 8]

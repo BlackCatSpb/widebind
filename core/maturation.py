@@ -88,8 +88,12 @@ class MaturationController(nn.Module):
         if tau_dev is not None:
             self._update_tau_norm(tau_dev)
         t = float(step)
+        # Top-down ramp: глубокие (глобальные) слои (tau_norm->1) открываются
+        # первыми — модель сначала опирается на грубую глобальную структуру, затем
+        # подключает локальную детализацию мелких слоёв. Инверсия исходного
+        # bottom-up порядка (где открывались сначала мелкие).
         gate = torch.sigmoid(
-            (t - (self.T0 + self.alpha * self.tau_norm * self.T_delay)) / self.delta_t)
+            (t - (self.T0 + self.alpha * (1.0 - self.tau_norm) * self.T_delay)) / self.delta_t)
         self.gate.copy_(gate)
         return gate
 

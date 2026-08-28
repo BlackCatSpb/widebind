@@ -209,8 +209,10 @@ def train(cfg=None, resume_path=None):
     watchdog = FailureDetector(model, scheduler, _make_opt,
                                os.path.join(cfg.save_dir, 'best.pt'), cfg.lr,
                                k_sigma=3.0, warmup=cfg.warmup_steps)
-    # Adaptive gradient clipping (AGC, scale-free ratio).
-    clipper = GradientClipper(c=0.01)
+    # Adaptive gradient clipping (AGC, scale-free ratio). WideBind-блоки
+    # трансформероподобны (MLP + концепт-внимание) -> docstring рекомендует
+    # c->0.1 для transformer-блоков (0.01 — режим ResNet из статьи).
+    clipper = GradientClipper(c=0.1)
 
     # AMP (Automatic Mixed Precision)
     use_amp = getattr(cfg, 'use_amp', False) and device == 'cuda'

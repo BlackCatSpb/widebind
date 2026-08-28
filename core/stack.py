@@ -138,9 +138,18 @@ class WideBindStack(nn.Module):
             if sB != B:
                 state = [None] * len(self.layers)
         if reasoning_buffer is None:
-            reasoning_buffer = getattr(self, '_reasoning_buffer', None)
-            reasoning_count = getattr(self, '_reasoning_count', None)
-            _reasoning_attr = True
+            if self.training:
+                # В обучении допускаем перенос deliberation-состояния между шагами
+                # (состояние цепочки мысли). При eval — СБРОС: иначе буфер от
+                # последнего шага обучения протаскивается в валидацию/генерацию
+                # и даёт ложную расходимость (ppl -> 1e6).
+                reasoning_buffer = getattr(self, '_reasoning_buffer', None)
+                reasoning_count = getattr(self, '_reasoning_count', None)
+                _reasoning_attr = True
+            else:
+                reasoning_buffer = None
+                reasoning_count = None
+                _reasoning_attr = False
         else:
             _reasoning_attr = False
         if self.explicit_reasoning and reasoning_buffer is not None:
