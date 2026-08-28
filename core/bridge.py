@@ -50,6 +50,9 @@ class SemanticBridge(nn.Module):
         # Injection strength. Initialised to 0 so the bridge starts as a no-op
         # (no disruption of an already-training run) and grows only if it helps.
         self.stream_log_scale = nn.Parameter(torch.zeros(1))
+        # Per-neighbour сигмоид-веса (i-1, i, i+1): нормированное среднее
+        # соседей вместо сырой суммы (режим Б — выпуклая комбинация, лакуна).
+        self.stream_log_weights = nn.Parameter(torch.zeros(3))
 
         # Persistent cross-layer stream: (n_layers, bridge_dim). EMA-updated,
         # not part of the autograd graph (detached when written).
@@ -80,11 +83,16 @@ class SemanticBridge(nn.Module):
             neigh.append(self.bridge_stream[i - 1])          # bottom-up (fresh)
         if i + 1 < self.n_layers:
             neigh.append(self.bridge_stream[i + 1])          # top-down (carried)
-        combined = torch.stack(neigh, 0).sum(0)              # (bridge_dim,)
-        scale = torch.tanh(self.stream_log_scale)
+        stack = torch.stack(neigh, 0)                        # (n, bridge_dim)
+        # Режим Б: нормированное сигмоид-среднее соседей (выпуклая комбинация,
+        # сумма весов = 1) вместо сырой суммы -> сохраняет лакуну между слоями.
+        sw = torch.sigmoid(self.stream_log_weights[:stack.shape[0]])
+        w = sw / sw.sum().clamp(min=1e-6)
+        combined = (stack * w.unsqueeze(-1)).sum(0)          # (bridge_dim,)
+        scale = torch.tanh(self.stream_log_scale)           # bounded ∈ (-1, 1)
         if maturity is not None:
             scale = scale * maturity
-        inj = scale * self.stream_proj(combined)             # (D,)
+        inj = scale * self.stream_proj(combined)             # (D,) — bounded сигнал
         return h_l + inj.view(1, 1, self.D)
 
     @torch.no_grad()

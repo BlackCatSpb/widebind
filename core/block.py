@@ -22,18 +22,26 @@ class PrecisionGate(nn.Module):
 
 
 class ExactSequenceMemory(nn.Module):
-    def __init__(self, D, k):
+    def __init__(self, D, k, softmax_free=True):
         super().__init__()
         self.query = nn.Linear(D, k)
         self.key = nn.Linear(D, k)
         self.value = nn.Linear(D, k)
         self.proj = nn.Linear(k, D)
         self.k = k
+        self.softmax_free = softmax_free
 
     def forward(self, h):
         q = self.query(h)
         k = self.key(h)
         v = self.value(h)
+        if self.softmax_free:
+            # LaCUR: сигмоид-нормированное среднее (проводимость, не конкуренция).
+            # Нормировка по сумме держит выход в выпуклой оболочке -> без взрыва.
+            scores = q @ k.transpose(-2, -1) / math.sqrt(self.k)
+            A = torch.sigmoid(scores)
+            A = A / A.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            return self.proj(A @ v)
         attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.k), dim=-1)
         return self.proj(attn @ v)
 
@@ -167,7 +175,8 @@ class WideBindBlock(nn.Module):
         # ─── Variable Precision Memory ───
         self.precision_gate = PrecisionGate(cfg.D)
         exact_k = min(64, cfg.D // 4)
-        self.exact_memory = ExactSequenceMemory(cfg.D, exact_k)
+        self.exact_memory = ExactSequenceMemory(cfg.D, exact_k,
+                                                 getattr(cfg, 'softmax_free', True))
         self.variable_precision = getattr(cfg, 'variable_precision', False)
         self.precision_threshold = getattr(cfg, 'precision_threshold', 0.3)
 
@@ -185,6 +194,7 @@ class WideBindBlock(nn.Module):
                 maturity_thresh=getattr(cfg, 'collective_maturity_thresh', 0.12),
                 seed=7 * (layer_idx + 1),
                 cfg=cfg,
+                softmax_free=getattr(cfg, 'softmax_free', True),
             )
     
     def forward(self, h, state=None, global_state=None,

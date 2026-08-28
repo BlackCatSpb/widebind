@@ -256,6 +256,14 @@ class WideBindConfig:
     # embeddings but does not inject a spatial stream signal.
     bridge_depth: bool = True
 
+    # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
+    # Все точки комбинации смыслов используют нормированное сигмоид-среднее
+    # (выпуклая комбинация, сумма весов = 1) вместо softmax-конкуренции.
+    # Сохраняет лакуну (потенциал несовпавшего) и проецирует горизонт
+    # событий, порождая новый концепт, без взрыва параметров. False = старый
+    # softmax (закрытый режим, для A/B).
+    softmax_free: bool = True
+
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
     vsa_b_d_smooth: float = 0.999   # per-step lerp rate towards controller target

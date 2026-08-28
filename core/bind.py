@@ -80,6 +80,7 @@ class BottleneckBind(nn.Module):
         self.D, self.K = D, K
         self.mode = getattr(cfg, "bind_twist_mode", "off")
         self.S = int(getattr(cfg, "bind_twist_S", 4))
+        self.softmax_free = getattr(cfg, "softmax_free", True)
         if self.mode == "off":
             self.S = 1
         self.ocular = getattr(cfg, "bind_twist_ocular", "tied")
@@ -183,7 +184,14 @@ class BottleneckBind(nn.Module):
                 crossed = self._cross(a[n-1] * self.w_u[n-1], a[n-2] * self.w_v[n-1], self.shifts[n-1])
                 a[n] = F.normalize(crossed + 1e-10, dim=-1) * seed_norm
 
-            mix = torch.softmax(self.mix_logit, dim=0)
+            if getattr(self, 'softmax_free', True):
+                # Режим Б: Фибоначчи-каскад смешивается нормированным
+                # сигмоид-средним (выпуклая комбинация членов развёртки),
+                # а не softmax-конкуренцией. Держит сумму весов = 1.
+                mix = torch.sigmoid(self.mix_logit)
+                mix = mix / mix.sum().clamp(min=1e-6)
+            else:
+                mix = torch.softmax(self.mix_logit, dim=0)
             if not self._tied and self.ocular == "multi":
                 out = None
                 for n in range(1, self.S + 1):

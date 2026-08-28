@@ -27,9 +27,12 @@ class CollectiveConceptLayer(nn.Module):
         maturity_thresh: float = 0.12,
         seed: int = 0,
         cfg=None,
+        softmax_free=None,
     ):
         super().__init__()
         self.cfg = cfg
+        self.softmax_free = (softmax_free if softmax_free is not None
+                             else (getattr(cfg, 'softmax_free', True) if cfg is not None else True))
         self.D = D
         self.k = k
         self.S = int(S)
@@ -171,7 +174,14 @@ class CollectiveConceptLayer(nn.Module):
         M_n = F.normalize(self.M, dim=-1)
         sim = shared @ M_n.T
         temp = self._temp.clamp(min=0.5)
-        a = torch.softmax(sim * temp, dim=-1)
+        if self.softmax_free:
+            # Режим Б: нормированное сигмоид-среднее (выпуклая комбинация
+            # концепт-слотов) вместо softmax-свёртки к ближайшему известному.
+            # Сохраняет лакуну -> интерпретатор именует потенциал, а не факт.
+            a = torch.sigmoid(sim * temp)
+            a = a / a.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        else:
+            a = torch.softmax(sim * temp, dim=-1)
         occ_w = (self.U_s / (self.U_s.max() + 1e-8)).clamp(0, 1)
         blend = (a.unsqueeze(-1) * occ_w.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
                  * M_n.unsqueeze(0).unsqueeze(0))
