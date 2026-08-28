@@ -100,6 +100,7 @@ class WideBindBlock(nn.Module):
             seq_len=cfg.seq_len,
             intent_bridge=getattr(cfg, 'intent_bridge', False),
             bridge_glu=getattr(cfg, 'bridge_glu', False),
+            bridge_glu_beta=getattr(cfg, 'bridge_glu_beta', 0.25),
             pm_write_delay=getattr(cfg, 'pm_write_delay', 5000),
             pm_coh_gate_std=getattr(cfg, 'pm_coh_gate_std', 0.02))
         

@@ -215,6 +215,13 @@ class WideBindConfig:
     # keeps its SwiGLU; BridgeGLU is the *outer* semantic gate. Experimental.
     bridge_glu: bool = False
 
+    # bridge_glu_beta: modulation strength of the live BridgeGLU gate AROUND the
+    # frozen stable baseline (sigmoid(mod_scale_mlp) ~ 0.667). BridgeGLU MODULATES
+    # the baseline (mlp_mod = base * (1 + beta*(2*glu-1))); it does NOT replace it.
+    # This keeps the run stable under the heavy aux suite (ranking~1e4) while the
+    # gate stays input/semantic-live. 0.25 = sane default.
+    bridge_glu_beta: float = 0.25
+
     # bridge_conn: weight of the per-layer in-pipeline semantic bridge aux loss.
     # When > 0 a SemanticBridge runs inside the core forward (every layer emits a
     # semantic vector, predicts the NEXT token's embedding via cosine loss, and a

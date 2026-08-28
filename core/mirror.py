@@ -74,8 +74,9 @@ class GroupedCognitiveMirror(nn.Module):
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
                  gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256,
-                  intent_bridge=False, bridge_glu=False,
-                  pm_write_delay=5000, pm_coh_gate_std=0.02):
+                   intent_bridge=False, bridge_glu=False,
+                   bridge_glu_beta=0.25,
+                   pm_write_delay=5000, pm_coh_gate_std=0.02):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -275,6 +276,12 @@ class GroupedCognitiveMirror(nn.Module):
         # BridgeGLU: GLU gating tooling inside the mirror (experimental; replaces
         # the mod_scale_mlp scale with a live gate when enabled).
         self.bridge_glu_net = BridgeGLU(self.G, self.k) if bridge_glu else None
+        # BridgeGLU modulation strength around the FROZEN stable baseline. The
+        # learnable gate must MODULATE the proven-stable sigmoid(mod_scale_mlp)
+        # anchor, not replace it — otherwise the stable ~0.667 MLP floor vanishes
+        # and the heavy aux suite (ranking~1e4) diverges the run. Centre-zero so
+        # init mlp_mod ≈ baseline; live semantic gate modulates ±beta around it.
+        self.bridge_glu_beta = bridge_glu_beta
         # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
         self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)
         # Error-gated damping: порог резонансного демпфирования α на инференсе
@@ -573,8 +580,13 @@ class GroupedCognitiveMirror(nn.Module):
         
         # Per-expert modulation strengths (gated by self-assessment)
         if self.bridge_glu_net is not None:
-            glu = self.bridge_glu_net(delta)                       # (B, L, G) — BridgeGLU: live semantic gate
-            mlp_mod = usefulness * glu
+            glu = self.bridge_glu_net(delta)                       # (B, L, G) — BridgeGLU: live semantic gate, in (0,1)
+            base = torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # frozen stable baseline ~0.667 (per-expert, input-independent)
+            # Live semantic modulation ANCHORED to the stable baseline (multiplicative,
+            # centre-zero): mlp_mod = base * (1 + beta*(2*glu - 1)). At init glu~0.25 ->
+            # factor ~0.875 -> mlp_mod ≈ 0.58*usefulness; as glu learns to centre (→0.5)
+            # it converges to the proven-stable baseline while staying input/semantic-live.
+            mlp_mod = usefulness * base * (1.0 + self.bridge_glu_beta * (2.0 * glu - 1.0))
         else:
             mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
