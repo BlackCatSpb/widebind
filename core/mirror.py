@@ -7,6 +7,27 @@ import torch.nn.functional as F
 from .config import WideBindConfig
 from .vsa_utils import fib_sigmoid_init, dct_basis
 
+class BridgeGLU(nn.Module):
+    """GLU-style gating tooling that lives INSIDE the mirror/bridge.
+
+    Takes the semantic delta (B,L,G,d) and produces a per-expert gate (B,L,G)
+    in (0,1):  glu = sigmoid(Wg·delta) * sigmoid(Wv·delta).
+    Replaces the frozen mod_scale_mlp scale, so the MLP gate becomes a live
+    function of the bridge's semantic state instead of a stuck parameter.
+    """
+    def __init__(self, G, d):
+        super().__init__()
+        self.Wg = nn.Linear(G * d, G)
+        self.Wv = nn.Linear(G * d, G)
+
+    def forward(self, delta):
+        B, L, G, d = delta.shape
+        flat = delta.reshape(B, L, G * d)                     # (B, L, G*d)
+        g = torch.sigmoid(self.Wg(flat))                     # (B, L, G)
+        v = torch.sigmoid(self.Wv(flat))                     # (B, L, G)
+        return g * v                                         # (B, L, G)
+
+
 class GroupedCognitiveMirror(nn.Module):
     """
     Ансамбль из 32 экспертов-зеркал, каждый в своём d=128 подпространстве (D=4096).
@@ -49,7 +70,7 @@ class GroupedCognitiveMirror(nn.Module):
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
                  gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256,
-                 intent_bridge=False):
+                 intent_bridge=False, bridge_glu=False):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -58,6 +79,7 @@ class GroupedCognitiveMirror(nn.Module):
         self.d = D // G
         self.seq_len = seq_len
         self.tie_mirror_proj = tie_mirror_proj
+        self.bridge_glu = bridge_glu
         # φ — единая когнитивная координата глубины (логарифмическая)
         phi = math.log(1 + layer_idx) / math.log(max(n_layers, 2))
         self.register_buffer('phi', torch.tensor(phi))
@@ -239,6 +261,9 @@ class GroupedCognitiveMirror(nn.Module):
         # Per-expert масштабы модуляции (learned log-scale)
         self.mod_scale_mlp = nn.Parameter(torch.full((G,), math.log(2.0)))
         self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
+        # BridgeGLU: GLU gating tooling inside the mirror (experimental; replaces
+        # the mod_scale_mlp scale with a live gate when enabled).
+        self.bridge_glu_net = BridgeGLU(self.G, self.d) if bridge_glu else None
         # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
         self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)
         # Error-gated damping: порог резонансного демпфирования α на инференсе
@@ -529,7 +554,11 @@ class GroupedCognitiveMirror(nn.Module):
 
         
         # Per-expert modulation strengths (gated by self-assessment)
-        mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
+        if self.bridge_glu_net is not None:
+            glu = self.bridge_glu_net(delta)                       # (B, L, G) — BridgeGLU: live semantic gate
+            mlp_mod = usefulness * glu
+        else:
+            mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
         
         # Linear projection + skip connection

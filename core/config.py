@@ -195,6 +195,12 @@ class WideBindConfig:
     # (sigmoid 0.667 = "asleep"). On resume set it to log(3)~1.10 (sigmoid 0.75)
     # so the gate starts clearly open AND the deep-MLP gradient boost can move it.
     mlp_mod_scale_reopen: float = 1.0986  # math.log(3.0)
+    # BridgeGLU: relocate SwiGLU gating tooling INTO the mirror/bridge. When True,
+    # the per-expert MLP gate (mlp_mod) is produced by a GLU network over the
+    # semantic delta instead of the frozen mod_scale_mlp parameter. The gate thus
+    # becomes a live function of the bridge (semantic), not a stuck param. MLP
+    # keeps its SwiGLU; BridgeGLU is the *outer* semantic gate. Experimental.
+    bridge_glu: bool = False
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)
