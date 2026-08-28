@@ -4242,3 +4242,8 @@ Changes (commit pending):
 - Fix: apply_mlp_depth_gradient_boost now also hooks layer.mirror.mod_scale_mlp and mod_scale_mem (depth-scaled). Resume reinit now also sets mod_scale_mlp -> cfg.mlp_mod_scale_reopen (=log(3)~0.75, new config knob). Files: core/stack.py, core/config.py, scripts/train.py, notebooks/colab.ipynb.
 - Expected: mod_mlp leaves 0.667 and starts moving once gradient flows (executor 'woke'). Train CE already healthy: 8.69->7.66 at step ~10340.
 - TODO: EVAL val_loss=13.73 (worse than random 11.09) at step 10252. Eval runs adaptive=False + state=None (no memory/intent) => lower bound vs train CE (with memory). Checkpoint best_val_loss=8.85 was a different protocol. Monitor eval TREND, not absolute.
+
+
+## 2026-08-28c - reopened gate recovers eval (13.73 -> 8.866)
+- After restart with mod_scale_mlp reopened to 0.75: EVAL@10718 val_loss=8.866 (ppl 7087) - back to checkpoint 8.85. The earlier 13.73 was the frozen/low gate (eval also runs with no memory). Train CE healthy 8.67->8.14->8.53.
+- mod_mlp pinned at mean 0.750 across steps: gate is OPEN, mean stable (expected; per-expert spread hidden by mean). Next best.pt (~eval 12252) -> run diag_mlp_core.py to confirm sigmoid(mod_scale_mlp) spread (executor 'woke' = spread > init).
