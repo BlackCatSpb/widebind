@@ -334,6 +334,27 @@ def run_wake(model, ckpt):
             if log_temp.mean().item() > 0.25:
                 _verdict(report, 'WATCH', [], 'log_temp rising (softmax flattening)')
 
+    mat = getattr(model, 'maturation', None)
+    mat_info = None
+    if mat is not None:
+        g = mat.gate
+        gl = g.tolist()
+        gmin, gmax = min(gl), max(gl)
+        gmean = sum(gl) / len(gl)
+        rmax = float(mat.readiness.max().item()) if hasattr(mat, 'readiness') else 0.0
+        report.append(f'  MATURATION gate: min={gmin:.4f} max={gmax:.4f} mean={gmean:.4f} '
+                      f'(ramp T0={mat.T0:.0f} delta={mat.delta_t:.0f} T_delay={mat.T_delay:.0f})')
+        report.append(f'  readiness max={rmax:.4f}  tau_norm max={mat.tau_norm.max().item():.3f}')
+        if gmax < 0.05:
+            _verdict(report, 'WATCH', [],
+                     f'maturation gates still ~closed (max {gmax:.3f}) — bridge not engaged yet')
+        else:
+            _verdict(report, 'PASS', [],
+                     f'maturation gate opening (max {gmax:.3f}) — bridge engaging')
+        mat_info = {'gate': gl, 'gmin': gmin, 'gmax': gmax, 'gmean': gmean,
+                    'readiness_max': rmax, 'tau_norm_max': float(mat.tau_norm.max().item()),
+                    'T0': mat.T0, 'delta': mat.delta_t, 'T_delay': mat.T_delay}
+
     hdr = 'OK' if not any(r.startswith('  [WAKE') for r in report) else 'WAKE-CANDIDATE'
     print(f'\nWAKE DETECTOR (verdict: {hdr})')
     for line in report:
@@ -354,6 +375,7 @@ def run_wake(model, ckpt):
         'slots': sum(slot_occ.values()), 'full': len(full), 'births': births,
         'temp_mean': (sum(temp_vals) / len(temp_vals)) if temp_vals else None,
         'mat_locked': n_zero if mat_counts else None,
+        'mat': mat_info,
     }
 
 
@@ -462,12 +484,15 @@ def run_live(model, cfg, batch=1, seq=128, gradinfo=True):
         except Exception as e:
             print(f'  [warn] grad info: {e}')
 
+    usef_vals = [l.mirror._cached_usefulness.mean().item() for l in model.layers
+                 if hasattr(l.mirror, '_cached_usefulness')]
     return {
         'in_norm': h.norm(dim=-1).mean().item(),
         'out_norm': h_out.norm(dim=-1).mean().item(),
         'out_std': h_out.std().item(),
         'ce_random': ls.item(), 'pred': aux['pred'], 'gate_l1': aux['gate_l1'],
         'balance': aux['balance'],
+        'usef': (sum(usef_vals) / len(usef_vals)) if usef_vals else float('nan'),
         'rows': rows, 'signals': signals, 'mirror': mirror_rows,
         'vsa_tau': [vsa_tau[0].item(), vsa_tau[-1].item()],
         'tau_l_dev': td.mean().item(), 'tau_l_dev_std': td.std().item(),
@@ -901,7 +926,12 @@ def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=No
         w_sal_val = torch.stack([torch.sigmoid(l.mirror.w_sal.data).mean()
                                  for l in model.layers]).mean().item()
     tau_intent_dev_val = (model._tau_intent_dev.data.mean().item()
-                          if hasattr(model, '_tau_intent_dev') else None)
+                           if hasattr(model, '_tau_intent_dev') else None)
+
+    if live is None:
+        live = {'ce_random': float('nan'), 'pred': float('nan'), 'tau_l_dev': float('nan'),
+                'gate_l1': float('nan'), 'usef': float('nan'), 'rows': [], 'signals': [],
+                'mirror': [], 'grad_info': None}
 
     badge = lambda flag: (f'<span class="bdg b-{flag}">{flag}</span>'
                           if flag in ('PASS', 'WATCH', 'WAKE') else flag)
@@ -938,6 +968,12 @@ td:first-child,th:first-child{text-align:left}
         ('pred', f'{live["pred"]:.3f}'), ('gate_l1', f'{live["gate_l1"]:.5f}'),
         ('tau_l_dev', f'{live["tau_l_dev"]:.4f}'),
     ]
+    if wake.get('mat') is not None:
+        m = wake['mat']
+        cards.append(('mat gate', f'{m["gmax"]:.3f}'))
+        cards.append(('mat mean', f'{m["gmean"]:.3f}'))
+    if not math.isnan(live.get('usef', float('nan'))):
+        cards.append(('usef', f'{live["usef"]:.3f}'))
     for k, v in cards:
         ch.append(f'<div class="card"><b>{v}</b><span>{k}</span></div>')
     if w_sal_val is not None:
@@ -979,6 +1015,20 @@ td:first-child,th:first-child{text-align:left}
         ch.append(f'<div class="hc" title="L{lyr}: {d:+.5f}" style="background:hsl({hue:.0f},75%,32%)">'
                   f'{lyr}<br>{d:+.4f}</div>')
     ch.append('</div>')
+
+    if wake.get('mat') is not None:
+        m = wake['mat']
+        ch.append(f'<h2>MATURATION gate (live wake-up ramp; T0={m["T0"]:.0f} '
+                  f'delta={m["delta"]:.0f} T_delay={m["T_delay"]:.0f})</h2>')
+        ch.append('<div class="heat">')
+        for lyr, v in enumerate(m['gate']):
+            hue = _hue(v, 0.0, 0.8)
+            ch.append(f'<div class="hc" title="L{lyr}: {v:.4f}" style="background:hsl({hue:.0f},75%,32%)">'
+                      f'{lyr}<br>{v:.2f}</div>')
+        ch.append('</div>')
+        ch.append(f'<div class="dim">readiness max={m["readiness_max"]:.4f} '
+                  f'&nbsp; tau_norm max={m["tau_norm_max"]:.3f} '
+                  f'(gate opens deeper layers later via tau-geometry)</div>')
 
     ch.append('<h2>LIVE — per-layer dissection</h2>')
     ch.append('<table><tr><th>L</th><th>||hp||</th><th>predMSE</th><th>|mirror|</th>'
