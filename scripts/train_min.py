@@ -129,7 +129,8 @@ def train(args):
             # gate spread (wake check)
             with torch.no_grad():
                 if any(l.mirror.bridge_glu_net is not None for l in model.layers):
-                    mlp_s = "bglu=on"
+                    gcat = torch.cat([l.mirror._last_mlp_mod.flatten() for l in model.layers])
+                    mlp_s = f"bglu_mean={gcat.mean().item():.3f} bglu_std={gcat.std().item():.3f}"
                 else:
                     ms = torch.stack([torch.sigmoid(l.mirror.mod_scale_mlp).mean()
                                       for l in model.layers])

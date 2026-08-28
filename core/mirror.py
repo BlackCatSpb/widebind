@@ -560,6 +560,7 @@ class GroupedCognitiveMirror(nn.Module):
         else:
             mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
+        self._last_mlp_mod = mlp_mod.detach()                      # for diagnostics (gate spread / aliveness)
         
         # Linear projection + skip connection
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)
