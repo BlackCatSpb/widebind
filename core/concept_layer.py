@@ -173,28 +173,28 @@ class CollectiveConceptLayer(nn.Module):
         self._concept_id = best
 
         B, L, G, k = hp.shape
-        if gate is not None and gate.shape[-1] == G:
-            # Подсознание = эксперты (G каналов K-пространства) и их гейты.
-            # «Перевод» (shared), подаваемый в Сознание, взвешивается по
-            # активности экспертов, а не усредняется вслепую: проекция Горизонта
-            # Событий опирается на живое подсознание, а не на статистику всех
-            # экспертов поровну.
-            gw = gate.float()
-            gsum = gw.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-            shared = F.normalize((hp * gw.unsqueeze(-1)).sum(dim=-2) / gsum, dim=-1)
-        else:
-            shared = F.normalize(hp.mean(dim=-2), dim=-1)
         M_n = F.normalize(self.M, dim=-1)
-        sim = shared @ M_n.T
+        # Подсознание = множество экспертов (G каналов K-пространства) и их
+        # гейтов. Образ мышления статьи: понимание — не усреднение, а параллельное
+        # множество взглядов. Сравнение с концептами ведётся ПЕР-ЭКСПЕРТНО
+        # (sim_g: каждый эксперт несёт своё понимание), и лишь затем множество
+        # переводится gate-взвешенно в читаемый для Сознания уровень. Тем самым
+        # множественность подсознания не стягивается в точку ДО интерпретации
+        # (проводимость, а не коллапс).
+        gate_w = gate.float() if (gate is not None and gate.shape[-1] == G) else torch.ones(B, L, G, device=hp.device)
+        gsum = gate_w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        hpg = F.normalize((hp * gate_w.unsqueeze(-1)).sum(dim=-2) / gsum, dim=-1)  # (B,L,k) ядро подсознания
+        sim_g = torch.einsum('blgk,sk->blgs', hp, M_n)            # (B,L,G,S) множество пониманий
         temp = self._temp.clamp(min=0.5)
         if self.softmax_free:
-            # Режим Б: нормированное сигмоид-среднее (выпуклая комбинация
-            # концепт-слотов) вместо softmax-свёртки к ближайшему известному.
-            # Сохраняет лакуну -> интерпретатор именует потенциал, а не факт.
-            a = torch.sigmoid(sim * temp)
-            a = a / a.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            # Режим Б: нормированное сигмоид-среднее ПО ЭКСПЕРТАМ (каждый эксперт
+            # сам мягко взвешивает концепт-слоты, без конкуренции), затем
+            # перевод множества в читаемый уровень. Сохраняет лакуну.
+            a_g = torch.sigmoid(sim_g * temp)
+            a_g = a_g / a_g.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         else:
-            a = torch.softmax(sim * temp, dim=-1)
+            a_g = torch.softmax(sim_g * temp, dim=-1)
+        a = (a_g * gate_w.unsqueeze(-1)).sum(dim=-2) / gsum        # (B,L,S) перевод множества
         occ_w = (self.U_s / (self.U_s.max() + 1e-8)).clamp(0, 1)
         blend = (a.unsqueeze(-1) * occ_w.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
                  * M_n.unsqueeze(0).unsqueeze(0))
@@ -219,17 +219,19 @@ class CollectiveConceptLayer(nn.Module):
             # Порождаем потенциал: выпуклая сигмоид-смесь ближайших концептов
             # (сохраняет лакуну) + остаток новизны (то, что вне известного).
             # Это и есть «лиса» из «собака+кошка»: новый концепт в промежутке.
-            best_sim = sim.max(dim=-1, keepdim=True).values            # (B,L,1)
+            best_sim = a.max(dim=-1, keepdim=True).values            # (B,L,1)
             birth_open = torch.sigmoid(self._contra_gain * (self._birth_gap - best_sim))
             birth_gate = torch.sigmoid(self._birth_log_scale) * birth_open
             self._cached_birth_gate = birth_gate.detach().mean()
             if birth_gate.mean().item() > 1e-4:
-                topk = torch.topk(sim, k=2, dim=-1)
+                topk = torch.topk(a, k=2, dim=-1)
                 w12 = torch.sigmoid(topk.values * temp)               # (B,L,2)
                 w12 = w12 / w12.sum(dim=-1, keepdim=True)             # нормировка
                 M12 = M_n[topk.indices]                               # (B,L,2,k)
                 neigh = (w12.unsqueeze(-1) * M12).sum(dim=-2)         # выпуклая смесь ближайших
-                residual = shared - (a.unsqueeze(-1) * M_n).sum(dim=-2)  # новизна вне известного
+                # residual = новизна вне известного, по ядру подсознания (множество
+                # экспертов уже переведено gate-взвешенно в hpg)
+                residual = hpg - (a.unsqueeze(-1) * M_n).sum(dim=-2)
                 horizon = F.normalize(neigh + residual, dim=-1)       # проекция горизонта
                 birth = self.W_o(horizon.unsqueeze(-2).expand(-1, -1, self.S, -1).reshape(B, L, -1))  # -> то же пространство D
                 out = out + birth_gate * birth * u_gate * c_gate
