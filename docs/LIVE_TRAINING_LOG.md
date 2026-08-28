@@ -4136,3 +4136,19 @@ attention-кэшей классического LLM — подсветка ре�
   => L12 w_intent наконец сможет расти. Затем 8388->20, 8621->24 (все слои снова активны).
   Ждать analyze на best.pt ~step 8155+ (где depth>=16), чтобы поймать пробуждение L12.
 - Отчёт: checkpoints/best_7922_report.html.
+
+
+## Depth expansion 8->12 at step 9320 (2026-08-28)
+
+- Log confirmed the prediction: at val plateau (EVAL step=9320, val_loss=9.0061) DepthController
+  expanded active_depth 8 -> 12 (val plateau slope=-0.0415 ~0 vs sigma=0.0985 -> active_depth=12/24).
+- best.pt overwritten carrying active_depth=12 => next resume restores 12 (reset-to-heuristic-8 eliminated).
+- val progress: 10.0982 (8854) -> 9.0476 (9087) -> 9.0061 (9320); ce ~7.9 (9405); ppl 24299 -> 8152.
+- mem grew 12.2GB -> 12.6GB at depth 12 (expected, more active layers). Watch T4 limit (~15GB)
+  on further expansion 16/20/24.
+- lr_adapt: ls_mult now [min=1.000 max=1.004] (was flat 1.000 at depth 8); gate_var 0.102 -> 0.156 -
+  per-layer LR adaptation more active as depth grows.
+- mod_mlp=0.661 (MLP asleep, as before); tok/s ~59-63.
+- Expected next expansions: plateau at depth 12 -> 16, then 20, 24 (plateau-eval every ~233 steps).
+- DepthController fix (persist active_depth + expand only on plateau) validated on live training.
+
