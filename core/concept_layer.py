@@ -42,6 +42,9 @@ class CollectiveConceptLayer(nn.Module):
         self._contra_gain = float(contra_gain)
         self._birth_gap = float(birth_gap)
         self._maturity_thresh = float(maturity_thresh)
+        # Рождение концепта (горизонт событий, режим Б): стартует почти выключенным
+        # (sigmoid(-3)~0.05), растёт только если проекция потенциала помогает CE.
+        self._birth_log_scale = nn.Parameter(torch.tensor(-3.0))
 
         g = torch.Generator().manual_seed(seed)
         m_init = torch.randn(S, k, generator=g)
@@ -198,4 +201,26 @@ class CollectiveConceptLayer(nn.Module):
                 self._gate_c.fill_(c_gate.mean().item())
 
         scale = torch.sigmoid(self._read_scale)
-        return read * u_gate * c_gate * scale
+        out = read * u_gate * c_gate * scale
+
+        if self.softmax_free and self.S >= 2:
+            # ─── Проекция горизонта событий (рождение концепта) ───
+            # best_sim низок => вход — Феномен (лакуна между известными).
+            # Порождаем потенциал: выпуклая сигмоид-смесь ближайших концептов
+            # (сохраняет лакуну) + остаток новизны (то, что вне известного).
+            # Это и есть «лиса» из «собака+кошка»: новый концепт в промежутке.
+            best_sim = sim.max(dim=-1, keepdim=True).values            # (B,L,1)
+            birth_open = torch.sigmoid(self._contra_gain * (self._birth_gap - best_sim))
+            birth_gate = torch.sigmoid(self._birth_log_scale) * birth_open
+            if birth_gate.mean().item() > 1e-4:
+                topk = torch.topk(sim, k=2, dim=-1)
+                w12 = torch.sigmoid(topk.values * temp)               # (B,L,2)
+                w12 = w12 / w12.sum(dim=-1, keepdim=True)             # нормировка
+                M12 = M_n[topk.indices]                               # (B,L,2,k)
+                neigh = (w12.unsqueeze(-1) * M12).sum(dim=-2)         # выпуклая смесь ближайших
+                residual = shared - (a.unsqueeze(-1) * M_n).sum(dim=-2)  # новизна вне известного
+                horizon = F.normalize(neigh + residual, dim=-1)       # проекция горизонта
+                birth = self.W_o(horizon.unsqueeze(-2).expand(-1, -1, self.S, -1).reshape(B, L, -1))  # -> то же пространство D
+                out = out + birth_gate * birth * u_gate * c_gate
+
+        return out
