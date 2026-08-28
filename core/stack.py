@@ -262,8 +262,12 @@ class WideBindStack(nn.Module):
         # and the intent bus. At M_l~0 only the frozen base MLP (~0.667) is active.
         mat_gate = None
         if self.maturation is not None:
-            _mstep = step if step is not None else 10_000_000
-            mat_gate = self.maturation.step_gate(_mstep, self._tau_l_dev.detach())
+            if step is None:
+                # Inference/eval: reuse the LAST training gate (never force-open, which
+                # would scramble eval vs train — the bug that produced ppl 485M).
+                mat_gate = self.maturation.gate
+            else:
+                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
         if self.bridge is not None:
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):

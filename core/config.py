@@ -86,10 +86,11 @@ class WideBindConfig:
     # The frozen base MLP gate (~0.667) stays OPEN regardless (no deadlock).
     maturation_enabled: bool = True
     matur_alpha: float = 1.0        # geometry delay strength
-    matur_T_delay: float = 20000.0  # deepest layer opens at ~alpha*T_delay steps
-    matur_delta: float = 4000.0     # geometry ramp width (steps)
-    matur_r0: float = 0.6           # readiness sigmoid center (saturation needed)
-    matur_rs: float = 0.3           # readiness sigmoid slope
+    matur_T0: float = 20000.0       # gate starts opening at ~T0 steps (smooth ramp-in)
+    matur_T_delay: float = 20000.0  # deepest layer opens at ~T0 + alpha*T_delay steps
+    matur_delta: float = 6000.0     # geometry ramp width (steps)
+    matur_r0: float = 0.6           # readiness sigmoid center (diagnostics only)
+    matur_rs: float = 0.3           # readiness sigmoid slope (diagnostics only)
     matur_ema: float = 0.999        # pred-error EMA decay (smoothness)
     matur_warm: int = 300           # warm steps: capture random-regime pred_err_init
     matur_write_thr: float = 0.3    # maturity needed before private-memory writes

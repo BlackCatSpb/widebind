@@ -4,26 +4,27 @@ Replaces the ad-hoc wake-up crutches (hard pm_coh threshold on mlp_mod std,
 fixed pm_write_delay, bridge-injection scale=0 hack) with ONE principled
 mechanism: each layer l has a maturity M_l(t) in [0,1] that gates EVERY
 "wake-up" signal (live BridgeGLU modulation, private-memory write, semantic
-bridge injection, intent bus). M_l is the product of two smooth, principled
-factors:
+bridge injection, intent bus).
 
-  readiness_l(t) : expert saturation on layer l. Experts are "ripe" when their
-                   prediction-error has DROPPED relative to the initial (random)
-                   regime. readiness = sigmoid((sat_l - r0)/rs),
-                   sat_l = 1 - EMA(pred_err_l) / pred_err_init_l.
-  geometry_l(t)  : deeper layers (larger tau in the VSA ladder) engage LATER,
-                   unified with the model's tau geometry (log-normalised so the
-                   ladder spans [0,1] instead of 5 decades of raw tau):
-                   geom_l = sigmoid((t - alpha*tau_norm_l*T_delay)/delta_t).
+  M_l(t) = sigmoid((t - (T0 + alpha*tau_norm_l*T_delay)) / delta_t)
 
-  M_l = readiness_l * geometry_l.
+i.e. a SMOOTH TIME/τ RAMP. It starts at ~0 for every layer (so the trunk is
+never perturbed by untrained wake-up branches at init -> no divergence), then
+opens gradually on a schedule: shallow layers (small tau in the VSA ladder)
+open first, deeper layers later, unified with the model's τ geometry
+(log-normalised so the ladder spans [0,1] instead of 5 decades of raw tau).
 
-At M_l ~ 0 every wake-up branch is ~closed, but the FROZEN base MLP gate
-(sigmoid(mod_scale_mlp) ~ 0.667) stays OPEN — so the model learns from step 0
-(the old, proven-stable regime), experts saturate, readiness rises, and only
-THEN do the live modulation / memory-write / bridge-inject / intent engage,
-smoothly, layer-by-layer. No divergence (residual gain rho ~ 1 at start), no
-deadlock (the base MLP always provides the learning signal).
+Why a time ramp and not expert-saturation (readiness)? At scale the base model
+does NOT learn LM on its own (ce ~ ln(vocab), random baseline), so a
+readiness trigger (pred_err must DROP first) deadlocks: gate closed -> no
+learning -> pred_err never drops -> gate stays closed forever -> bridge never
+engages. The time ramp breaks that by opening the wake-up branches on a fixed
+schedule, giving the bridge a chance to supply the learning signal while
+staying smooth enough to avoid the original divergence.
+
+The FROZEN base MLP gate (sigmoid(mod_scale_mlp) ~ 0.667) stays OPEN regardless
+(no deadlock). `readiness` is still tracked (see update) and exposed for
+diagnostics, but it no longer blocks the gate.
 """
 
 import math
@@ -48,8 +49,9 @@ class MaturationController(nn.Module):
         self.register_buffer("_warm_done", torch.zeros(1))
 
         self.alpha = float(getattr(cfg, "matur_alpha", 1.0))
+        self.T0 = float(getattr(cfg, "matur_T0", 20000.0))
         self.T_delay = float(getattr(cfg, "matur_T_delay", 20000.0))
-        self.delta_t = float(getattr(cfg, "matur_delta", 4000.0))
+        self.delta_t = float(getattr(cfg, "matur_delta", 6000.0))
         self.r0 = float(getattr(cfg, "matur_r0", 0.6))
         self.rs = float(getattr(cfg, "matur_rs", 0.3))
         self.ema = float(getattr(cfg, "matur_ema", 0.999))
@@ -68,16 +70,26 @@ class MaturationController(nn.Module):
         self.tau_norm.copy_(((log_tau - math.log(self.tau_min)) / denom).clamp(0.0, 1.0))
 
     def step_gate(self, step, tau_dev=None):
-        """Gate for THIS step, computed from the previous-step readiness EMA.
+        """Gate for THIS step: a smooth TIME/τ ramp (no learning-dependence).
 
-        Call BEFORE the layer loop (pred_err for this step is not known yet).
-        Returns a (n_layers,) tensor in [0,1].
+        gate_l(t) = sigmoid((t - (T0 + alpha*tau_norm_l*T_delay)) / delta_t)
+
+        Starts at ~0 for every layer (so the trunk is never perturbed by untrained
+        wake-up branches at init -> no divergence), then opens SMOOTHLY on a schedule:
+        shallow layers (small tau in the VSA ladder) open first, deeper layers later,
+        unified with the model's τ geometry. This replaces the readiness-gated design,
+        which deadlocked at scale: readiness required pred_err to DROP, but the base
+        model does not learn LM at this scale, so pred_err never dropped and the gate
+        stayed ~0 forever (bridge never engaged -> no learning -> ...).
+
+        `readiness` is still tracked (see update) and exposed for diagnostics, but it
+        no longer blocks the gate.
         """
         if tau_dev is not None:
             self._update_tau_norm(tau_dev)
         t = float(step)
-        geom = torch.sigmoid((t - self.alpha * self.tau_norm * self.T_delay) / self.delta_t)
-        gate = self.readiness * geom
+        gate = torch.sigmoid(
+            (t - (self.T0 + self.alpha * self.tau_norm * self.T_delay)) / self.delta_t)
         self.gate.copy_(gate)
         return gate
 
