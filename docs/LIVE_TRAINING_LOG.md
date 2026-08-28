@@ -4164,3 +4164,30 @@ attention-кэшей классического LLM — подсветка ре�
 - mem 12.6 -> 13.0GB at depth 16. Watch T4 ~15GB ceiling approaching at depth 20-24.
 - mod_mlp=0.661 still (MLP asleep). tok/s ~60-63 stable.
 
+
+
+## DIAGNOSTIC: vanishing gradient to MLP / cognitive gate with depth (2026-08-28)
+
+- User hypothesis ("gates only close, never open to provide gradient to layers that need it")
+  CONFIRMED by gradient measurement.
+- Forced all 24 layers active (set_active_depth(24)) on stale best.pt step=9087; backward of
+  CE+sum(aux). Gradient to MLP weights and cognitive gate COLLAPSES with depth:
+  - g_W_up (MLP): L0=5.88e4, L4=1.13e3, L8=3.2, L12=5.6, L16=6.1, L23=3.7  (~10k-20k x drop by L8)
+  - g_mod_scale_mlp: L0=1.99, L4=9.3e-2, L8..L23 ~ 4e-4 .. 2e-4  (deep layers ~0)
+  - g_mlp_gate_b: L0=2.2e3, L8..L23 ~ 0.1 .. 1.2
+- Root causes:
+  (1) mlp_mod is wired through mlp_gate_b (init 0) in mlp.py:67 -> gate=silu*(a+b*mg);
+      with b=0 the cognitive gate has NO effect on forward AND mod_scale_mlp gradient is
+      exactly 0 (chain through b). So mod_scale_mlp is structurally frozen (cosmetic in logs).
+  (2) gradalign_weight=0.0 default -> the only "open" mechanism is OFF; journal shows if ON it
+      drives mod_scale_mlp DOWN (0.667->0.650), i.e. only closes.
+  (3) Gradient to MLP/modulation path vanishes through the deep stack (residual does not carry it
+      to deep layers) -> deep MLP cannot learn (W_std tracks decay), gate cannot open where needed.
+- Conclusion: MLP "asleep" at depth is NOT benign -> it is a vanishing-gradient defect. Shallow
+  L0 MLP DOES learn (g_W_up 5.88e4). Deep MLP + cognitive gate receive ~0 gradient.
+- Caveat: stale local ckpt has deep layers at init (confounds magnitude); but live training at
+  depth 24 independently shows MLP asleep -> collapse is real in training too.
+- Next: consider (a) enable gradalign_weight>0 + init mlp_gate_b>0 so gate can OPEN; (b) add a
+  gradient highway / per-depth MLP lr boost so deep MLP receives gradient; (c) audit alpha-gate /
+  contractive ops in backward for the attenuation source.
+
