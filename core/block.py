@@ -99,7 +99,9 @@ class WideBindBlock(nn.Module):
             alpha_novelty_weight=getattr(cfg, 'alpha_novelty_weight', 0.0),
             seq_len=cfg.seq_len,
             intent_bridge=getattr(cfg, 'intent_bridge', False),
-            bridge_glu=getattr(cfg, 'bridge_glu', False))
+            bridge_glu=getattr(cfg, 'bridge_glu', False),
+            pm_write_delay=getattr(cfg, 'pm_write_delay', 5000),
+            pm_coh_gate_std=getattr(cfg, 'pm_coh_gate_std', 0.02))
         
         # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
         self._n_scales = 4

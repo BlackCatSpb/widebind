@@ -74,7 +74,8 @@ class GroupedCognitiveMirror(nn.Module):
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
                  gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256,
-                 intent_bridge=False, bridge_glu=False):
+                  intent_bridge=False, bridge_glu=False,
+                  pm_write_delay=5000, pm_coh_gate_std=0.02):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -176,10 +177,16 @@ class GroupedCognitiveMirror(nn.Module):
         self._meta_trust = meta_trust
         # Private memory bank: expert confident K-space states (cross-expert recall)
         self._has_private_mem = has_private_mem
-        # Minimum training forward steps before private memory writes activate.
-        # 5000 ≈ 640K tokens at accum=8 (main) or 640K at accum=1 (Mini).
+        # Minimum training forward steps before private memory writes activate (safety
+        # floor). Coherence gate (below) lets writes start earlier once states are
+        # no longer random. 5000 ≈ 640K tokens at accum=8 (main) or 640K at accum=1 (Mini).
         # G=32 needs more delay than G=8 due to higher echo chamber risk.
-        self._pm_write_delay = 5000
+        self._pm_write_delay = pm_write_delay
+        self._pm_coh_gate_std = pm_coh_gate_std
+        # 1.0 once the semantic gate is alive (mod_std >= thr): states left the random
+        # regime, so private-memory writes are safe (no echo chamber). Updated at end of
+        # forward; read by the write gate at the next forward.
+        self.register_buffer('_pm_coh', torch.tensor(0.0), persistent=False)
         if has_private_mem:
             self.register_buffer('_private_mem', torch.randn(G, self.k) * 0.01)
             self.register_buffer('_pm_step', torch.zeros(1, dtype=torch.long))
@@ -449,7 +456,14 @@ class GroupedCognitiveMirror(nn.Module):
         _write_ok = _write
         if _write_ok:
             self._pm_step += 1
-            _write_ok = self._pm_step.item() >= self._pm_write_delay
+            # Adaptive write gate: enable once the model has left the random regime.
+            # (a) hard safety floor: pm_write_delay steps, OR
+            # (b) coherence: the semantic gate is alive (mod_std >= thr) -> states are
+            #     no longer random, so writing won't seed a random echo chamber.
+            #     (delta is rms-normalized to ~constant magnitude, so gate liveness is
+            #     the discriminator.) _pm_coh is updated at the end of forward.
+            coherent = bool(self._pm_coh.item())
+            _write_ok = (self._pm_step.item() >= self._pm_write_delay) or coherent
         if _write_ok:
             with torch.no_grad():
                 conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
@@ -565,6 +579,12 @@ class GroupedCognitiveMirror(nn.Module):
             mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
         self._last_mlp_mod = mlp_mod.detach()                      # for diagnostics (gate spread / aliveness)
+
+        # coherence tracker for the adaptive private-memory write gate (see forward write block)
+        if self._has_private_mem:
+            with torch.no_grad():
+                _ms = mlp_mod.detach().float().std().item()
+                self._pm_coh.fill_(1.0 if _ms >= self._pm_coh_gate_std else 0.0)
         
         # Linear projection + skip connection
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)

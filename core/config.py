@@ -63,6 +63,19 @@ class WideBindConfig:
     reset_skip_alpha: bool = False
     private_mem: bool = True  # cross-expert private memory bank (meta-cognitive layer)
 
+    # Private-memory WRITE GATE. Writes start only once the model has LEFT the
+    # random regime, to avoid seeding a random-state echo chamber (early random
+    # K-space written -> read back -> self-reinforcing loop). Two conditions (OR):
+    #   (a) pm_write_delay forward steps (hard safety floor), OR
+    #   (b) coherence: the semantic gate is alive (mlp_mod std >= pm_coh_gate_std)
+    #       -> states are no longer random, so writing is safe.
+    # Set pm_write_delay=0 to rely PURELY on coherence (eg with BridgeGLU, whose
+    # gate is live from early on). delta is rms-normalized to ~constant magnitude,
+    # so gate liveness (mod_std) is the real discriminator. Default 5000 preserves
+    # legacy behaviour for the frozen gate.
+    pm_write_delay: int = 5000
+    pm_coh_gate_std: float = 0.02
+
     # ─── Spec 1: Asymmetric expert init ───
     expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert
 
