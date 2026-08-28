@@ -74,9 +74,10 @@ class GroupedCognitiveMirror(nn.Module):
                  layer_idx=0, n_layers=32, has_private_mem=False,
                  expert_asymmetry=False, meta_trust=False,
                  gate_bias_scale=0.0, alpha_novelty_weight=0.0, seq_len=256,
-                   intent_bridge=False, bridge_glu=False,
-                   bridge_glu_beta=0.25,
-                   pm_write_delay=5000, pm_coh_gate_std=0.02):
+                    intent_bridge=False, bridge_glu=False,
+                    bridge_glu_beta=0.25,
+                    pm_write_delay=5000, pm_coh_gate_std=0.02,
+                    matur_write_thr=0.3):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -184,6 +185,7 @@ class GroupedCognitiveMirror(nn.Module):
         # G=32 needs more delay than G=8 due to higher echo chamber risk.
         self._pm_write_delay = pm_write_delay
         self._pm_coh_gate_std = pm_coh_gate_std
+        self._matur_write_thr = float(matur_write_thr)
         # 1.0 once the semantic gate is alive (mod_std >= thr): states left the random
         # regime, so private-memory writes are safe (no echo chamber). Updated at end of
         # forward; read by the write gate at the next forward.
@@ -294,7 +296,7 @@ class GroupedCognitiveMirror(nn.Module):
     def forward(self, h, mem_all, global_state=None, diff=None,
                 tanh_bias_mod=1.0, pred_scale_mod=None,
                 context_mem=None, allow_write=None, step=None, intent=None,
-                salience=None):
+                salience=None, maturity=None):
         B, L, D = h.shape
         G, d, k = self.G, self.d, self.k
         
@@ -459,17 +461,17 @@ class GroupedCognitiveMirror(nn.Module):
                 self._cached_isolation = isolation
         
         # ─── Private Memory: write confident K-space states (contradiction-aware) ───
-        # Delay until _pm_write_delay forward passes to avoid random-state echo chamber
+        # Private-memory write gate: OPEN once the layer has MATURED (unified controller),
+        # with a hard pm_write_delay floor as a safety net. This replaces the old
+        # "mod_std >= pm_coh_gate_std" crutch: maturity already encodes "experts ripe
+        # AND geometry allows", so writing at M>=thr can only seed a learned echo.
         _write_ok = _write
         if _write_ok:
             self._pm_step += 1
-            # Adaptive write gate: enable once the model has left the random regime.
-            # (a) hard safety floor: pm_write_delay steps, OR
-            # (b) coherence: the semantic gate is alive (mod_std >= thr) -> states are
-            #     no longer random, so writing won't seed a random echo chamber.
-            #     (delta is rms-normalized to ~constant magnitude, so gate liveness is
-            #     the discriminator.) _pm_coh is updated at the end of forward.
-            coherent = bool(self._pm_coh.item())
+            if maturity is not None:
+                coherent = bool(maturity >= self._matur_write_thr)
+            else:
+                coherent = bool(self._pm_coh.item())
             _write_ok = (self._pm_step.item() >= self._pm_write_delay) or coherent
         if _write_ok:
             with torch.no_grad():
@@ -586,7 +588,12 @@ class GroupedCognitiveMirror(nn.Module):
             # centre-zero): mlp_mod = base * (1 + beta*(2*glu - 1)). At init glu~0.25 ->
             # factor ~0.875 -> mlp_mod ≈ 0.58*usefulness; as glu learns to centre (→0.5)
             # it converges to the proven-stable baseline while staying input/semantic-live.
-            mlp_mod = usefulness * base * (1.0 + self.bridge_glu_beta * (2.0 * glu - 1.0))
+            live = 2.0 * glu - 1.0
+            if maturity is not None:
+                # Maturation gate: live modulation is SCALED by layer maturity, so
+                # untrained experts cannot perturb the trunk at step 0 (rho(J_l) ~ 1).
+                live = live * maturity
+            mlp_mod = usefulness * base * (1.0 + self.bridge_glu_beta * live)
         else:
             mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
@@ -595,8 +602,12 @@ class GroupedCognitiveMirror(nn.Module):
         # coherence tracker for the adaptive private-memory write gate (see forward write block)
         if self._has_private_mem:
             with torch.no_grad():
-                _ms = mlp_mod.detach().float().std().item()
-                self._pm_coh.fill_(1.0 if _ms >= self._pm_coh_gate_std else 0.0)
+                if maturity is not None:
+                    # Unified maturation gate drives the write gate (no hard std crutch).
+                    self._pm_coh.fill_(float(maturity))
+                else:
+                    _ms = mlp_mod.detach().float().std().item()
+                    self._pm_coh.fill_(1.0 if _ms >= self._pm_coh_gate_std else 0.0)
         
         # Linear projection + skip connection
         linear = torch.einsum('blgk,gkd->blgd', delta, self.W_out)  # (B, L, G, d)

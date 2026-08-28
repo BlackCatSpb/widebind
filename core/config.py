@@ -73,8 +73,26 @@ class WideBindConfig:
     # gate is live from early on). delta is rms-normalized to ~constant magnitude,
     # so gate liveness (mod_std) is the real discriminator. Default 5000 preserves
     # legacy behaviour for the frozen gate.
-    pm_write_delay: int = 5000
-    pm_coh_gate_std: float = 0.02
+    pm_write_delay: int = 5000  # hard safety floor (steps); 0 => maturity-only
+    pm_coh_gate_std: float = 0.02  # legacy fallback when maturation is disabled
+
+    # ─── Maturation gate (unified wake-up controller) ───
+    # Replaces the ad-hoc pm_write_delay / pm_coh_gate_std / bridge-injection
+    # scale=0 crutches with ONE principled per-layer maturity M_l(t) in [0,1]
+    # that gates live BridgeGLU modulation, private-memory write, semantic
+    # bridge injection and the intent bus. M_l = readiness_l * geometry_l:
+    #   readiness_l : expert saturation via pred-error drop vs the random regime
+    #   geometry_l  : deeper layers (larger tau in the VSA ladder) engage later
+    # The frozen base MLP gate (~0.667) stays OPEN regardless (no deadlock).
+    maturation_enabled: bool = True
+    matur_alpha: float = 1.0        # geometry delay strength
+    matur_T_delay: float = 20000.0  # deepest layer opens at ~alpha*T_delay steps
+    matur_delta: float = 4000.0     # geometry ramp width (steps)
+    matur_r0: float = 0.6           # readiness sigmoid center (saturation needed)
+    matur_rs: float = 0.3           # readiness sigmoid slope
+    matur_ema: float = 0.999        # pred-error EMA decay (smoothness)
+    matur_warm: int = 300           # warm steps: capture random-regime pred_err_init
+    matur_write_thr: float = 0.3    # maturity needed before private-memory writes
 
     # ─── Spec 1: Asymmetric expert init ───
     expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert

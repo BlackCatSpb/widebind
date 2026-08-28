@@ -66,8 +66,13 @@ class SemanticBridge(nn.Module):
         """Emit the semantic vector for a layer's hidden state -> (B, L, bridge_dim)."""
         return self.probe(h_l)
 
-    def inject_layer(self, i: int, h_l: torch.Tensor) -> torch.Tensor:
-        """Add the cross-layer semantic stream signal to a layer's hidden state."""
+    def inject_layer(self, i: int, h_l: torch.Tensor, maturity: torch.Tensor = None) -> torch.Tensor:
+        """Add the cross-layer semantic stream signal to a layer's hidden state.
+
+        `maturity` (scalar tensor, optional) scales the injection by the layer's
+        unified maturation gate: the bridge stays a near-no-op until the layer's
+        experts have ripened, so its gradient cannot perturb the trunk early.
+        """
         if not self.depth or self.n_layers == 0:
             return h_l
         neigh = [self.bridge_stream[i]]
@@ -77,6 +82,8 @@ class SemanticBridge(nn.Module):
             neigh.append(self.bridge_stream[i + 1])          # top-down (carried)
         combined = torch.stack(neigh, 0).sum(0)              # (bridge_dim,)
         scale = torch.tanh(self.stream_log_scale)
+        if maturity is not None:
+            scale = scale * maturity
         inj = scale * self.stream_proj(combined)             # (D,)
         return h_l + inj.view(1, 1, self.D)
 

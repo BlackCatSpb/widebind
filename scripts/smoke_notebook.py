@@ -82,9 +82,12 @@ for step in range(10):
             _ga = sum(o.norm() for o in _g) / max(1, len(_g))
             aux_dict['gradalign'] = _ga
     balancer.backward(ce_loss, aux_dict, model.parameters())
+    clipper.clip(model.parameters())
     optimizer.step()
     scheduler.step()
-    print(f'step={step:>2} ce={ce_loss.item():.3f} bridge_conn={lc_val:.4f}')
+    _mm = torch.stack([l.mirror._last_mlp_mod.detach().mean() for l in model.layers]).mean().item() if hasattr(model.layers[0].mirror, '_last_mlp_mod') else float('nan')
+    _mg = model.maturation.gate.detach().mean().item() if getattr(model, 'maturation', None) is not None else float('nan')
+    print(f'step={step:>2} ce={ce_loss.item():.3f} bridge_conn={lc_val:.4f} mlp_mod={_mm:.3f} mat_gate={_mg:.3f}')
 
 # ---- checkpoint save (the StopIteration-prone expression, now safe) ----
 sd = model.state_dict()

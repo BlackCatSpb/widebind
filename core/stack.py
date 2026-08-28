@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .config import WideBindConfig
 from .block import WideBindBlock, PrecisionGate, ExactSequenceMemory
 from .bridge import SemanticBridge
+from .maturation import MaturationController
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
@@ -101,6 +102,15 @@ class WideBindStack(nn.Module):
         self._tau_min_value = tau_s[0].item()
         self._tau_max_value = tau_s[-1].item()
         self._tau_mid_value = tau_mid
+        # ─── Maturation controller (unified wake-up gate) ───
+        # Replaces pm_write_delay / pm_coh_gate_std / bridge scale=0 crutches with
+        # one principled per-layer maturity M_l(t) gating live BridgeGLU, memory
+        # write, bridge injection and the intent bus. Created only when enabled.
+        if getattr(cfg, 'maturation_enabled', True):
+            self.maturation = MaturationController(
+                cfg.n_layers, tau_s[0].item(), tau_s[-1].item(), cfg)
+        else:
+            self.maturation = None
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
     
@@ -230,6 +240,7 @@ class WideBindStack(nn.Module):
                 self._gs_velocity = self._gs_velocity.to(global_state.device)
         new_state = []
         self._pred_cache = []
+        pred_errs = []  # per-layer pred_error_norm means for the maturation controller
         # ─── Cross-layer bus scratch (intent bridge) ───
         # Carried streams are the previous step's gist (detached). The bus is
         # STREAMING: layer i sees FRESH intent of already-processed layers (j<=i)
@@ -245,6 +256,14 @@ class WideBindStack(nn.Module):
             _bus_running = torch.zeros_like(_bus_sum)
             _bus_le_carried = torch.zeros_like(_bus_sum)
         _last_bus = None
+        # ─── Maturation gate for THIS step ───
+        # Computed from the previous-step readiness EMA (pred_err for this step is
+        # not known yet). M_l gates live BridgeGLU, memory write, bridge injection
+        # and the intent bus. At M_l~0 only the frozen base MLP (~0.667) is active.
+        mat_gate = None
+        if self.maturation is not None:
+            _mstep = step if step is not None else 10_000_000
+            mat_gate = self.maturation.step_gate(_mstep, self._tau_l_dev.detach())
         if self.bridge is not None:
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):
@@ -302,6 +321,9 @@ class WideBindStack(nn.Module):
                 bus_i = (_bus_running + (_bus_sum - _bus_le_carried)) / n_layers  # (1,1,G,Kmax)
                 _last_bus = bus_i
                 intent_i = bus_i[..., :_ki]            # truncate to layer k
+                if mat_gate is not None:
+                    # Intent bus strength is gated by layer maturity (unified wake-up).
+                    intent_i = intent_i * mat_gate[i]
             # ─── Semantic Bridge (in-pipeline per-layer) ───
             # Inject the carried cross-layer stream into this layer's hidden state,
             # then emit + record the layer's semantic vector and EMA-update the
@@ -309,8 +331,16 @@ class WideBindStack(nn.Module):
             # this step, and upper layers a CARRIED one — same streaming pattern as
             # the Intent Bridge). Runs in train and inference alike.
             if self.bridge is not None:
-                h = self.bridge.inject_layer(i, h)
-                _s_l = self.bridge.probe_layer(h)        # (B, L, bridge_dim), grad
+                _mat_i = mat_gate[i] if mat_gate is not None else None
+                h = self.bridge.inject_layer(i, h, maturity=_mat_i)
+                # Probe reads a DETACHED hidden state: the bridge is a semantic
+                # read-out head that learns from its own self-supervised loss
+                # (1-cos vs next-token embed) WITHOUT back-propagating into the
+                # main trunk. Under the heavy aux suite (ranking~1e4) that per-layer
+                # gradient into h destabilised CE; detaching keeps the bridge's
+                # forward signal (stream injection) while removing the diverging
+                # gradient path. The gate still gets its gradient from the main CE.
+                _s_l = self.bridge.probe_layer(h.detach())  # (B, L, bridge_dim)
                 self.bridge.record(_s_l)
                 self.bridge.update_stream(i, _s_l)
             if self.cfg.gradient_checkpointing and self.training:
@@ -324,7 +354,7 @@ class WideBindStack(nn.Module):
                     mem2v_scale, l_diff, nscale,
                     tanh_bias_mod, pred_scale_mod, spectral_mod,
                     context_mem, allow_write, vsa_tau, step, intent_i,
-                    salience=_sal,
+                    salience=_sal, maturity=(mat_gate[i] if mat_gate is not None else None),
                     use_reentrant=False,
                 )
                 h, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp = _out
@@ -334,7 +364,12 @@ class WideBindStack(nn.Module):
                                  tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                                  spectral_mod=spectral_mod,
                                  context_mem=context_mem, allow_write=allow_write,
-                                  tau_s=vsa_tau, step=step, intent=intent_i, salience=_sal)
+                                  tau_s=vsa_tau, step=step, intent=intent_i, salience=_sal,
+                                   maturity=(mat_gate[i] if mat_gate is not None else None))
+            if self.maturation is not None:
+                _pe = layer.mirror._cached_pred_error_norm
+                if _pe is not None:
+                    pred_errs.append(_pe.detach().mean())
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -373,6 +408,10 @@ class WideBindStack(nn.Module):
                 mir = layer.mirror
                 if mir._cached_pred_k is not None and mir._cached_hp is not None:
                     self._pred_cache.append((mir._cached_pred_k, mir._cached_hp))
+        
+        # ─── Update maturation controller from this step's per-layer pred-error ───
+        if self.maturation is not None and step is not None and len(pred_errs) == n_layers:
+            self.maturation.update(step, torch.stack(pred_errs))
         
         h = self.final_norm_w * h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + 1e-7)
 
@@ -968,7 +1007,7 @@ class WideBindStack(nn.Module):
                              mem2v_scale, diff, noise_scale,
                              tanh_bias_mod, pred_scale_mod, spectral_mod,
                              context_mem, allow_write, tau_s, step, intent=None,
-                             salience=None):
+                             salience=None, maturity=None):
         """Wrapper for gradient checkpointing.
         Mirror cache is passed as explicit args/returns so checkpoint saves/restores it,
         preventing stale-cache mismatch between forward and backward recomputation."""
@@ -979,7 +1018,7 @@ class WideBindStack(nn.Module):
                              tanh_bias_mod=tanh_bias_mod, pred_scale_mod=pred_scale_mod,
                              spectral_mod=spectral_mod, context_mem=context_mem,
                              allow_write=allow_write, tau_s=tau_s, step=step,
-                             intent=intent, salience=salience)
+                             intent=intent, salience=salience, maturity=maturity)
         return h_out, s_out, layer.mirror._cached_pred_error_norm, layer.mirror._cached_hp
 
     def param_count(self):
