@@ -187,7 +187,9 @@ class WideBindConfig:
     mlp_gate_b_init: float = 0.25
     # Per-depth MLP gradient boost (fix for vanishing gradient to deep MLP):
     # scales MLP gradient by exp(mlp_depth_lr_exp * layer_idx). 0 = disabled.
-    mlp_depth_lr_exp: float = 0.15
+    # Calibrated to the real (trained) gradient profile: ~13x collapse L0->mid
+    # (not the 10k-20k x init-artifact). 0.10 -> L16 ~x4.5, L23 ~x10.
+    mlp_depth_lr_exp: float = 0.10
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

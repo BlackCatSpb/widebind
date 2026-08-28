@@ -4213,3 +4213,25 @@ Changes (commit pending):
 - Default mlp_depth_lr_exp=0.15 is conservative; raise if deep MLP still asleep (monitor
   mod_mlp and MLP W_std). Live collapse is likely milder than the init-artifact measurement.
 
+
+
+## Analyze best 1.pt (step 10252, depth 24) — live confirmation (2026-08-28)
+
+- Real live checkpoint at depth 24 (active_depth=24, reasoning enabled step 10257), val 8.85.
+- MLP STILL ASLEEP: W_std dev +0.0008 (tracks decay), gate max 0.667 (<0.75 wake). Confirms the
+  problem is real in live training, not benign.
+- mlp_gate_b in ckpt = -0.0035 (~0, slightly closed) -> cognitive gate was inert. Fix reopens to
+  0.25 on resume (gives mod_scale_mlp a CE-gradient path so it can OPEN).
+- mod_scale_mlp = 0.668 (sigmoid 0.661): gradalign pushed it DOWN (0.667->0.661) -> only CLOSED,
+  exactly as user suspected ("gates only close, never open").
+- REAL gradient profile (trained deep layers, forced depth 24): g_Wup L0=40.1, L4=2.8, L8=3.3,
+  L12=3.6, L16=3.2, L20=1.5, L23=12.2 -> MILD ~13x collapse (L0->mid), NOT the 10k-20k x measured
+  earlier. Earlier 16k x was an INIT ARTIFACT (deep layers at init -> random MLP -> tiny grad).
+  -> recalibrated mlp_depth_lr_exp default 0.15 -> 0.10 (L16 ~x4.5, L23 ~x10), well matched.
+- Bridge healthy: salience H/Hmax=0.993, cross-layer cos 0.028 (low redundancy); bus_head_proj
+  weight_norm=0.66 (learning); w_intent decreases with depth (L0 0.150 -> L23 0.016). Private memory
+  writing (births L10-15), reasoning helps (natural top-1 0.137 vs OFF 0.003).
+- GRAD INFO shows ||gCE||=0.000e+00 again -> confirmed artifact of analyze.py gradinfo (training
+  clearly works: val 8.85 vs uniform 11.09). Not a model bug.
+- Conclusion: fix (reopen gate + depth boost) is correctly calibrated and will wake MLP on next resume.
+
