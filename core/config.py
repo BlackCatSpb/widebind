@@ -190,6 +190,11 @@ class WideBindConfig:
     # Calibrated to the real (trained) gradient profile: ~13x collapse L0->mid
     # (not the 10k-20k x init-artifact). 0.10 -> L16 ~x4.5, L23 ~x10.
     mlp_depth_lr_exp: float = 0.10
+    # Reopen value for the REAL cognitive gate `mod_scale_mlp` (MirrorMemory
+    # param, sigmoid -> MLP scale). Checkpoints freeze it at init log(2)~0.69
+    # (sigmoid 0.667 = "asleep"). On resume set it to log(3)~1.10 (sigmoid 0.75)
+    # so the gate starts clearly open AND the deep-MLP gradient boost can move it.
+    mlp_mod_scale_reopen: float = 1.0986  # math.log(3.0)
 
     # VSA long-range memory
     vsa_b_d_max: float = 12.0       # max b_d (τ≈160K at 12.0, was 5.0/τ≈150)

@@ -967,7 +967,16 @@ class WideBindStack(nn.Module):
             boost = math.exp(exp * i)
             if abs(boost - 1.0) < 1e-6:
                 continue
+            # GroupedMLP internal params (W_up/down, gate, mlp_gate_b)
             for p in layer.mlp.parameters():
+                if p.requires_grad:
+                    p.register_hook(lambda grad, b=boost: grad * b)
+                    n_applied += 1
+            # Mirror cognitive gates — THE actual MLP/memory modulation scale that
+            # was "asleep" (mod_scale_mlp stuck at init ~0.667). These are SEPARATE
+            # params from mlp.mlp_gate_b and must be boosted so deep gates can
+            # open/close instead of only decaying.
+            for p in (layer.mirror.mod_scale_mlp, layer.mirror.mod_scale_mem):
                 if p.requires_grad:
                     p.register_hook(lambda grad, b=boost: grad * b)
                     n_applied += 1

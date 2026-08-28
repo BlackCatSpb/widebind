@@ -4235,3 +4235,10 @@ Changes (commit pending):
   clearly works: val 8.85 vs uniform 11.09). Not a model bug.
 - Conclusion: fix (reopen gate + depth boost) is correctly calibrated and will wake MLP on next resume.
 
+
+
+## 2026-08-28b - reopened REAL cognitive gate mod_scale_mlp
+- Bug: previous reinit wrote mlp.mlp_gate_b (internal GroupedMLP bias); the 'asleep' indicator is mirror.mod_scale_mlp (sigmoid->MLP scale), stuck at init sigmoid(log2)=0.667. The deep-MLP boost only hooked mlp.parameters(), so mod_scale_mlp never received gradient and mod_mlp stayed ~0.661 after resume.
+- Fix: apply_mlp_depth_gradient_boost now also hooks layer.mirror.mod_scale_mlp and mod_scale_mem (depth-scaled). Resume reinit now also sets mod_scale_mlp -> cfg.mlp_mod_scale_reopen (=log(3)~0.75, new config knob). Files: core/stack.py, core/config.py, scripts/train.py, notebooks/colab.ipynb.
+- Expected: mod_mlp leaves 0.667 and starts moving once gradient flows (executor 'woke'). Train CE already healthy: 8.69->7.66 at step ~10340.
+- TODO: EVAL val_loss=13.73 (worse than random 11.09) at step 10252. Eval runs adaptive=False + state=None (no memory/intent) => lower bound vs train CE (with memory). Checkpoint best_val_loss=8.85 was a different protocol. Monitor eval TREND, not absolute.
