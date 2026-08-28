@@ -443,8 +443,14 @@ class WideBindStack(nn.Module):
         specialization/collective memory/concept space).
         Zero-initialized know_proj keeps resume unchanged."""
         with torch.no_grad():
-            logits = self.lm_head(h)  # (B, L, V), normalized
-            p = logits.softmax(-1)
+            logits = self.lm_head(h)  # (B, L, V)
+            if getattr(self.cfg, 'softmax_free', True):
+                # Режим Б: per-class уверенность (сигмоида), без нормировки к
+                # симплексу и без конкуренции. Верификатор читает потенциал
+                # каждого класса независимо, а не победителя softmax.
+                p = logits.sigmoid()
+            else:
+                p = logits.softmax(-1)
             p1 = p.max(-1).values
             p2 = p.topk(2, dim=-1).values[..., 1]
             ent = -(p * p.clamp_min(1e-9).log()).sum(-1)
@@ -480,7 +486,10 @@ class WideBindStack(nn.Module):
         """p1 of the last position — confidence of the head on `h`."""
         with torch.no_grad():
             logits = self.lm_head(h[:, -1:, :])
-            p = logits.softmax(-1)
+            if getattr(self.cfg, 'softmax_free', True):
+                p = logits.sigmoid()
+            else:
+                p = logits.softmax(-1)
             return p.max(-1).values.squeeze(1)  # (B,)
 
     def _adaptive_reasoning(self, h, s, state=None, reasoning_buffer=None, reasoning_count=None):

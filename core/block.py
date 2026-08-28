@@ -250,7 +250,7 @@ class WideBindBlock(nn.Module):
             self._cache_conv_out = h_conv  # for branch_loss (with grad)
         
         if isinstance(self.bind, TrajectorySpiralBind):
-            if traj_state is None:
+            if traj_state is None and self.training:
                 traj_state = getattr(self, '_traj_state', None)
             if traj_state is not None and (traj_state.shape[2] != L
                                            or traj_state.shape[0] != B):
@@ -440,7 +440,7 @@ class WideBindBlock(nn.Module):
         enhanced = enhanced_base + mirror
         if self.collective is not None:
             hp_c = hp
-            pen_c = pen
+            pen_c = self.mirror._cached_pred_error_norm
             if hp_c is not None and pen_c is not None:
                 col_out = self.collective(
                     h, hp_c, pen_c,

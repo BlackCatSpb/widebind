@@ -131,7 +131,10 @@ def train(args):
                                       for l in model.layers])
                     mlp_s = f"mod_mlp_mean={ms.mean().item():.3f} mod_mlp_std={ms.std().item():.3f}"
             lc_s = "" if bridge is None else f" Lconn={lc_val:.3f}"
-            print(f"step={step:>5} ce={ce_loss.item():.3f} {mlp_s}{lc_s} t={time.time()-t0:.0f}s")
+            bgs = [getattr(l.collective, '_cached_birth_gate', None) for l in model.layers
+                   if getattr(l, 'collective', None) is not None]
+            bg_s = f" birth={sum(b.item() for b in bgs)/len(bgs):.4f}" if bgs else ""
+            print(f"step={step:>5} ce={ce_loss.item():.3f} {mlp_s}{lc_s}{bg_s} t={time.time()-t0:.0f}s")
     # generation sample (greedy) with bridge stream carried
     print("\n--- generation (prompt: 'cat') ---")
     model.eval()

@@ -212,6 +212,7 @@ class CollectiveConceptLayer(nn.Module):
             best_sim = sim.max(dim=-1, keepdim=True).values            # (B,L,1)
             birth_open = torch.sigmoid(self._contra_gain * (self._birth_gap - best_sim))
             birth_gate = torch.sigmoid(self._birth_log_scale) * birth_open
+            self._cached_birth_gate = birth_gate.detach().mean()
             if birth_gate.mean().item() > 1e-4:
                 topk = torch.topk(sim, k=2, dim=-1)
                 w12 = torch.sigmoid(topk.values * temp)               # (B,L,2)
@@ -224,3 +225,8 @@ class CollectiveConceptLayer(nn.Module):
                 out = out + birth_gate * birth * u_gate * c_gate
 
         return out
+
+    @torch.no_grad()
+    def birth_gate_mean(self):
+        """Средний вес рождения концепта (проекция горизонта событий). 0 = спит."""
+        return self._cached_birth_gate if hasattr(self, '_cached_birth_gate') else torch.tensor(0.0)

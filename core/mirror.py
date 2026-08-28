@@ -398,6 +398,7 @@ class GroupedCognitiveMirror(nn.Module):
             else:
                 self._cached_pred_k_buf[:, :L].zero_()
             self._cached_pred_error_norm_buf[:, :L].copy_(pred_error_norm.detach())
+            self._cached_pred_error_norm = pred_error_norm.detach()
         
         # ─── Private Memory: read via cross-expert attention (when uncertain) ───
         if self._has_private_mem:
