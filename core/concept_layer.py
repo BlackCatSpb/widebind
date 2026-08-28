@@ -161,7 +161,7 @@ class CollectiveConceptLayer(nn.Module):
         self.U_s.mul_(0.99).add_(occ.to(self.U_s), alpha=0.01)
         return write_event, best
 
-    def forward(self, h, hp, pen, resvar=None, allow_write=None, mature_override=None):
+    def forward(self, h, hp, pen, resvar=None, allow_write=None, mature_override=None, gate=None):
         _write = allow_write is None or allow_write
         if mature_override is not None:
             self._mature.fill_(float(mature_override))
@@ -173,7 +173,17 @@ class CollectiveConceptLayer(nn.Module):
         self._concept_id = best
 
         B, L, G, k = hp.shape
-        shared = F.normalize(hp.mean(dim=-2), dim=-1)
+        if gate is not None and gate.shape[-1] == G:
+            # Подсознание = эксперты (G каналов K-пространства) и их гейты.
+            # «Перевод» (shared), подаваемый в Сознание, взвешивается по
+            # активности экспертов, а не усредняется вслепую: проекция Горизонта
+            # Событий опирается на живое подсознание, а не на статистику всех
+            # экспертов поровну.
+            gw = gate.float()
+            gsum = gw.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            shared = F.normalize((hp * gw.unsqueeze(-1)).sum(dim=-2) / gsum, dim=-1)
+        else:
+            shared = F.normalize(hp.mean(dim=-2), dim=-1)
         M_n = F.normalize(self.M, dim=-1)
         sim = shared @ M_n.T
         temp = self._temp.clamp(min=0.5)

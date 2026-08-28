@@ -445,7 +445,8 @@ class WideBindBlock(nn.Module):
                 col_out = self.collective(
                     h, hp_c, pen_c,
                     resvar=self.mirror._residual_var_ema.mean(),
-                    allow_write=self.training)
+                    allow_write=self.training,
+                    gate=self.mirror._cached_gate)
                 if col_out is not None:
                     enhanced = enhanced + col_out
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
