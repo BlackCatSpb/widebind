@@ -19,13 +19,17 @@ class BridgeGLU(nn.Module):
         super().__init__()
         self.Wg = nn.Linear(G * k, G)
         self.Wv = nn.Linear(G * k, G)
+        # Learnable gain: init ~2.7 so initial gate ≈ sigmoid(log2)=0.667
+        # (matches the frozen mod_scale_mlp capacity). Prevents BridgeGLU from
+        # starving the MLP on tasks that need it; stays learnable.
+        self.log_gain = nn.Parameter(torch.tensor(math.log(2.7)))
 
     def forward(self, delta):
         B, L, G, k = delta.shape
         flat = delta.reshape(B, L, G * k)                    # (B, L, G*k)
         g = torch.sigmoid(self.Wg(flat))                     # (B, L, G)
         v = torch.sigmoid(self.Wv(flat))                     # (B, L, G)
-        return g * v                                         # (B, L, G)
+        return torch.sigmoid(self.log_gain) * g * v          # (B, L, G)
 
 
 class GroupedCognitiveMirror(nn.Module):
