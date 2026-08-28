@@ -1554,7 +1554,10 @@ class MirrorLRScheduler:
                       f'mult={mult:.4f} lr={self.base_lr*mult:.2e}{ls_info}')
 
         for i, pg in enumerate(self.optimizer.param_groups):
-            pg['lr'] = self._orig_lrs[i] * mult
+            if i < len(self._orig_lrs):
+                pg['lr'] = self._orig_lrs[i] * mult
+            # groups added AFTER scheduler init (e.g. bridge_conn aux head) keep
+            # their own lr (set when the group was appended) -> don't index _orig_lrs.
 
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
