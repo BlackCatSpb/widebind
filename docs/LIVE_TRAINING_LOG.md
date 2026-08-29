@@ -47,14 +47,15 @@
 - **Каскад созревания (~5995–6105):** `bridge_readiness` догоняет — `bridge_conn` (raw) падает **0.237 → 0.074 → 0.038** (мост научился предсказывать эталонный next-token), `mat` прыгает **0.626 → 0.684 → 0.734**, `ce` **9.29 → 8.80**. Здоровый каскад (не расходимость): maturation-гейт держит `ρ(J_l) ≈ 1`.
 - **Плато (6105 → 7205+):** `mat` стабилизируется **0.730–0.735**, `bridge_conn` (raw) ~0.03–0.07, живые ветви (live BridgeGLU, injection моста, intent-шина, запись приватной памяти) раскрыты полностью; `mod_mlp`~0.327, CE плавает 8.5–10.1.
 
-### Вердикт analyze (`checkpoints/best.pt`@6757) — WAKE-CANDIDATE
+### Вердикт analyze (`checkpoints/best.pt`@7223) — WAKE-CANDIDATE
 
-- MLP проснулся: `W_std` = 0.0705 ≈ decay-базис (0.0699, dev +0.0006); gate max 0.751 (порог WAKE 0.75). `sigmoid(mod_scale_mlp)` = 0.750, `sigmoid(mod_scale_mem)` = 0.667.
-- Maturation gate 0.731 (открыт); `bridge_readiness` max = 0.778, `tau_norm` max = 0.997 — мост реально включается.
-- Intent-шина: слои несут **дополняющие** сигналы (cross-layer cosine offdiag = 0.0195, близко к 0); `bus_head_proj` растёт с zero-init (стенсил учится: norm 0.48).
+- MLP проснулся: `W_std` = 0.0704 ≈ decay-базис (0.0698, dev +0.0006); gate max 0.751 (порог WAKE 0.75). `sigmoid(mod_scale_mlp)` = 0.749, `sigmoid(mod_scale_mem)` = 0.667.
+- Maturation gate 0.7355 (полностью открыт, max 0.736); `bridge_readiness` max = 0.780, `tau_norm` max = 0.997 — мост реально включается.
+- Intent-шина: слои несут **дополняющие** сигналы (cross-layer cosine offdiag = 0.0524, далеко от 1); `bus_head_proj` растёт с zero-init (стенсил учится: norm 0.489), `bus` norm вырос до 4269.
 - Концепты: slots 76/192, births в пустых слоях **[14]** (штатное рождение нового концепта, WATCH).
 - Triad (`triad_reason`): при генерации ствол ре-циркулируется, если `_conf < 0.5` (до `triad_max_passes=3`), бленд `h = 0.5·h + 0.5·h2`. Только inference.
-- Минорные WATCH: `pred` aux DEAD (`requires_grad=False`, `cos_sim(diversity, CE)=0`); **72 unexpected tensors** = буферы `collective._resvar_ema/_resvar_var/_mature_count` (пересоздаются на резюме, EMA зрелости коллектива сбрасывается — кандидат на рефактор: зарегистрировать в `__init__`).
+- Минорные WATCH: `pred` aux DEAD (`requires_grad=False`, `cos_sim(diversity, CE)=-0.72`, но `||gCE||≫||gDIV||` ⇒ вклад capped в 0); **72 unexpected tensors** = буферы `collective._resvar_ema/_resvar_var/_mature_count` (пересоздаются на резюме, EMA зрелости коллектива сбрасывается — кандидат на рефактор: зарегистрировать в `__init__`).
+- HTML-отчёт: `checkpoints/best_7223_report.html`.
 
 **Цель:** выйти к историческому рубежу `val ≈ 8.5` при сохранении устойчивого CE.
 
