@@ -27,7 +27,8 @@
 
 | Метрика | Значение |
 |---|---|
-| Шаг сохранения best | 7223 (обучение продолжается, последний лог step 7535) |
+| Шаг сохранения best | 7223 (обучение продолжается, последний лог step 7922; после 7223 — перестройка, см. ниже) |
+| val_loss / ppl | 9.6390 / ~15352 |
 | val_loss / ppl | 9.6390 / ~15352 |
 | Зрелость `mat` | 0.733–0.735 (все 24 слоя равномерно, плато после каскада) |
 | `bridge_conn` (raw cosine-loss моста) | ~0.03–0.07 — мост компетентен (упал с 0.237 на старте каскада) |
@@ -38,6 +39,14 @@
 ### Траектория val (монотонно улучшается)
 
 10.0216 (5126) → 9.9749 (5359) → 9.9283 (5592) → 9.8816 (5825) → 9.8366 (6058) → 9.7956 (6291) → 9.7516 (6524) → 9.7113 (6757) → 9.6820 (6990) → **9.6390 (7223)** (периодический eval 7456 дал 9.7607 — хуже best, не сохранён; текущий best стабильно 9.6390@7223)
+
+### ⚠️ Событие перестройки (step 7689 → 7922)
+
+После best **9.6390@7223** валидация пошла вверх: **EVAL 7689 = 11.09** (≈ порог случайного ln(65536)=11.09), затем **EVAL 7922 = 15.74 / ppl 6.86M** — катастрофический скачок. Одновременно `mat` вырос **0.735 → 0.748** (time-рамп `M_l = max(time_ramp, bridge_readiness)` продолжает расти с шагом, T0=20000 / T_delay=20000, и тянет гейт к 1.0), `bridge_conn` (raw) упал до **~0.02** (мост предельно компетентен, его injection в ствол открыт на полную), LR принудительно снижен до **1.5e-4**.
+
+Интерпретация: живые ветви (BridgeGLU, injection семантического моста, intent-шина, запись приватной памяти) раскрылись **полностью** и ломают прежнее устойчивое внутреннее пространство — отсюда «перестройка». **Не обязательно расходимость до dead**: CE в трейне держится ~9.0–9.4 (ниже порога `watchdog_ce=15.0`), значит ствол жив; но val-траектория временно вне устойчивости.
+
+**`best.pt` НЕ перезаписан** (эвалы хуже 9.6390, save не сработал) — чекпоинт 9.6390@7223 сохранён. Действия: наблюдать; если val не оседает обратно < ~10 за следующие ~1–2k шагов или CE пробьёт 15 — рассмотреть откат на `best.pt`@7223 (watchdog или ручной rollback, `FORCE_FRESH` остаётся False).
 
 ### Фазовый переход (созревание и каскад, step 4950 → 6105)
 
@@ -189,4 +198,16 @@ step=  7480  loss=9497.0666  ce=8.8263  mod_mlp=0.329 mod_std=0.081 lr=2.98e-04 
   aux: alpha_novelty=-0.0005 balance=0.0292 branch=36.4771 bridge_conn=0.0633 decorr=0.0575 div=-0.1160 diversity=24.9303 gate_l1=0.4297 gate_repulse=-0.1654 gradalign=19.0552 intent_tau=0.6591 ls_reg=10.3634 nuc=162.1724 pred=2.7119 ranking=9229.7920 reinforce=0.1990 signal_ent=1.4242 w_m2v=0.1583
 step=  7535  loss=9203.3830  ce=8.8863  mod_mlp=0.330 mod_std=0.079 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=1.6249  mlp_out=734.0 usef=0.502  mat=0.732[0.732,0.732]
   aux: alpha_novelty=-0.0005 balance=0.0277 branch=37.5599 bridge_conn=0.0626 decorr=0.0551 div=-0.1160 diversity=11.4359 gate_l1=0.4357 gate_repulse=-0.1607 gradalign=18.9723 intent_tau=0.6591 ls_reg=10.3599 nuc=161.5496 pred=2.7160 ranking=8949.1641 reinforce=0.1937 signal_ent=1.4242 w_m2v=0.1583
+  EVAL step=7689: val_loss=11.0899 val_ppl=65506.07
+step=  7700  loss=9557.5917  ce=9.3681  mod_mlp=0.329 mod_std=0.077 lr=1.50e-04  tok/s=28  mem=9.8GB  intent_w=1.7163  mlp_out=712.2 usef=0.501  mat=0.722[0.722,0.722]
+  aux: alpha_novelty=-0.0005 balance=0.0314 branch=35.5200 bridge_conn=0.0843 decorr=0.0525 div=-0.1159 diversity=19.3035 gate_l1=0.4179 gate_repulse=-0.1700 gradalign=19.0770 intent_tau=0.6591 ls_reg=10.3493 nuc=162.9566 pred=2.6534 ranking=9295.6230 reinforce=0.1999 signal_ent=1.4242 w_m2v=0.1581
+step=  7755  loss=8298.2740  ce=9.0166  mod_mlp=0.328 mod_std=0.076 lr=1.50e-04  tok/s=28  mem=9.8GB  intent_w=1.7880  mlp_out=727.9 usef=0.501  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0335 branch=31.1364 bridge_conn=0.0216 decorr=0.0548 div=-0.1159 diversity=6.4541 gate_l1=0.3999 gate_repulse=-0.1687 gradalign=18.8842 intent_tau=0.6591 ls_reg=10.3468 nuc=163.5444 pred=2.6675 ranking=8053.5566 reinforce=0.2015 signal_ent=1.4242 w_m2v=0.1580
+step=  7810  loss=8214.2540  ce=9.1472  mod_mlp=0.326 mod_std=0.075 lr=1.50e-04  tok/s=28  mem=9.8GB  intent_w=1.8374  mlp_out=712.4 usef=0.500  mat=0.742[0.742,0.742]
+  aux: alpha_novelty=-0.0005 balance=0.0355 branch=28.9960 bridge_conn=0.0160 decorr=0.0524 div=-0.1159 diversity=8.0508 gate_l1=0.3961 gate_repulse=-0.1696 gradalign=19.0560 intent_tau=0.6591 ls_reg=10.3445 nuc=162.2924 pred=2.6918 ranking=7971.0186 reinforce=0.2015 signal_ent=1.4242 w_m2v=0.1580
+step=  7865  loss=8074.0453  ce=9.0356  mod_mlp=0.326 mod_std=0.075 lr=1.49e-04  tok/s=28  mem=9.8GB  intent_w=1.8566  mlp_out=715.6 usef=0.500  mat=0.746[0.746,0.746]
+  aux: alpha_novelty=-0.0005 balance=0.0361 branch=30.1148 bridge_conn=0.0242 decorr=0.0549 div=-0.1159 diversity=3.9566 gate_l1=0.3991 gate_repulse=-0.1722 gradalign=19.3132 intent_tau=0.6591 ls_reg=10.3426 nuc=165.5135 pred=2.6948 ranking=7830.4033 reinforce=0.2038 signal_ent=1.4242 w_m2v=0.1580
+step=  7920  loss=8668.2774  ce=9.1071  mod_mlp=0.326 mod_std=0.075 lr=1.50e-04  tok/s=29  mem=9.8GB  intent_w=1.8917  mlp_out=716.3 usef=0.500  mat=0.748[0.748,0.748]
+  aux: alpha_novelty=-0.0005 balance=0.0352 branch=32.6400 bridge_conn=0.0303 decorr=0.0571 div=-0.1159 diversity=6.0092 gate_l1=0.4003 gate_repulse=-0.1683 gradalign=19.4430 intent_tau=0.6591 ls_reg=10.3406 nuc=166.1099 pred=2.6734 ranking=8419.2754 reinforce=0.1995 signal_ent=1.4241 w_m2v=0.1580
+  EVAL step=7922: val_loss=15.7416 val_ppl=6862653.58 - идет перестройка внутреннего пространства
 ```
