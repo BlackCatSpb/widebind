@@ -7,7 +7,8 @@
 - Контур: `notebooks/colab.ipynb`, Colab T4, **fp32 (`use_amp=False`)**, ~28 tok/s, ~9.8 GB VRAM.
 - Резюм `checkpoints/best.pt` (`FORCE_FRESH=False`); `eval_interval=2000`, `save_interval=987`, `max_steps=300000`.
 - Watchdog `FailureDetector`: откат на `best.pt` при CE-спайке > `watchdog_ce=15.0`.
-- При резюме cognitive gate принудительно «открывается» (`mod_scale_mlp → cfg.mlp_mod_scale_reopen ≈ 1.099`), чтобы ядро не резюмилось «спящим».
+- При резюме cognitive gate принудительно «открывается» (`mod_scale_mlp → cfg.mlp_mod_scale_reopen ≈ 1.099`), поэтому зрелость `mat` после резюма стартует снизу (~0.07) и снова набирает рамп.
+- In-core SemanticBridge active: `bridge_conn=0.1`, `bridge_dim=256`, params = 2,034,948 (внутри модели).
 
 ### Конфигурация (Большая, обучаемая)
 
@@ -26,26 +27,25 @@
 
 | Метрика | Значение |
 |---|---|
-| Шаг сохранения best | 6757 (обучение продолжается) |
-| val_loss / ppl | 9.7113 / ~16503 |
-| Зрелость `mat` | 0.731 (все 24 слоя равномерно) |
-| `bridge_conn` (raw cosine-loss моста) | ~0.07 — мост компетентен |
-| `mod_mlp` (live) | ~0.328 (здоров, не схлопнут) |
+| Шаг сохранения best | 6990 (обучение продолжается, последний лог step 7205) |
+| val_loss / ppl | 9.6820 / ~16026 |
+| Зрелость `mat` | 0.733–0.735 (все 24 слоя равномерно, плато после каскада) |
+| `bridge_conn` (raw cosine-loss моста) | ~0.03–0.07 — мост компетентен (упал с 0.237 на старте каскада) |
+| `mod_mlp` (live) | ~0.327 (здоров, не схлопнут) |
 | Скорость / VRAM | ~28 tok/s на T4 / ~9.8 GB |
 | NaN / Inf | 0 / 0 |
 
 ### Траектория val (монотонно улучшается)
 
-9.9749 (5359) → 9.9283 (5592) → 9.8816 (5825) → 9.8366 (6058) → 9.7956 (6291) → 9.7516 (6524) → **9.7113 (6757)**
+10.0216 (5126) → 9.9749 (5359) → 9.9283 (5592) → 9.8816 (5825) → 9.8366 (6058) → 9.7956 (6291) → 9.7516 (6524) → 9.7113 (6757) → **9.6820 (6990)**
 
-### Фазовый переход (каскад созревания, ~5995–6215)
+### Фазовый переход (созревание и каскад, step 4950 → 6105)
 
-Единый гейт зрелости `M_l = max(time_ramp, bridge_readiness)` открыл живые ветви **по компетентности моста**, а не по слепым часам:
+Единый гейт зрелости `M_l = max(time_ramp, bridge_readiness)`:
 
-- `bridge_conn` (raw) упал **0.237 → 0.037** — in-core SemanticBridge научился предсказывать эталонный next-token embedding;
-- `mat` вырос **0.624 → 0.735**; `ce` **9.3 → 8.80**.
-
-Здоровый каскад (не расходимость): maturation-гейт держит `ρ(J_l) ≈ 1`, ствол и метакогнитивные ветви учатся как единое целое. После каскада `mat` продолжает медленно расти (0.730 → 0.733), живые ветви (live BridgeGLU, injection семантического моста, intent-шина, запись приватной памяти) раскрыты полностью.
+- **Рампа зрелости (4950–5940):** после резюма `mat` стартует с ~0.07 и поднимается по time/τ-рампе до плато **0.624** (step ~5225–5940). `bridge_conn` (raw) в этой фазе **высокий (0.23–0.24)** — мост ещё не компетентен, живые ветви прикрыты.
+- **Каскад созревания (~5995–6105):** `bridge_readiness` догоняет — `bridge_conn` (raw) падает **0.237 → 0.074 → 0.038** (мост научился предсказывать эталонный next-token), `mat` прыгает **0.626 → 0.684 → 0.734**, `ce` **9.29 → 8.80**. Здоровый каскад (не расходимость): maturation-гейт держит `ρ(J_l) ≈ 1`.
+- **Плато (6105 → 7205+):** `mat` стабилизируется **0.730–0.735**, `bridge_conn` (raw) ~0.03–0.07, живые ветви (live BridgeGLU, injection моста, intent-шина, запись приватной памяти) раскрыты полностью; `mod_mlp`~0.327, CE плавает 8.5–10.1.
 
 ### Вердикт analyze (`checkpoints/best.pt`@6757) — WAKE-CANDIDATE
 
@@ -54,14 +54,82 @@
 - Intent-шина: слои несут **дополняющие** сигналы (cross-layer cosine offdiag = 0.0195, близко к 0); `bus_head_proj` растёт с zero-init (стенсил учится: norm 0.48).
 - Концепты: slots 76/192, births в пустых слоях **[14]** (штатное рождение нового концепта, WATCH).
 - Triad (`triad_reason`): при генерации ствол ре-циркулируется, если `_conf < 0.5` (до `triad_max_passes=3`), бленд `h = 0.5·h + 0.5·h2`. Только inference.
-- Минорные WATCH: `pred` aux DEAD (`requires_grad=False`, `cos_sim(diversity, CE)=0`) — diversity-выравнивание не даёт градиента; **72 unexpected tensors** = буферы `collective._resvar_ema/_resvar_var/_mature_count` (пересоздаются на резюме, EMA зрелости коллектива сбрасывается — кандидат на рефактор: зарегистрировать в `__init__`).
+- Минорные WATCH: `pred` aux DEAD (`requires_grad=False`, `cos_sim(diversity, CE)=0`); **72 unexpected tensors** = буферы `collective._resvar_ema/_resvar_var/_mature_count` (пересоздаются на резюме, EMA зрелости коллектива сбрасывается — кандидат на рефактор: зарегистрировать в `__init__`).
 
 **Цель:** выйти к историческому рубежу `val ≈ 8.5` при сохранении устойчивого CE.
 
-### Сырой лог (фрагмент мониторинга, step 6325 → 6820)
+### Сырой лог (текущий запуск, step 4934 → 7205)
 
 ```
-Saved best to best.pt
+In-core SemanticBridge active (bridge_conn=0.1, bridge_dim=256, params=2,034,948)
+Training: step 4934 -> 300000
+  (295066 steps remaining)
+  batch=1 seq=128 -> tokens/step=128
+  lr_adapt: var(ls)=13.826442 |1-a|=0.096238 gate_var=0.027234 |mirror|=229.4501 tau_var=13.826442 mult=1.0000 lr=3.00e-04 ls_mult[min=1.000 max=1.000]
+step=  4950  loss=17244.4960  ce=10.1561  mod_mlp=0.370 mod_std=0.017 lr=2.71e-04  tok/s=33  mem=9.8GB  intent_w=1.0857  mlp_out=680.6 usef=0.500  mat=0.071[0.071,0.075]
+  aux: alpha_novelty=-0.0005 balance=0.0037 branch=62.7507 bridge_conn=0.1166 decorr=0.0435 div=-0.1164 diversity=88.7674 gate_l1=0.6044 gate_repulse=-0.0385 gradalign=22.9064 intent_tau=0.6592 ls_reg=10.5243 nuc=161.4851 pred=2.7078 ranking=16882.2461 reinforce=0.0978 signal_ent=1.4241 w_m2v=0.1583
+step=  5005  loss=16589.2152  ce=9.4930  mod_mlp=0.355 mod_std=0.024 lr=2.63e-04  tok/s=34  mem=9.8GB  intent_w=1.1559  mlp_out=691.7 usef=0.499  mat=0.301[0.301,0.301]
+  aux: alpha_novelty=-0.0005 balance=0.0061 branch=59.8303 bridge_conn=0.2346 decorr=0.0492 div=-0.1164 diversity=90.7959 gate_l1=0.5793 gate_repulse=-0.0557 gradalign=22.4302 intent_tau=0.6592 ls_reg=10.5211 nuc=163.5605 pred=2.7327 ranking=16226.8066 reinforce=0.1065 signal_ent=1.4241 w_m2v=0.1583
+step=  5060  loss=18776.6878  ce=10.1048  mod_mlp=0.346 mod_std=0.032 lr=2.78e-04  tok/s=34  mem=9.8GB  intent_w=1.1567  mlp_out=700.4 usef=0.499  mat=0.446[0.446,0.446]
+  aux: alpha_novelty=-0.0005 balance=0.0070 branch=56.8113 bridge_conn=0.2367 decorr=0.0488 div=-0.1164 diversity=88.3108 gate_l1=0.5777 gate_repulse=-0.0585 gradalign=21.9366 intent_tau=0.6592 ls_reg=10.5180 nuc=158.1258 pred=2.6891 ranking=18425.1426 reinforce=0.1127 signal_ent=1.4241 w_m2v=0.1583
+step=  5115  loss=21175.7445  ce=9.8732  mod_mlp=0.341 mod_std=0.041 lr=2.83e-04  tok/s=34  mem=9.8GB  intent_w=1.1565  mlp_out=706.1 usef=0.499  mat=0.526[0.526,0.526]
+  aux: alpha_novelty=-0.0005 balance=0.0074 branch=61.0523 bridge_conn=0.2372 decorr=0.0539 div=-0.1164 diversity=84.9034 gate_l1=0.5948 gate_repulse=-0.0641 gradalign=21.3297 intent_tau=0.6592 ls_reg=10.5147 nuc=163.6150 pred=2.6937 ranking=20818.6875 reinforce=0.1211 signal_ent=1.4241 w_m2v=0.1583
+  EVAL step=5126: val_loss=10.0216 val_ppl=22507.09
+  Saved best to best.pt
+step=  5170  loss=19855.1412  ce=9.6998  mod_mlp=0.335 mod_std=0.049 lr=2.88e-04  tok/s=28  mem=9.8GB  intent_w=1.1563  mlp_out=706.1 usef=0.499  mat=0.619[0.619,0.619]
+  aux: alpha_novelty=-0.0005 balance=0.0081 branch=62.9412 bridge_conn=0.2367 decorr=0.0550 div=-0.1164 diversity=86.9810 gate_l1=0.5825 gate_repulse=-0.0673 gradalign=20.5239 intent_tau=0.6592 ls_reg=10.5113 nuc=161.5979 pred=2.7100 ranking=19497.1094 reinforce=0.1270 signal_ent=1.4241 w_m2v=0.1583
+step=  5225  loss=18873.1661  ce=9.8335  mod_mlp=0.335 mod_std=0.056 lr=2.92e-04  tok/s=29  mem=9.8GB  intent_w=1.1561  mlp_out=702.2 usef=0.499  mat=0.621[0.621,0.621]
+  aux: alpha_novelty=-0.0005 balance=0.0073 branch=62.9849 bridge_conn=0.2363 decorr=0.0539 div=-0.1164 diversity=95.8580 gate_l1=0.5923 gate_repulse=-0.0671 gradalign=20.2378 intent_tau=0.6592 ls_reg=10.5079 nuc=163.2755 pred=2.6554 ranking=18504.7402 reinforce=0.1254 signal_ent=1.4241 w_m2v=0.1583
+step=  5280  loss=20022.3371  ce=9.3670  mod_mlp=0.336 mod_std=0.063 lr=2.97e-04  tok/s=29  mem=9.8GB  intent_w=1.1558  mlp_out=698.4 usef=0.500  mat=0.622[0.622,0.622]
+  aux: alpha_novelty=-0.0005 balance=0.0068 branch=63.9334 bridge_conn=0.2351 decorr=0.0524 div=-0.1164 diversity=91.8136 gate_l1=0.6061 gate_repulse=-0.0651 gradalign=19.9691 intent_tau=0.6592 ls_reg=10.5044 nuc=166.3732 pred=2.6110 ranking=19654.6777 reinforce=0.1277 signal_ent=1.4241 w_m2v=0.1583
+step=  5335  loss=19809.8223  ce=9.4990  mod_mlp=0.336 mod_std=0.067 lr=2.98e-04  tok/s=30  mem=9.8GB  intent_w=1.1556  mlp_out=696.9 usef=0.500  mat=0.622[0.622,0.622]
+  aux: alpha_novelty=-0.0005 balance=0.0067 branch=68.2098 bridge_conn=0.2344 decorr=0.0514 div=-0.1164 diversity=118.4021 gate_l1=0.6052 gate_repulse=-0.0647 gradalign=19.8936 intent_tau=0.6592 ls_reg=10.5009 nuc=163.1034 pred=2.5865 ranking=19414.5410 reinforce=0.1282 signal_ent=1.4241 w_m2v=0.1583
+  EVAL step=5359: val_loss=9.9749 val_ppl=21480.85
+  Saved best to best.pt
+step=  5390  loss=21579.3361  ce=9.3163  mod_mlp=0.335 mod_std=0.070 lr=3.02e-04  tok/s=27  mem=9.8GB  intent_w=1.1554  mlp_out=691.4 usef=0.499  mat=0.624[0.624,0.624]
+  aux: alpha_novelty=-0.0005 balance=0.0063 branch=66.6551 bridge_conn=0.2335 decorr=0.0529 div=-0.1164 diversity=115.7410 gate_l1=0.6178 gate_repulse=-0.0615 gradalign=19.8435 intent_tau=0.6592 ls_reg=10.4974 nuc=163.3369 pred=2.5811 ranking=21188.2617 reinforce=0.1295 signal_ent=1.4241 w_m2v=0.1583
+  lr_adapt: var(ls)=13.797299 |1-a|=0.096083 gate_var=0.064116 |mirror|=219.7716 tau_var=13.802939 mult=0.9915 lr=2.97e-04 ls_mult[min=1.000 max=1.003]
+step=  5445  loss=18699.6473  ce=9.7415  mod_mlp=0.335 mod_std=0.073 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=1.1552  mlp_out=696.2 usef=0.499  mat=0.624[0.624,0.624]
+  aux: alpha_novelty=-0.0005 balance=0.0067 branch=66.7463 bridge_conn=0.2338 decorr=0.0518 div=-0.1164 diversity=116.4736 gate_l1=0.5911 gate_repulse=-0.0619 gradalign=19.4496 intent_tau=0.6592 ls_reg=10.4939 nuc=162.3531 pred=2.5551 ranking=18308.7637 reinforce=0.1243 signal_ent=1.4241 w_m2v=0.1583
+step=  5500  loss=18804.9149  ce=9.4932  mod_mlp=0.335 mod_std=0.075 lr=3.00e-04  tok/s=29  mem=9.8GB  intent_w=1.1550  mlp_out=703.7 usef=0.499  mat=0.624[0.624,0.624]
+  aux: alpha_novelty=-0.0005 balance=0.0069 branch=65.7132 bridge_conn=0.2342 decorr=0.0523 div=-0.1164 diversity=101.0818 gate_l1=0.5851 gate_repulse=-0.0624 gradalign=19.2372 intent_tau=0.6592 ls_reg=10.4903 nuc=162.5631 pred=2.5455 ranking=18430.7266 reinforce=0.1232 signal_ent=1.4241 w_m2v=0.1583
+step=  5555  loss=18910.3498  ce=10.0384  mod_mlp=0.335 mod_std=0.076 lr=2.99e-04  tok/s=29  mem=9.8GB  intent_w=1.1547  mlp_out=701.7 usef=0.498  mat=0.624[0.624,0.624]
+  aux: alpha_novelty=-0.0005 balance=0.0072 branch=64.3634 bridge_conn=0.2343 decorr=0.0520 div=-0.1163 diversity=100.3827 gate_l1=0.5795 gate_repulse=-0.0636 gradalign=19.0990 intent_tau=0.6592 ls_reg=10.4868 nuc=161.5101 pred=2.5411 ranking=18538.8711 reinforce=0.1230 signal_ent=1.4241 w_m2v=0.1583
+  EVAL step=5592: val_loss=9.9283 val_ppl=20502.73
+  Saved best to best.pt
+step=  5610  loss=19157.2335  ce=9.3778  mod_mlp=0.334 mod_std=0.077 lr=2.98e-04  tok/s=28  mem=9.8GB  intent_w=1.1545  mlp_out=706.7 usef=0.497  mat=0.624[0.624,0.624]
+  aux: alpha_novelty=-0.0005 balance=0.0080 branch=63.7023 bridge_conn=0.2340 decorr=0.0499 div=-0.1163 diversity=83.6108 gate_l1=0.5715 gate_repulse=-0.0650 gradalign=19.0605 intent_tau=0.6592 ls_reg=10.4833 nuc=163.5666 pred=2.5419 ranking=18801.8398 reinforce=0.1271 signal_ent=1.4241 w_m2v=0.1583
+step=  5665  loss=17934.9361  ce=9.4183  mod_mlp=0.334 mod_std=0.078 lr=2.94e-04  tok/s=28  mem=9.8GB  intent_w=1.1543  mlp_out=712.4 usef=0.497  mat=0.624[0.624,0.624]
+  aux: alpha_novelty=-0.0005 balance=0.0084 branch=62.2630 bridge_conn=0.2354 decorr=0.0511 div=-0.1163 diversity=77.1884 gate_l1=0.5576 gate_repulse=-0.0686 gradalign=18.8985 intent_tau=0.6592 ls_reg=10.4799 nuc=163.8314 pred=2.5500 ranking=17587.2734 reinforce=0.1245 signal_ent=1.4241 w_m2v=0.1583
+step=  5720  loss=18132.1395  ce=9.1653  mod_mlp=0.334 mod_std=0.079 lr=2.96e-04  tok/s=28  mem=9.8GB  intent_w=1.1541  mlp_out=715.9 usef=0.497  mat=0.623[0.623,0.623]
+  aux: alpha_novelty=-0.0005 balance=0.0084 branch=60.4343 bridge_conn=0.2362 decorr=0.0510 div=-0.1163 diversity=70.8315 gate_l1=0.5583 gate_repulse=-0.0692 gradalign=18.9417 intent_tau=0.6592 ls_reg=10.4764 nuc=164.9314 pred=2.5469 ranking=17791.7773 reinforce=0.1252 signal_ent=1.4241 w_m2v=0.1583
+step=  5775  loss=17723.0460  ce=9.2842  mod_mlp=0.334 mod_std=0.079 lr=3.01e-04  tok/s=29  mem=9.8GB  intent_w=1.1539  mlp_out=725.2 usef=0.496  mat=0.623[0.623,0.623]
+  aux: alpha_novelty=-0.0005 balance=0.0084 branch=61.6536 bridge_conn=0.2371 decorr=0.0519 div=-0.1163 diversity=60.9052 gate_l1=0.5551 gate_repulse=-0.0663 gradalign=19.2160 intent_tau=0.6592 ls_reg=10.4729 nuc=163.5091 pred=2.5415 ranking=17392.4297 reinforce=0.1228 signal_ent=1.4241 w_m2v=0.1583
+  EVAL step=5825: val_loss=9.8816 val_ppl=19567.84
+  Saved best to best.pt
+step=  5830  loss=17756.0448  ce=9.0678  mod_mlp=0.334 mod_std=0.079 lr=3.04e-04  tok/s=28  mem=9.8GB  intent_w=1.1537  mlp_out=718.2 usef=0.496  mat=0.622[0.622,0.622]
+  aux: alpha_novelty=-0.0005 balance=0.0083 branch=63.3093 bridge_conn=0.2357 decorr=0.0504 div=-0.1163 diversity=82.9631 gate_l1=0.5515 gate_repulse=-0.0647 gradalign=19.2616 intent_tau=0.6592 ls_reg=10.4694 nuc=163.2122 pred=2.5289 ranking=17402.2051 reinforce=0.1215 signal_ent=1.4241 w_m2v=0.1583
+step=  5885  loss=17262.2982  ce=9.3803  mod_mlp=0.335 mod_std=0.077 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=1.1534  mlp_out=716.6 usef=0.497  mat=0.622[0.622,0.622]
+  aux: alpha_novelty=-0.0005 balance=0.0083 branch=62.4052 bridge_conn=0.2377 decorr=0.0499 div=-0.1163 diversity=74.6484 gate_l1=0.5523 gate_repulse=-0.0652 gradalign=19.7435 intent_tau=0.6592 ls_reg=10.4659 nuc=161.8000 pred=2.5315 ranking=16918.2949 reinforce=0.1205 signal_ent=1.4241 w_m2v=0.1583
+  lr_adapt: var(ls)=13.768724 |1-a|=0.095611 gate_var=0.066043 |mirror|=218.4194 tau_var=13.774396 mult=1.0000 lr=3.00e-04 ls_mult[min=1.001 max=1.006]
+step=  5940  loss=17648.0902  ce=9.2284  mod_mlp=0.336 mod_std=0.076 lr=3.00e-04  tok/s=28  mem=9.8GB  intent_w=1.1532  mlp_out=707.1 usef=0.499  mat=0.622[0.622,0.622]
+  aux: alpha_novelty=-0.0005 balance=0.0088 branch=63.4966 bridge_conn=0.2371 decorr=0.0526 div=-0.1163 diversity=79.6487 gate_l1=0.5490 gate_repulse=-0.0666 gradalign=19.8044 intent_tau=0.6592 ls_reg=10.4624 nuc=166.6372 pred=2.5356 ranking=17293.2500 reinforce=0.1212 signal_ent=1.4241 w_m2v=0.1583
+step=  5995  loss=17977.1111  ce=9.2865  mod_mlp=0.336 mod_std=0.076 lr=2.66e-04  tok/s=28  mem=9.8GB  intent_w=1.1715  mlp_out=718.2 usef=0.500  mat=0.626[0.626,0.626]
+  aux: alpha_novelty=-0.0005 balance=0.0123 branch=58.9524 bridge_conn=0.0741 decorr=0.0538 div=-0.1163 diversity=31.8635 gate_l1=0.5435 gate_repulse=-0.0856 gradalign=19.5268 intent_tau=0.6592 ls_reg=10.4585 nuc=163.0489 pred=2.5218 ranking=17678.5879 reinforce=0.1420 signal_ent=1.4241 w_m2v=0.1583
+step=  6050  loss=14516.9445  ce=8.8047  mod_mlp=0.330 mod_std=0.074 lr=2.40e-04  tok/s=29  mem=9.8GB  intent_w=1.2942  mlp_out=705.9 usef=0.502  mat=0.684[0.684,0.684]
+  aux: alpha_novelty=-0.0005 balance=0.0242 branch=42.1315 bridge_conn=0.0377 decorr=0.0518 div=-0.1162 diversity=31.8160 gate_l1=0.4931 gate_repulse=-0.1362 gradalign=19.9710 intent_tau=0.6592 ls_reg=10.4541 nuc=165.5912 pred=2.5810 ranking=14232.8096 reinforce=0.1899 signal_ent=1.4241 w_m2v=0.1582
+  EVAL step=6058: val_loss=9.8366 val_ppl=18705.62
+  Saved best to best.pt
+step=  6105  loss=11549.9395  ce=9.0469  mod_mlp=0.327 mod_std=0.075 lr=2.63e-04  tok/s=28  mem=9.8GB  intent_w=1.3451  mlp_out=730.7 usef=0.501  mat=0.734[0.734,0.734]
+  aux: alpha_novelty=-0.0005 balance=0.0280 branch=39.5124 bridge_conn=0.0698 decorr=0.0563 div=-0.1162 diversity=34.2751 gate_l1=0.4550 gate_repulse=-0.1576 gradalign=19.4945 intent_tau=0.6591 ls_reg=10.4509 nuc=163.9374 pred=2.5915 ranking=11267.8594 reinforce=0.1951 signal_ent=1.4242 w_m2v=0.1582
+step=  6160  loss=11216.2164  ce=9.3949  mod_mlp=0.327 mod_std=0.075 lr=2.78e-04  tok/s=28  mem=9.8GB  intent_w=1.3621  mlp_out=748.1 usef=0.502  mat=0.732[0.732,0.732]
+  aux: alpha_novelty=-0.0005 balance=0.0296 branch=39.9740 bridge_conn=0.0711 decorr=0.0552 div=-0.1162 diversity=37.1533 gate_l1=0.4302 gate_repulse=-0.1606 gradalign=18.7122 intent_tau=0.6591 ls_reg=10.4477 nuc=161.6926 pred=2.5511 ranking=10933.5430 reinforce=0.1974 signal_ent=1.4242 w_m2v=0.1582
+step=  6215  loss=9639.9325  ce=9.3267  mod_mlp=0.326 mod_std=0.073 lr=2.77e-04  tok/s=28  mem=9.8GB  intent_w=1.4545  mlp_out=725.0 usef=0.501  mat=0.735[0.735,0.735]
+  aux: alpha_novelty=-0.0005 balance=0.0380 branch=31.2010 bridge_conn=0.0623 decorr=0.0564 div=-0.1162 diversity=51.3389 gate_l1=0.3968 gate_repulse=-0.1829 gradalign=19.6438 intent_tau=0.6592 ls_reg=10.4438 nuc=165.5657 pred=2.5944 ranking=9347.1074 reinforce=0.2154 signal_ent=1.4242 w_m2v=0.1582
+step=  6270  loss=9165.0054  ce=9.3284  mod_mlp=0.328 mod_std=0.074 lr=2.91e-04  tok/s=29  mem=9.8GB  intent_w=1.4578  mlp_out=738.4 usef=0.502  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0360 branch=33.2024 bridge_conn=0.0681 decorr=0.0572 div=-0.1162 diversity=34.6335 gate_l1=0.3975 gate_repulse=-0.1762 gradalign=19.7579 intent_tau=0.6592 ls_reg=10.4405 nuc=162.3660 pred=2.5786 ranking=8889.9805 reinforce=0.2101 signal_ent=1.4242 w_m2v=0.1582
+  EVAL step=6291: val_loss=9.7956 val_ppl=17954.66
+  Saved best to best.pt
 step=  6325  loss=9111.0518  ce=9.2120  mod_mlp=0.327 mod_std=0.074 lr=2.99e-04  tok/s=28  mem=9.8GB  intent_w=1.4575  mlp_out=741.3 usef=0.500  mat=0.730[0.730,0.730]
   aux: alpha_novelty=-0.0005 balance=0.0312 branch=34.9204 bridge_conn=0.0694 decorr=0.0565 div=-0.1162 diversity=22.6763 gate_l1=0.4095 gate_repulse=-0.1639 gradalign=19.5623 intent_tau=0.6592 ls_reg=10.4370 nuc=166.1653 pred=2.5451 ranking=8842.8105 reinforce=0.1952 signal_ent=1.4242 w_m2v=0.1582
 step=  6380  loss=10322.1458  ce=9.6259  mod_mlp=0.327 mod_std=0.077 lr=3.02e-04  tok/s=28  mem=9.8GB  intent_w=1.4999  mlp_out=754.1 usef=0.499  mat=0.730[0.730,0.730]
@@ -70,21 +138,38 @@ step=  6380  loss=10322.1458  ce=9.6259  mod_mlp=0.327 mod_std=0.077 lr=3.02e-04
 step=  6435  loss=10555.8609  ce=8.9819  mod_mlp=0.328 mod_std=0.076 lr=3.03e-04  tok/s=28  mem=9.8GB  intent_w=1.5167  mlp_out=752.5 usef=0.499  mat=0.730[0.730,0.730]
   aux: alpha_novelty=-0.0005 balance=0.0297 branch=39.1991 bridge_conn=0.0685 decorr=0.0596 div=-0.1161 diversity=20.4201 gate_l1=0.4131 gate_repulse=-0.1558 gradalign=18.9245 intent_tau=0.6591 ls_reg=10.4300 nuc=164.0620 pred=2.7407 ranking=10288.3750 reinforce=0.1876 signal_ent=1.4242 w_m2v=0.1582
 step=  6490  loss=10355.7069  ce=9.8227  mod_mlp=0.327 mod_std=0.078 lr=3.07e-04  tok/s=28  mem=9.8GB  intent_w=1.5167  mlp_out=747.1 usef=0.497  mat=0.730[0.730,0.730]
-  aux: alpha_novelty=-0.0005 balance=0.0261 branch=40.6108 bridge_conn=0.0686 decorr=0.0584 div=-0.1161 diversity=21.0399 gate_l1=0.4287 gate_repulse=-0.1458 gradalign=18.6426 intent_tau=0.6591 ls_reg=10.4265 nuc=162.6291 pred=2.7426 ranking=10087.0537 reinforce=0.1781 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0261 branch=40.6108 bridge_conn=0.0686 decorr=0.0584 div=-0.1161 diversity=21.0399 gate_l1=0.4287 gate_repulse=-0.1458 gradalign=18.6426 intent_tau=0.6591 ls_reg=10.4265 nuc=162.6291 pred=2.7426 ranking=10087.0537 reinforce=0.1781 signal_ent=1.4242 w_m2v=0.1583
   EVAL step=6524: val_loss=9.7516 val_ppl=17181.54
   Saved best to best.pt
 step=  6545  loss=10596.1228  ce=9.8317  mod_mlp=0.328 mod_std=0.079 lr=3.15e-04  tok/s=28  mem=9.8GB  intent_w=1.5164  mlp_out=761.5 usef=0.498  mat=0.730[0.730,0.730]
-  aux: alpha_novelty=-0.0005 balance=0.0212 branch=48.3606 bridge_conn=0.0687 decorr=0.0546 div=-0.1161 diversity=29.1893 gate_l1=0.4471 gate_repulse=-0.1280 gradalign=18.4454 intent_tau=0.6591 ls_reg=10.4228 nuc=164.3101 pred=2.6901 ranking=10310.1211 reinforce=0.1634 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0212 branch=48.3606 bridge_conn=0.0687 decorr=0.0546 div=-0.1161 diversity=29.1893 gate_l1=0.4471 gate_repulse=-0.1280 gradalign=18.4454 intent_tau=0.6591 ls_reg=10.4228 nuc=164.3101 pred=2.6901 ranking=10310.1211 reinforce=0.1634 signal_ent=1.4242 w_m2v=0.1583
 step=  6600  loss=10743.3384  ce=9.9444  mod_mlp=0.328 mod_std=0.081 lr=3.12e-04  tok/s=28  mem=9.8GB  intent_w=1.5161  mlp_out=753.7 usef=0.498  mat=0.730[0.730,0.730]
-  aux: alpha_novelty=-0.0005 balance=0.0194 branch=48.4665 bridge_conn=0.0675 decorr=0.0533 div=-0.1161 diversity=36.6611 gate_l1=0.4631 gate_repulse=-0.1218 gradalign=18.7255 intent_tau=0.6591 ls_reg=10.4192 nuc=163.7982 pred=2.6826 ranking=10449.8760 reinforce=0.1587 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0194 branch=48.4665 bridge_conn=0.0675 decorr=0.0533 div=-0.1161 diversity=36.6611 gate_l1=0.4631 gate_repulse=-0.1218 gradalign=18.7255 intent_tau=0.6591 ls_reg=10.4192 nuc=163.7982 pred=2.6826 ranking=10449.8760 reinforce=0.1587 signal_ent=1.4242 w_m2v=0.1583
 step=  6655  loss=11003.3808  ce=10.0861  mod_mlp=0.328 mod_std=0.081 lr=3.12e-04  tok/s=28  mem=9.8GB  intent_w=1.5159  mlp_out=748.3 usef=0.499  mat=0.730[0.730,0.730]
-  aux: alpha_novelty=-0.0005 balance=0.0172 branch=49.5062 bridge_conn=0.0659 decorr=0.0536 div=-0.1161 diversity=31.8268 gate_l1=0.4853 gate_repulse=-0.1118 gradalign=18.7288 intent_tau=0.6591 ls_reg=10.4156 nuc=160.4449 pred=2.5947 ranking=10716.9922 reinforce=0.1505 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0172 branch=49.5062 bridge_conn=0.0659 decorr=0.0536 div=-0.1161 diversity=31.8268 gate_l1=0.4853 gate_repulse=-0.1118 gradalign=18.7288 intent_tau=0.6591 ls_reg=10.4156 nuc=160.4449 pred=2.5947 ranking=10716.9922 reinforce=0.1505 signal_ent=1.4242 w_m2v=0.1583
 step=  6710  loss=10669.8212  ce=9.6265  mod_mlp=0.328 mod_std=0.082 lr=3.08e-04  tok/s=28  mem=9.8GB  intent_w=1.5156  mlp_out=733.1 usef=0.499  mat=0.731[0.731,0.731]
-  aux: alpha_novelty=-0.0005 balance=0.0159 branch=52.5265 bridge_conn=0.0652 decorr=0.0523 div=-0.1161 diversity=25.3604 gate_l1=0.4949 gate_repulse=-0.1097 gradalign=18.8497 intent_tau=0.6591 ls_reg=10.4120 nuc=164.2590 pred=2.5875 ranking=10383.4072 reinforce=0.1488 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0159 branch=52.5265 bridge_conn=0.0652 decorr=0.0523 div=-0.1161 diversity=25.3604 gate_l1=0.4949 gate_repulse=-0.1097 gradalign=18.8497 intent_tau=0.6591 ls_reg=10.4120 nuc=164.2590 pred=2.5875 ranking=10383.4072 reinforce=0.1488 signal_ent=1.4242 w_m2v=0.1583
   EVAL step=6757: val_loss=9.7113 val_ppl=16503.49
   Saved best to best.pt
 step=  6765  loss=10493.4582  ce=9.5128  mod_mlp=0.328 mod_std=0.081 lr=2.99e-04  tok/s=28  mem=9.8GB  intent_w=1.5153  mlp_out=708.0 usef=0.499  mat=0.733[0.733,0.733]
-  aux: alpha_novelty=-0.0005 balance=0.0166 branch=50.9702 bridge_conn=0.0618 decorr=0.0515 div=-0.1161 diversity=17.6157 gate_l1=0.4870 gate_repulse=-0.1133 gradalign=18.7729 intent_tau=0.6591 ls_reg=10.4084 nuc=167.0909 pred=2.5863 ranking=10213.7188 reinforce=0.1538 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0166 branch=50.9702 bridge_conn=0.0618 decorr=0.0515 div=-0.1161 diversity=17.6157 gate_l1=0.4870 gate_repulse=-0.1133 gradalign=18.7729 intent_tau=0.6591 ls_reg=10.4084 nuc=167.0909 pred=2.5863 ranking=10213.7188 reinforce=0.1538 signal_ent=1.4242 w_m2v=0.1583
 step=  6820  loss=10920.2238  ce=9.8700  mod_mlp=0.328 mod_std=0.080 lr=3.04e-04  tok/s=28  mem=9.8GB  intent_w=1.5151  mlp_out=701.5 usef=0.499  mat=0.733[0.733,0.733]
-  aux: alpha_novelty=-0.0005 balance=0.0159 branch=55.5065 bridge_conn=0.0608 decorr=0.0538 div=-0.1161 diversity=16.6013 gate_l1=0.4958 gate_repulse=-0.1084 gradalign=18.7795 intent_tau=0.6591 ls_reg=10.4049 nuc=163.7702 pred=2.6465 ranking=10639.8525 reinforce=0.1497 signal_ent=1.4242 w_m2v=0.1582
+  aux: alpha_novelty=-0.0005 balance=0.0159 branch=55.5065 bridge_conn=0.0608 decorr=0.0538 div=-0.1161 diversity=16.6013 gate_l1=0.4958 gate_repulse=-0.1084 gradalign=18.7795 intent_tau=0.6591 ls_reg=10.4049 nuc=163.7702 pred=2.6465 ranking=10639.8525 reinforce=0.1497 signal_ent=1.4242 w_m2v=0.1583
+step=  6875  loss=11424.3584  ce=9.4552  mod_mlp=0.328 mod_std=0.080 lr=3.15e-04  tok/s=28  mem=9.8GB  intent_w=1.5148  mlp_out=680.7 usef=0.498  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0126 branch=62.4556 bridge_conn=0.0614 decorr=0.0534 div=-0.1161 diversity=51.1574 gate_l1=0.5207 gate_repulse=-0.0936 gradalign=19.4586 intent_tau=0.6591 ls_reg=10.4014 nuc=160.6016 pred=2.6862 ranking=11105.3242 reinforce=0.1389 signal_ent=1.4242 w_m2v=0.1583
+step=  6930  loss=12887.7856  ce=9.5039  mod_mlp=0.327 mod_std=0.080 lr=3.19e-04  tok/s=28  mem=9.8GB  intent_w=1.5145  mlp_out=689.9 usef=0.497  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0105 branch=61.0194 bridge_conn=0.0619 decorr=0.0543 div=-0.1161 diversity=29.8183 gate_l1=0.5382 gate_repulse=-0.0830 gradalign=19.3088 intent_tau=0.6591 ls_reg=10.3977 nuc=163.3574 pred=2.6897 ranking=12588.8506 reinforce=0.1332 signal_ent=1.4242 w_m2v=0.1583
+  lr_adapt: var(ls)=13.702960 |1-a|=0.096055 gate_var=0.082228 |mirror|=230.5272 tau_var=13.708824 mult=1.0633 lr=3.19e-04 ls_mult[min=1.001 max=1.009]
+step=  6985  loss=13284.0741  ce=9.1737  mod_mlp=0.327 mod_std=0.082 lr=3.12e-04  tok/s=28  mem=9.8GB  intent_w=1.5142  mlp_out=700.3 usef=0.497  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0103 branch=60.3771 bridge_conn=0.0618 decorr=0.0544 div=-0.1161 diversity=33.8055 gate_l1=0.5440 gate_repulse=-0.0820 gradalign=18.9101 intent_tau=0.6591 ls_reg=10.3940 nuc=162.8321 pred=2.6682 ranking=12983.0654 reinforce=0.1345 signal_ent=1.4242 w_m2v=0.1583
+  EVAL step=6990: val_loss=9.6820 val_ppl=16026.00
+  Saved best to best.pt
+step=  7040  loss=12626.4141  ce=8.4676  mod_mlp=0.326 mod_std=0.082 lr=3.02e-04  tok/s=28  mem=9.8GB  intent_w=1.5140  mlp_out=720.9 usef=0.497  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0117 branch=60.1104 bridge_conn=0.0615 decorr=0.0529 div=-0.1161 diversity=67.5895 gate_l1=0.5327 gate_repulse=-0.0877 gradalign=18.4942 intent_tau=0.6591 ls_reg=10.3905 nuc=163.0561 pred=2.6662 ranking=12292.8057 reinforce=0.1379 signal_ent=1.4242 w_m2v=0.1583
+step=  7095  loss=12500.9960  ce=8.8784  mod_mlp=0.328 mod_std=0.084 lr=2.95e-04  tok/s=28  mem=9.8GB  intent_w=1.5137  mlp_out=733.3 usef=0.499  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0124 branch=58.6687 bridge_conn=0.0634 decorr=0.0549 div=-0.1161 diversity=61.0174 gate_l1=0.5359 gate_repulse=-0.0938 gradalign=18.3102 intent_tau=0.6591 ls_reg=10.3870 nuc=160.3240 pred=2.6859 ranking=12177.8838 reinforce=0.1430 signal_ent=1.4242 w_m2v=0.1583
+step=  7150  loss=11188.0758  ce=8.7941  mod_mlp=0.327 mod_std=0.083 lr=2.93e-04  tok/s=28  mem=9.8GB  intent_w=1.5135  mlp_out=723.9 usef=0.499  mat=0.733[0.733,0.733]
+  aux: alpha_novelty=-0.0005 balance=0.0135 branch=57.6694 bridge_conn=0.0640 decorr=0.0551 div=-0.1160 diversity=60.1811 gate_l1=0.5184 gate_repulse=-0.1008 gradalign=18.4919 intent_tau=0.6591 ls_reg=10.3836 nuc=163.6138 pred=2.6593 ranking=10863.4619 reinforce=0.1455 signal_ent=1.4242 w_m2v=0.1583
+step=  7205  loss=10737.4645  ce=9.5438  mod_mlp=0.326 mod_std=0.084 lr=2.56e-04  tok/s=28  mem=9.8GB  intent_w=1.6004  mlp_out=767.4 usef=0.498  mat=0.735[0.735,0.735]
+  aux: alpha_novelty=-0.0005 balance=0.0261 branch=38.0365 bridge_conn=0.0335 decorr=0.0553 div=-0.1160 diversity=89.1218 gate_l1=0.4419 gate_repulse=-0.1516 gradalign=18.3614 intent_tau=0.6591 ls_reg=10.3799 nuc=162.8055 pred=2.6676 ranking=10403.8291 reinforce=0.1887 signal_ent=1.4242 w_m2v=0.1582
 ```
