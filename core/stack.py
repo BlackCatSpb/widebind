@@ -85,6 +85,7 @@ class WideBindStack(nn.Module):
             cfg.D, cfg.n_layers,
             bridge_dim=getattr(cfg, 'bridge_dim', 256),
             depth=getattr(cfg, 'bridge_depth', True),
+            cfg=cfg,
         ) if getattr(cfg, 'bridge_conn', 0.0) > 0.0 else None
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
@@ -279,7 +280,12 @@ class WideBindStack(nn.Module):
                 # would scramble eval vs train — the bug that produced ppl 485M).
                 mat_gate = self.maturation.gate
             else:
-                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
+                # Bridge-readiness: maturity = max(time_ramp, bridge готовность).
+                # Ветви открываются, как только in-core SemanticBridge стал
+                # компетентным (его косинус-лосс упал), а не по слепым часам.
+                br = self.bridge.readiness() if self.bridge is not None else None
+                mat_gate = self.maturation.step_gate(
+                    step, self._tau_l_dev.detach(), bridge_readiness=br)
         if self.bridge is not None:
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):

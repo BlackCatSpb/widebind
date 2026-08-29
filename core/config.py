@@ -104,6 +104,17 @@ class WideBindConfig:
     matur_ema: float = 0.999        # pred-error EMA decay (smoothness)
     matur_warm: int = 300           # warm steps: capture random-regime pred_err_init
     matur_write_thr: float = 0.3    # maturity needed before private-memory writes
+    # ─── Maturity готовность по компетентности bridge (вместо слепой time-рампы) ───
+    # effective maturity = max(time_ramp, bridge_readiness). Ветви (bridge-инъекция,
+    # live-модуляция, private-memory write, intent-шина) открываются, как только
+    # in-core SemanticBridge научился предсказывать next-token embedding (его
+    # косинус-лосс упал), а не по фиксированным часам T0. Bridge учится
+    # независимо от LM-лосса ствола => готовность НЕ зацикливается (в отличие от
+    # pred_err зеркала). У init bridge случаен => readiness=0 => ствол не
+    # возмущается => стабильность обучения сохранена.
+    matur_bridge_readiness: bool = True
+    matur_bridge_r0: float = 0.5    # центр сигмоиды готовности (доля падения лосса)
+    matur_bridge_rs: float = 0.25   # наклон сигмоиды готовности
 
     # ─── Spec 1: Asymmetric expert init ───
     expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert

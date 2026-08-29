@@ -69,21 +69,16 @@ class MaturationController(nn.Module):
             denom = 1.0
         self.tau_norm.copy_(((log_tau - math.log(self.tau_min)) / denom).clamp(0.0, 1.0))
 
-    def step_gate(self, step, tau_dev=None):
-        """Gate for THIS step: a smooth TIME/τ ramp (no learning-dependence).
+    def step_gate(self, step, tau_dev=None, bridge_readiness=None):
+        """Gate for THIS step: max(TIME/τ ramp, bridge-readiness).
 
         gate_l(t) = sigmoid((t - (T0 + alpha*tau_norm_l*T_delay)) / delta_t)
-
-        Starts at ~0 for every layer (so the trunk is never perturbed by untrained
-        wake-up branches at init -> no divergence), then opens SMOOTHLY on a schedule:
-        shallow layers (small tau in the VSA ladder) open first, deeper layers later,
-        unified with the model's τ geometry. This replaces the readiness-gated design,
-        which deadlocked at scale: readiness required pred_err to DROP, but the base
-        model does not learn LM at this scale, so pred_err never dropped and the gate
-        stayed ~0 forever (bridge never engaged -> no learning -> ...).
-
-        `readiness` is still tracked (see update) and exposed for diagnostics, but it
-        no longer blocks the gate.
+        effective = max(gate_l, bridge_readiness)   # ветви открываются, как
+        только bridge стал компетентным (его косинус-лосс упал), а не по
+        слепым часам T0. При init bridge случаен => readiness=0 => gate=time
+        (≈0) => ствол не возмущается => стабильность сохранена. pred_err-
+        готовность (update) не зацикливается, т.к. bridge учится предсказывать
+        ЭТАЛОННЫЙ next-token embedding независимо от LM-лосса ствола.
         """
         if tau_dev is not None:
             self._update_tau_norm(tau_dev)
@@ -94,6 +89,9 @@ class MaturationController(nn.Module):
         # bottom-up порядка (где открывались сначала мелкие).
         gate = torch.sigmoid(
             (t - (self.T0 + self.alpha * (1.0 - self.tau_norm) * self.T_delay)) / self.delta_t)
+        if bridge_readiness is not None:
+            br = bridge_readiness.to(gate.device).reshape(1)
+            gate = torch.maximum(gate, br.expand_as(gate))
         self.gate.copy_(gate)
         return gate
 

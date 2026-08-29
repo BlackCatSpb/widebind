@@ -29,12 +29,26 @@ import torch.nn.functional as F
 
 
 class SemanticBridge(nn.Module):
-    def __init__(self, D: int, n_layers: int, bridge_dim: int = 256, depth: bool = True):
+    def __init__(self, D: int, n_layers: int, bridge_dim: int = 256, depth: bool = True, cfg=None):
         super().__init__()
         self.D = D
         self.n_layers = n_layers
         self.bridge_dim = bridge_dim
         self.depth = depth
+        # ─── Readiness по компетентности bridge (замена слепой time-рампе) ───
+        # Bridge самообучается предсказывать ЭТАЛОННЫЙ next-token embedding
+        # (косинус-лосс) независимо от LM-лосса ствола, поэтому его
+        # компетентность растёт даже когда ствол у случайного базиса. Это даёт
+        # сигнал готовности, который НЕ зацикливается (в отличие от pred_err
+        # зеркала, который при масштабе не падает). maturity = max(time_ramp,
+        # bridge_readiness): ветви открываются, как только bridge стал
+        # компетентным, а не по слепым часам, и при этом у init закрыты
+        # (bridge случаен => readiness=0 => стабильность сохранена).
+        self._br_r0 = float(getattr(cfg, 'matur_bridge_r0', 0.5))
+        self._br_rs = float(getattr(cfg, 'matur_bridge_rs', 0.25))
+        # baseline случайного режима (running max косинус-лосса) и EMA лосса
+        self.register_buffer('bridge_loss_init', torch.tensor(1.0), persistent=False)
+        self.register_buffer('bridge_loss_ema', torch.tensor(1.0), persistent=False)
 
         # Shared per-layer probe head (one set of weights applied at every layer
         # to keep parameter count small and force a common semantic readout).
@@ -60,6 +74,20 @@ class SemanticBridge(nn.Module):
             "bridge_stream", torch.zeros(n_layers, bridge_dim), persistent=False
         )
         self._preds: list[torch.Tensor] | None = None
+
+    @torch.no_grad()
+    def readiness(self) -> torch.Tensor:
+        """Скалярная готовность в [0,1] по компетентности bridge.
+
+        sat = 1 - ema_loss / init_loss  (насколько косинус-лосс bridge упал
+        относительно случайного базиса); readiness = sigmoid((sat - r0)/rs)
+        минус базовое значение при sat=0, чтобы ровно 0 при отсутствии обучения
+        (bridge случаен => ствол не возмущается => стабильность обучения).
+        Возвращает detached scalar-тензор (буферы вне графа)."""
+        init = self.bridge_loss_init.clamp(min=1e-3)
+        sat = (1.0 - self.bridge_loss_ema / init).clamp(0.0, 1.0)
+        base = torch.sigmoid(torch.tensor(-self._br_r0 / self._br_rs))
+        return (torch.sigmoid((sat - self._br_r0) / self._br_rs) - base).clamp(0.0, 1.0)
 
     # ------------------------------------------------------------------ #
     def start_forward(self) -> None:
@@ -133,4 +161,12 @@ class SemanticBridge(nn.Module):
                 tgt_ = tgt
             total = total + (1.0 - F.cosine_similarity(pred, tgt_, dim=-1).mean())
             n += 1
-        return total / max(n, 1)
+        loss_val = total / max(n, 1)
+        # EMA косинус-лосса + baseline случайного режима для readiness().
+        # Под no_grad: буферы вне графа, градиент по лоссу (probe/stream_proj)
+        # сохраняется — он течёт через возвращаемый loss_val.
+        with torch.no_grad():
+            lv = loss_val.detach().float()
+            self.bridge_loss_init.copy_(torch.maximum(self.bridge_loss_init, lv))
+            self.bridge_loss_ema.lerp_(lv, 0.01)
+        return loss_val
