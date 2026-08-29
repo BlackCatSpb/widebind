@@ -916,6 +916,268 @@ def run_bridge(model, cfg, batch=1, seq=128):
     }
 
 
+# ─────────────────────────── ALL-METRICS LOG PARSER ───────────────────────────
+
+import re as _re
+
+_MAIN_RE = _re.compile(
+    r'step=\s*(\d+)\s+loss=([-\d.eE+]+)\s+ce=([-\d.eE+]+)\s+'
+    r'mod_mlp=([-\d.eE+]+)\s+mod_std=([-\d.eE+]+)\s+lr=([-\d.eE+]+)\s+'
+    r'tok/s=(\d+)\s+mem=([\d.]+)GB\s+intent_w=([-\d.eE+]+)\s+'
+    r'mlp_out=([-\d.eE+]+)\s+usef=([-\d.eE+]+)\s+mat=([\d.]+)\[([\d.]+),([\d.]+)\]')
+_AUX_RE = _re.compile(r'aux:\s+(.*)')
+_AUX_KV = _re.compile(r'(\w+)=([-\d.eE+]+)')
+_EVAL_RE = _re.compile(r'EVAL step=(\d+):\s*val_loss=([-\d.eE+]+)\s*val_ppl=([-\d.eE+]+)')
+_DEPTH_RE = _re.compile(r'\[DepthController\].*?->\s*active_depth=(\d+)/(\d+)')
+_BRIDGE_RE = _re.compile(r'In-core SemanticBridge active\s*\((.*?)\)')
+_SAVE_RE = _re.compile(r'Saved (best|latest) to .*?\(?step\s*(\d+)\)?')
+
+
+def parse_training_log(path):
+    """Парсит лог обучения Colab и возвращает ВСЕ метрики в структурированном виде.
+
+    Возвращает dict:
+      steps : list[int]                       — шаги с основной строкой
+      main  : {metric: [val,...]}             — loss, ce, mod_mlp, mod_std, lr,
+                                                tok_s, mem, intent_w, mlp_out, usef,
+                                                mat, mat_min, mat_max (по шагам)
+      aux   : {metric: [val,...]}             — ВСЕ aux: ключи (alpha_novelty, balance,
+                                                branch, bridge_conn, decorr, div, diversity,
+                                                gate_l1, gate_repulse, gradalign, intent_tau,
+                                                ls_reg, nuc, pred, ranking, reinforce,
+                                                signal_ent, w_m2v, ...)
+      eval  : [(step, val_loss, val_ppl), ...]
+      depth : [(step, active, total), ...]
+      bridge: str | None                      — строка In-core SemanticBridge active (...)
+      saves : [(kind, step), ...]
+    """
+    data = {'steps': [], 'main': {}, 'aux': {}, 'eval': [], 'depth': [],
+            'bridge': None, 'saves': []}
+    MAIN_KEYS = ['loss', 'ce', 'mod_mlp', 'mod_std', 'lr', 'tok_s', 'mem',
+                 'intent_w', 'mlp_out', 'usef', 'mat', 'mat_min', 'mat_max']
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            m = _MAIN_RE.search(line)
+            if m:
+                step = int(m.group(1))
+                vals = [float(x) for x in m.groups()[1:]]
+                # vals order: loss, ce, mod_mlp, mod_std, lr, tok_s, mem, intent_w,
+                #             mlp_out, usef, mat, mat_min, mat_max  (13 чисел)
+                data['steps'].append(step)
+                for k, v in zip(MAIN_KEYS, vals):
+                    data['main'].setdefault(k, []).append(v)
+                continue
+            a = _AUX_RE.search(line)
+            if a:
+                for k, v in _AUX_KV.findall(a.group(1)):
+                    try:
+                        data['aux'].setdefault(k, []).append(float(v))
+                    except ValueError:
+                        pass
+                continue
+            e = _EVAL_RE.search(line)
+            if e:
+                data['eval'].append((int(e.group(1)), float(e.group(2)), float(e.group(3))))
+                continue
+            d = _DEPTH_RE.search(line)
+            if d:
+                data['depth'].append((data['steps'][-1] if data['steps'] else 0,
+                                      int(d.group(1)), int(d.group(2))))
+                continue
+            b = _BRIDGE_RE.search(line)
+            if b:
+                data['bridge'] = b.group(1)
+                continue
+            s = _SAVE_RE.search(line)
+            if s:
+                step_s = s.group(2)
+                data['saves'].append((s.group(1), int(step_s) if step_s else None))
+                continue
+    return data
+
+
+def _svg_spark(steps, vals, w=640, h=70, color='#58a6ff'):
+    if not steps or len(vals) < 2:
+        return '<div class="dim">нет данных</div>'
+    xs = list(range(len(vals)))
+    x0, x1 = xs[0], xs[-1]
+    vmin, vmax = min(vals), max(vals)
+    if vmax - vmin < 1e-12:
+        vmax = vmin + 1.0
+    pad = 4
+    def px(i, v):
+        xx = pad + (w - 2 * pad) * (xs[i] - x0) / max(1, (x1 - x0))
+        yy = (h - pad) - (h - 2 * pad) * (v - vmin) / (vmax - vmin)
+        return xx, yy
+    pts = ' '.join(f'{px(i, vals[i])[0]:.1f},{px(i, vals[i])[1]:.1f}'
+                   for i in range(len(vals)))
+    last = px(len(vals) - 1, vals[-1])
+    return (f'<svg width="{w}" height="{h}" style="display:block">'
+            f'<polyline fill="none" stroke="{color}" stroke-width="1.5" points="{pts}"/>'
+            f'<circle cx="{last[0]:.1f}" cy="{last[1]:.1f}" r="2.5" fill="{color}"/>'
+            f'</svg><div class="dim">min={vmin:.4g} max={vmax:.4g} last={vals[-1]:.4g}</div>')
+
+
+def render_log_html(data, outpath):
+    import html as H
+    steps = data['steps']
+    main = data['main']
+    aux = data['aux']
+
+    # сводные карточки (последнее значение каждой ключевой метрики)
+    def _last(d, k):
+        return d[k][-1] if (k in d and d[k]) else float('nan')
+
+    cards = [
+        ('Steps', f'{steps[0] if steps else "?"}–{steps[-1] if steps else "?"}'),
+        ('CE', f'{_last(main, "ce"):.4f}'),
+        ('val_loss', f'{data["eval"][-1][1] if data["eval"] else float("nan"):.4f}'),
+        ('val_ppl', f'{data["eval"][-1][2]:.0f}' if data["eval"] else '—'),
+        ('mat', f'{_last(main, "mat"):.4f}'),
+        ('mat_min', f'{_last(main, "mat_min"):.4f}'),
+        ('bridge_conn', f'{_last(aux, "bridge_conn"):.4f}'),
+        ('branch', f'{_last(aux, "branch"):.2f}'),
+        ('pred', f'{_last(aux, "pred"):.3f}'),
+        ('gradalign', f'{_last(aux, "gradalign"):.2f}'),
+        ('intent_w', f'{_last(main, "intent_w"):.3f}'),
+        ('usef', f'{_last(main, "usef"):.3f}'),
+        ('active_depth', f'{data["depth"][-1][1]}/{data["depth"][-1][2]}' if data['depth'] else '—'),
+        ('tok/s', f'{_last(main, "tok_s"):.0f}'),
+    ]
+    ch = []
+    ch.append('<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>WideBind training log</title><style>')
+    ch.append('body{background:#0d1117;color:#c9d1d9;font:14px/1.5 Consolas,monospace;margin:24px}'
+              'h1{color:#f0f6fc}h2{color:#79c0ff;border-bottom:1px solid #30363d;padding-bottom:4px;margin-top:26px}'
+              '.cards{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}'
+              '.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:8px 14px;min-width:96px}'
+              '.card b{display:block;font-size:17px;color:#f0f6fc}.card span{font-size:11px;color:#8b949e;text-transform:uppercase}'
+              'table{border-collapse:collapse;margin:10px 0;font-size:12px}th,td{border:1px solid #30363d;padding:3px 8px;text-align:right}'
+              'th{background:#161b22;color:#8b949e;position:sticky;top:0}td:first-child,th:first-child{text-align:left}'
+              '.scroll{max-height:420px;overflow:auto;border:1px solid #30363d;border-radius:8px}'
+              '.dim{color:#8b949e}.g{color:#7ee787}.y{color:#e3b341}.r{color:#ff7b72}')
+    ch.append('</style></head><body>')
+    ch.append('<h1>WideBind — Training Log Dashboard</h1>')
+    if data['bridge']:
+        ch.append(f'<div class="dim">bridge: {H.escape(data["bridge"])}</div>')
+    if data['saves']:
+        sv = ', '.join(f'{k}@{s}' for k, s in data['saves'])
+        ch.append(f'<div class="dim">saves: {H.escape(sv)}</div>')
+    ch.append('<div class="cards">')
+    for k, v in cards:
+        ch.append(f'<div class="card"><b>{v}</b><span>{k}</span></div>')
+    ch.append('</div>')
+
+    # графики ключевых метрик
+    ch.append('<h2>ДИНАМИКА КЛЮЧЕВЫХ МЕТРИК</h2>')
+    chart_metrics = [('ce', '#ff7b72'), ('mat', '#79c0ff'), ('mat_min', '#a5d6ff'),
+                     ('mod_mlp', '#7ee787'), ('bridge_conn', '#d2a8ff'), ('branch', '#e3b341'),
+                     ('pred', '#ffa657'), ('gradalign', '#56d364'), ('diversity', '#79c0ff'),
+                     ('ranking', '#f0883e'), ('gate_l1', '#58a6ff'), ('intent_w', '#ff7b72'),
+                     ('usef', '#7ee787'), ('div', '#e3b341'), ('decorr', '#79c0ff'),
+                     ('reinforce', '#d2a8ff'), ('ls_reg', '#56d364'), ('nuc', '#f0883e'),
+                     ('tok_s', '#8b949e'), ('lr', '#a5d6ff')]
+    for k, col in chart_metrics:
+        src = main if k in main else aux
+        if k in src and len(src[k]) >= 2:
+            ch.append(f'<h3>{k} ({len(src[k])} точек)</h3>')
+            ch.append(_svg_spark(steps, src[k], color=col))
+
+    # таблица ВСЕХ метрик по шагам
+    ch.append('<h2>ВСЕ МЕТРИКИ ПО ШАГАМ (полная таблица)</h2>')
+    all_keys = list(main.keys()) + [k for k in aux.keys() if k not in main]
+    ch.append('<div class="scroll"><table><tr><th>step</th>')
+    for k in all_keys:
+        ch.append(f'<th>{H.escape(k)}</th>')
+    ch.append('</tr>')
+    nrows = len(steps)
+    for i in range(nrows):
+        ch.append(f'<tr><td>{steps[i]}</td>')
+        for k in all_keys:
+            src = main if k in main else aux
+            v = src.get(k, [None] * nrows)[i]
+            if v is None:
+                ch.append('<td>—</td>')
+            else:
+                ch.append(f'<td>{v:.4g}</td>')
+        ch.append('</tr>')
+    ch.append('</table></div>')
+
+    if data['eval']:
+        ch.append('<h2>VAL LOSS (EVAL)</h2>')
+        ch.append('<table><tr><th>step</th><th>val_loss</th><th>val_ppl</th></tr>')
+        for s, vl, vp in data['eval']:
+            ch.append(f'<tr><td>{s}</td><td>{vl:.4f}</td><td>{vp:.0f}</td></tr>')
+        ch.append('</table>')
+    if data['depth']:
+        ch.append('<h2>ACTIVE DEPTH (DepthController)</h2>')
+        ch.append('<table><tr><th>step</th><th>active</th><th>total</th></tr>')
+        for s, a, t in data['depth']:
+            ch.append(f'<tr><td>{s}</td><td>{a}</td><td>{t}</td></tr>')
+        ch.append('</table>')
+
+    ch.append('<p class="dim">generated by analyze.py --log</p>')
+    ch.append('</body></html>')
+    with open(outpath, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(ch))
+    print(f'\nLOG HTML report: {outpath}')
+
+
+def run_metacog(model, cfg):
+    """Извлекает ВСЕ мета-когнитивные буферы модели (per-layer + глобальные)."""
+    layers = []
+    for i, layer in enumerate(model.layers):
+        m = layer.mirror
+        row = {'layer': i}
+        try:
+            row['pm_norm'] = (m._private_mem.norm(dim=-1).mean().item()
+                              if m._has_private_mem else None)
+        except Exception:
+            row['pm_norm'] = None
+        try:
+            w = torch.sigmoid(m._signal_log_weights)
+            row['signal_w'] = (w / (w.sum() + 1e-10)).tolist()
+        except Exception:
+            row['signal_w'] = None
+        for bname in ('gate_ema', 'w_help', 'w_contra'):
+            try:
+                row[bname] = float(getattr(m, bname).mean().item() if hasattr(m, bname) else getattr(m, '_' + bname).mean().item())
+            except Exception:
+                row[bname] = None
+        try:
+            row['trust_diag'] = m._trust_matrix.diag().mean().item()
+        except Exception:
+            row['trust_diag'] = None
+        try:
+            row['trust_max'] = m._trust_matrix.max().item()
+        except Exception:
+            row['trust_max'] = None
+        try:
+            row['concept_sim'] = m._concept_sim_ema.mean().item()
+        except Exception:
+            row['concept_sim'] = None
+        try:
+            row['behavior_div'] = m._behavior_div_ema.mean().item()
+        except Exception:
+            row['behavior_div'] = None
+        try:
+            row['meta_private_mem'] = (m._meta_private_mem.mean().item()
+                                        if m._meta_trust else None)
+        except Exception:
+            row['meta_private_mem'] = None
+        layers.append(row)
+    mat = model.maturation
+    out = {
+        'layers': layers,
+        'mat_gate': mat.gate.tolist(),
+        'mat_readiness': mat.readiness.tolist(),
+        'mat_pen_init': mat.pen_init.tolist(),
+        'mat_pen_ema': mat.pen_ema.tolist(),
+        'bridge_readiness': (float(model.bridge.readiness())
+                             if model.bridge is not None else None),
+    }
+    return out
+
+
 # ─────────────────────────── HTML ───────────────────────────
 
 def _hue(v, vmin, vmax):
@@ -923,7 +1185,7 @@ def _hue(v, vmin, vmax):
     return 120 * (1.0 - t)
 
 
-def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=None):
+def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=None, metacog=None):
     import html as H
     path = ckpt.get('_path', '?')
     step = ckpt.get('step', '?')
@@ -1083,6 +1345,48 @@ td:first-child,th:first-child{text-align:left}
                   '</td></tr>')
     ch.append('</table>')
 
+    if metacog is not None:
+        ch.append('<h2>META-COGNITION (ВСЕ буферы)</h2>')
+        if metacog.get('bridge_readiness') is not None:
+            ch.append(f'<div class="cards">'
+                      f'<div class="card"><b>{metacog["bridge_readiness"]:.4f}</b>'
+                      f'<span>bridge readiness</span></div>'
+                      f'<div class="card"><b>{max(metacog["mat_gate"]):.4f}</b>'
+                      f'<span>mat gate max</span></div>'
+                      f'<div class="card"><b>{sum(metacog["mat_gate"]) / len(metacog["mat_gate"]):.4f}</b>'
+                      f'<span>mat gate mean</span></div>'
+                      f'<div class="card"><b>{max(metacog["mat_readiness"]):.4f}</b>'
+                      f'<span>readiness max</span></div></div>')
+        sig_names = ['temp', 'pred', 'smooth', 'sym', 'help']
+        ch.append('<table><tr><th>L</th><th>pm_norm</th><th>gate_ema</th>'
+                  '<th>w_help</th><th>w_contra</th><th>trust_diag</th><th>trust_max</th>'
+                  '<th>concept_sim</th><th>behavior_div</th><th>meta_pm</th>'
+                  '<th>signal temp</th><th>signal pred</th><th>signal smooth</th>'
+                  '<th>signal sym</th><th>signal help</th></tr>')
+        for r in metacog['layers']:
+            sw = r.get('signal_w') or [None] * 5
+            def _c(x):
+                return f'{x:.4f}' if isinstance(x, (int, float)) else '—'
+            ch.append('<tr><td>' + str(r['layer']) + '</td><td>' + _c(r.get('pm_norm')) +
+                      '</td><td>' + _c(r.get('gate_ema')) + '</td><td>' + _c(r.get('w_help')) +
+                      '</td><td>' + _c(r.get('w_contra')) + '</td><td>' + _c(r.get('trust_diag')) +
+                      '</td><td>' + _c(r.get('trust_max')) + '</td><td>' + _c(r.get('concept_sim')) +
+                      '</td><td>' + _c(r.get('behavior_div')) + '</td><td>' + _c(r.get('meta_private_mem')) +
+                      '</td>' + ''.join(f'<td>{_c(sw[j] if j < len(sw) else None)}</td>'
+                                       for j in range(5)) + '</tr>')
+        ch.append('</table>')
+        ch.append('<h2>MATURATION per-layer</h2>')
+        ch.append('<table><tr><th>L</th><th>gate</th><th>readiness</th>'
+                  '<th>pen_init</th><th>pen_ema</th></tr>')
+        for i in range(len(metacog['mat_gate'])):
+            def _f(x):
+                return f'{x:.4f}'
+            ch.append('<tr><td>' + str(i) + '</td><td>' + _f(metacog['mat_gate'][i]) +
+                      '</td><td>' + _f(metacog['mat_readiness'][i]) + '</td><td>' +
+                      _f(metacog['mat_pen_init'][i]) + '</td><td>' +
+                      _f(metacog['mat_pen_ema'][i]) + '</td></tr>')
+        ch.append('</table>')
+
     ch.append('<h2>ANOMALY TRACK</h2>')
     if anomaly:
         for line in anomaly['report']:
@@ -1178,8 +1482,8 @@ td:first-child,th:first-child{text-align:left}
 # ─────────────────────────── MAIN ───────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description='WideBind checkpoint analyzer (все методы)')
-    ap.add_argument('checkpoints', nargs='+', help='path(s) to .pt')
+    ap = argparse.ArgumentParser(description='WideBind checkpoint analyzer (все методы + лог)')
+    ap.add_argument('checkpoints', nargs='*', help='path(s) to .pt (optional if --log given)')
     ap.add_argument('--no-live', action='store_true', help='skip live forward dissection')
     ap.add_argument('--no-gradinfo', action='store_true',
                     help='skip dead_pred/cos_sim(diversity,CE) grad diagnostics (slower)')
@@ -1190,7 +1494,11 @@ def main():
     ap.add_argument('--temp', type=float, default=0.8)
     ap.add_argument('--seq', type=int, default=128, help='live forward seq_len')
     ap.add_argument('--no-html', action='store_true', help='skip HTML report generation')
+    ap.add_argument('--log', type=str, default='',
+                    help='path to Colab training log (.txt) -> полный HTML-дашборд ВСЕХ метрик')
     args = ap.parse_args()
+    if not args.checkpoints and not args.log:
+        ap.error('нужен хотя бы один checkpoint или --log PATH')
 
     tok = None
     if not args.no_head and not args.quick:
@@ -1247,8 +1555,13 @@ def main():
                 print(f'[error] bridge: {e}')
         if not args.no_html and wake_data is not None:
             try:
+                metacog = run_metacog(model, cfg) if not args.quick else None
+            except Exception as e:
+                print(f'[error] metacog: {e}')
+                metacog = None
+            try:
                 save_html_report(ckpt, cfg, model, wake_data, live_data, head_data,
-                                 anomaly_data, bridge_data)
+                                 anomaly_data, bridge_data, metacog=metacog)
             except Exception as e:
                 print(f'[error] html: {e}')
 
@@ -1257,6 +1570,20 @@ def main():
             run_cmp(models, args, tok)
         except Exception as e:
             print(f'[error] cmp: {e}')
+
+    if args.log:
+        try:
+            print(f'\n# parsing log: {args.log}')
+            log_data = parse_training_log(args.log)
+            n = len(log_data['steps'])
+            print(f'  parsed steps={n}  aux_metrics={len(log_data["aux"])}  '
+                  f'eval={len(log_data["eval"])}  depth={len(log_data["depth"])}')
+            if n == 0:
+                print('[warn] основные строки step= не найдены — проверьте формат лога')
+            out = os.path.splitext(args.log)[0] + '_log_report.html'
+            render_log_html(log_data, out)
+        except Exception as e:
+            print(f'[error] log: {e}')
 
 
 if __name__ == '__main__':
