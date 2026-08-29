@@ -43,6 +43,16 @@ class WideBindConfig:
     reasoning_adaptive: bool = False  # True = per-step gates (adaptive depth); False = old single step
     reasoning_gate_stop_threshold: float = 0.5  # loop stops when mean gate < threshold
 
+    # ─── Триада: Рассудок как участник (замыкание петли) ───
+    # Верификатор (Рассудок) не только читает _knowledge_signal/_last_conf, но
+    # при неуверенности ре-циркулирует ствол (повторный осмысленный проход =>
+    # бóльшая эффективная глубина). Чистый control-flow: новых параметров нет,
+    # переобучение не требуется. Активно только в inference/generation
+    # (not self.training и step is not None), тренировка и валидация нетронуты.
+    triad_reason: bool = True
+    triad_conf_thr: float = 0.5       # порог уверенности lm_head: ниже -> ре-проход
+    triad_max_passes: int = 3         # бюджет ре-циркуляций (защита от зацикливания)
+
     # AMP (Automatic Mixed Precision)
     use_amp: bool = False  # True = mixed precision (requires CUDA, ~2x speed)
 

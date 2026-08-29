@@ -113,10 +113,13 @@ class WideBindStack(nn.Module):
             self.maturation = None
         # EMA for exploration (smoothed over ~500 steps)
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
+        # Триада: сколько ре-циркуляций сделал Рассудок на последнем проходе (диагностика)
+        self._triad_passes = 0
     
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
                 context_mem=None, allow_write=None, step=None,
-                reasoning_buffer=None, reasoning_count=None, intent_state=None):
+                reasoning_buffer=None, reasoning_count=None, intent_state=None,
+                _triad_depth: int = 0):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
@@ -441,6 +444,36 @@ class WideBindStack(nn.Module):
         if _reasoning_attr:
             self._reasoning_buffer = reasoning_buffer
             self._reasoning_count = reasoning_count
+
+        # ─── Триада: Рассудок как участник (замыкание петли) ───
+        # После прохода верификатор оценивает уверенность (_last_conf). Если она
+        # ниже порога, ствол ре-циркулирует: повторный осмысленный проход с тем
+        # же входом => бóльшая эффективная глубина, пока Рассудок не удовлетворён
+        # или не исчерпан бюджет. Это превращает верификатор из пассивного
+        # читателя в активного участника петли самокоррекции.
+        # Только inference/generation: `not self.training` (eval измерение и
+        # обучение не трогаем) И `step is not None` (generate передаёт step,
+        # валидация — нет). Нет новых параметров => переобучение не нужно.
+        self._triad_passes = _triad_depth
+        if (getattr(self.cfg, 'triad_reason', False)
+                and (not self.training)
+                and step is not None
+                and _triad_depth < int(getattr(self.cfg, 'triad_max_passes', 3))):
+            with torch.no_grad():
+                _conf = float(self._last_conf(h).mean().item())
+            if _conf < float(getattr(self.cfg, 'triad_conf_thr', 0.5)):
+                h2, new_state, global_state, rb = self.forward(
+                    h, state=new_state, global_state=global_state,
+                    pred_weight=pred_weight, adaptive=adaptive,
+                    context_mem=context_mem, allow_write=allow_write,
+                    step=step, reasoning_buffer=reasoning_buffer,
+                    reasoning_count=reasoning_count, intent_state=None,
+                    _triad_depth=_triad_depth + 1)
+                # Консервативный бленд против дрейфа при ре-циркуляции: половина
+                # исходного и половина пересмотренного представления.
+                h = 0.5 * h + 0.5 * h2
+                reasoning_buffer, reasoning_count = rb
+                self._triad_passes = _triad_depth + 1
 
         return h, new_state, global_state, (reasoning_buffer, reasoning_count)
 
