@@ -23,7 +23,7 @@ class WideBindConfig:
     dtype: str = 'float32'
 
     # False = обучать EOS-токен (границы предложений), True = маскировать (старое поведение)
-    mask_eos: bool = True
+    mask_eos: bool = False   # Colab: учим EOS (данные *_eos.bin — границы предложений)
 
     # ─── λ_d hierarchy ─────────────────────────────────────────
     lambda_d: int = 3            # dimension of generalized golden ratio
@@ -33,14 +33,14 @@ class WideBindConfig:
     tie_mirror_proj: bool = True  # True = mirror W_out = W_proj^T (per-expert K-space AE)
 
     # Variable Precision Memory
-    variable_precision: bool = False  # True = add exact sequence memory on top of VSA
+    variable_precision: bool = True   # add exact sequence memory on top of VSA (canonical Colab stack)
     precision_threshold: float = 0.3  # gate threshold to activate exact memory
 
     # Explicit Reasoning (chain-of-thought)
-    explicit_reasoning: bool = False  # True = enable thinking tokens and reasoning memory
+    explicit_reasoning: bool = True   # canonical Colab stack: reasoning loop enabled
     reasoning_max_steps: int = 8  # max reasoning steps in chain-of-thought
     reasoning_ramp_steps: int = 1000  # exp ramp of block influence: scale = 1 - exp(-t/ramp)
-    reasoning_adaptive: bool = False  # True = per-step gates (adaptive depth); False = old single step
+    reasoning_adaptive: bool = True   # per-step gates (adaptive depth) — canonical Colab stack
     reasoning_gate_stop_threshold: float = 0.5  # loop stops when mean gate < threshold
 
     # ─── Триада: Рассудок как участник (замыкание петли) ───
@@ -86,7 +86,7 @@ class WideBindConfig:
     # pm_write_delay<=0 тогда означает «только по когерентности» (без шагового пола).
     # ВНИМАНИЕ: слепое pm_write_delay=0 при СТАРОМ коде (до этого фикса) открывало
     # запись с шага 0 — именно это засевало эхо в best.pt. Теперь исправлено.
-    pm_write_delay: int = 5000  # legacy-пол только при maturation_enabled=False; 0 => coherence-only
+    pm_write_delay: int = 0      # legacy-пол только при maturation_enabled=False; 0 => coherence-only (maturity-only write gate)
     pm_coh_gate_std: float = 0.02  # legacy fallback when maturation is disabled
 
     # ─── Maturation gate (unified wake-up controller) ───
@@ -133,7 +133,7 @@ class WideBindConfig:
 
     collective_layer: bool = True
     collective_layer_idx: int = None
-    collective_read_out: bool = False
+    collective_read_out: bool = True
     collective_S: int = 8
     collective_uncert_theta: float = 0.5
     collective_uncert_kappa: float = 3.0
@@ -262,7 +262,7 @@ class WideBindConfig:
     # semantic delta instead of the frozen mod_scale_mlp parameter. The gate thus
     # becomes a live function of the bridge (semantic), not a stuck param. MLP
     # keeps its SwiGLU; BridgeGLU is the *outer* semantic gate. Experimental.
-    bridge_glu: bool = False
+    bridge_glu: bool = True
 
     # bridge_glu_beta: modulation strength of the live BridgeGLU gate AROUND the
     # frozen stable baseline (sigmoid(mod_scale_mlp) ~ 0.667). BridgeGLU MODULATES
@@ -277,7 +277,7 @@ class WideBindConfig:
     # persistent cross-layer stream is injected back into each layer). This makes
     # the bridge part of the live pipeline in BOTH training and inference. 0.0 =
     # off. 0.1 is a sane default.
-    bridge_conn: float = 0.0
+    bridge_conn: float = 0.1
 
     # bridge_dim: semantic vector width for the in-core SemanticBridge probe.
     bridge_dim: int = 256
@@ -314,7 +314,7 @@ class WideBindConfig:
     hybrid_alpha_min: float = 0.3
     bind_twist_ocular: str = "tied"
     bind_twist_scheme: str = "golden"
-    bind_twist_gate: bool = False
+    bind_twist_gate: bool = True
 
     # Trajectory manifold (FCF): beams + Zeckendorf decay on trajectory bind
     traj_manifold: bool = False        # clever wrap: TrajectoryManifoldBind instead of Spiral
@@ -327,7 +327,7 @@ class WideBindConfig:
     # ─── Intent Bridge (нисходяще-восходящая передача «намерения» экспертам) ───
     # Эксперты «подхватывают» восходящий сигнал (то, что идёт наверх и станет
     # логитом). Реализуется как обёртка: IntentProbe + zero-init w_intent/b_intent.
-    intent_bridge: bool = False    # True = добавить мост ( checkpoint-совместимо: ноль-эффект при init)
+    intent_bridge: bool = True     # добавить мост ( checkpoint-совместимо: ноль-эффект при init)
     intent_topdown: bool = True    # зарезервировано: форма нисходящей трансляции intent_state
 
     # Gradient accumulation
