@@ -73,17 +73,20 @@ class WideBindConfig:
     reset_skip_alpha: bool = False
     private_mem: bool = True  # cross-expert private memory bank (meta-cognitive layer)
 
-    # Private-memory WRITE GATE. Writes start only once the model has LEFT the
-    # random regime, to avoid seeding a random-state echo chamber (early random
-    # K-space written -> read back -> self-reinforcing loop). Two conditions (OR):
-    #   (a) pm_write_delay forward steps (hard safety floor), OR
-    #   (b) coherence: the semantic gate is alive (mlp_mod std >= pm_coh_gate_std)
-    #       -> states are no longer random, so writing is safe.
-    # Set pm_write_delay=0 to rely PURELY on coherence (eg with BridgeGLU, whose
-    # gate is live from early on). delta is rms-normalized to ~constant magnitude,
-    # so gate liveness (mod_std) is the real discriminator. Default 5000 preserves
-    # legacy behaviour for the frozen gate.
-    pm_write_delay: int = 5000  # hard safety floor (steps); 0 => maturity-only
+    # Private-memory WRITE GATE.
+    # При включённой maturation (maturation_enabled=True, по умолчанию) запись
+    # управляется ЕДИНЫМ показателем зрелости M_l(t)=max(time/τ-рампа,
+    # bridge_readiness), пересекающим matur_write_thr — см. mirror.py. Это
+    # интеллектуальный (когнитивный) гейт: память не засевается ранне-случайными
+    # состояниями (эхо-камера невозможна), а компетентный bridge подключает её
+    # ровно когда полезно. В этом режиме pm_write_delay ИГНОРИРУЕТСЯ (time-floor
+    # уже встроен внутрь M_l). Не надо подгонять его вручную.
+    # При ВЫКЛЮЧЕННОЙ maturation (legacy) работает старый crutch: запись открывается
+    # после pm_write_delay шагов ИЛИ по когерентности (mlp_mod std >= pm_coh_gate_std).
+    # pm_write_delay<=0 тогда означает «только по когерентности» (без шагового пола).
+    # ВНИМАНИЕ: слепое pm_write_delay=0 при СТАРОМ коде (до этого фикса) открывало
+    # запись с шага 0 — именно это засевало эхо в best.pt. Теперь исправлено.
+    pm_write_delay: int = 5000  # legacy-пол только при maturation_enabled=False; 0 => coherence-only
     pm_coh_gate_std: float = 0.02  # legacy fallback when maturation is disabled
 
     # ─── Maturation gate (unified wake-up controller) ───
@@ -99,6 +102,12 @@ class WideBindConfig:
     matur_T0: float = 20000.0       # gate starts opening at ~T0 steps (smooth ramp-in)
     matur_T_delay: float = 20000.0  # deepest layer opens at ~T0 + alpha*T_delay steps
     matur_delta: float = 6000.0     # geometry ramp width (steps)
+    # NOTE: matur_T0 здесь — лишь Safety-Floor ВНУТРИ fused maturity
+    # (= max(time_ramp, bridge_readiness)). Снижать его вручную НЕ нужно:
+    # bridge_readiness открывает ветви рано, как только in-core bridge
+    # научился предсказывать next-token (его косинус-лосс упал), а time_ramp
+    # гарантирует открытие даже при «мёртвом» bridge. T0 не блокирует
+    # раннее включение — оно управляется компетентностью, а не часами.
     matur_r0: float = 0.6           # readiness sigmoid center (diagnostics only)
     matur_rs: float = 0.3           # readiness sigmoid slope (diagnostics only)
     matur_ema: float = 0.999        # pred-error EMA decay (smoothness)

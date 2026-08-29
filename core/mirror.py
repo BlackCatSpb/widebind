@@ -462,18 +462,27 @@ class GroupedCognitiveMirror(nn.Module):
                 self._cached_isolation = isolation
         
         # ─── Private Memory: write confident K-space states (contradiction-aware) ───
-        # Private-memory write gate: OPEN once the layer has MATURED (unified controller),
-        # with a hard pm_write_delay floor as a safety net. This replaces the old
-        # "mod_std >= pm_coh_gate_std" crutch: maturity already encodes "experts ripe
-        # AND geometry allows", so writing at M>=thr can only seed a learned echo.
+        # ИНТЕЛЛЕКТУАЛЬНЫЙ (когнитивный) контроллер записи:
+        #   • При включённой maturation запись открывается ТОЛЬКО когда ЕДИНЫЙ
+        #     показатель зрелости M_l(t) = max(time/τ-рампа, bridge_readiness)
+        #     пересекает matur_write_thr. M_l уже несёт в себе safety time-floor
+        #     (память откроется к ~22k–41k шагу даже если bridge никогда не станет
+        #     компетентным) И реальную компетентность bridge. Никакого слепого
+        #     переопределения шаговым таймером -> ранне-случайное эхо-камера
+        #     невозможно, а компетентный bridge подключает память ровно когда это
+        #     полезно. pm_write_delay в этом режиме игнорируется.
+        #   • При ВЫКЛЮЧЕННОЙ maturation (legacy) — явный step-delay floor ИЛИ
+        #     crutch по std модуляции (исходное поведение). pm_write_delay<=0 тогда
+        #     означает «только по когерентности» (без шагового пола).
         _write_ok = _write
         if _write_ok:
-            self._pm_step += 1
             if maturity is not None:
-                coherent = bool(maturity >= self._matur_write_thr)
+                _write_ok = bool(maturity >= self._matur_write_thr)
             else:
+                self._pm_step += 1
                 coherent = bool(self._pm_coh.item())
-            _write_ok = (self._pm_step.item() >= self._pm_write_delay) or coherent
+                _write_ok = coherent if self._pm_write_delay <= 0 \
+                    else (self._pm_step.item() >= self._pm_write_delay) or coherent
         if _write_ok:
             with torch.no_grad():
                 conf = torch.sigmoid(-pred_error.abs().mean(dim=-1, keepdim=True))
