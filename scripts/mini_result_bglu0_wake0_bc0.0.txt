@@ -1,5 +1,0 @@
-[mini] bridge_conn=0.0 mlp_wake=False bridge_glu=False steps=5
-step=    0 ce=3.519 mod_mlp_mean=0.667 mod_mlp_std=0.000 birth=0.0424 t=0s
-
---- generation (prompt: 'cat') ---
-cat .

@@ -1,7 +1,0 @@
-[mini] bridge_conn=0.1 mlp_wake=False bridge_glu=True steps=300
-step=    0 ce=3.414 bglu_mean=0.333 bglu_std=0.012 Lconn=1.089 t=0s
-step=  100 ce=2.667 bglu_mean=0.327 bglu_std=0.043 Lconn=0.001 t=22s
-step=  200 ce=2.601 bglu_mean=0.327 bglu_std=0.053 Lconn=0.000 t=44s
-
---- generation (prompt: 'cat') ---
-cat bird sat .

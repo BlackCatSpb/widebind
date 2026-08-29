@@ -1,8 +1,0 @@
-[mini] bridge_conn=0.1 mlp_wake=False bridge_glu=False steps=400
-step=    0 ce=3.584 mod_mlp_mean=0.667 mod_mlp_std=0.000 Lconn=0.985 birth=0.0426 t=0s
-step=  100 ce=2.679 mod_mlp_mean=0.666 mod_mlp_std=0.000 Lconn=0.001 birth=0.0412 t=23s
-step=  200 ce=2.612 mod_mlp_mean=0.666 mod_mlp_std=0.000 Lconn=0.000 birth=0.0419 t=45s
-step=  300 ce=2.477 mod_mlp_mean=0.666 mod_mlp_std=0.000 Lconn=0.000 birth=0.0420 t=77s
-
---- generation (prompt: 'cat') ---
-cat fox .
