@@ -1113,7 +1113,7 @@ WideBind/
 │   ├── colab.ipynb             # канонический ноутбук (D2560/24L, T4)
 │   └── widebind_colab.ipynb    # вариант D4096/16L (24GB+ вариант)
 │
-├── docs/                       # документы; журналы: TRAINING_JOURNAL.md (история) и LIVE_TRAINING_LOG.md (актуальный)
+├── docs/                       # документы; LIVE_TRAINING_LOG.md — единственный журнал обучения (актуальный)
 ├── checkpoints/                # чекпоинты (best.pt, step_N.pt, step_N_fcf.pt — FCF-CPR сжатые)
 ├── wb/                         # BPE-токенизатор (russian_tokenizer/) + обучающие потоки (token_stream_*_eos.bin)
 ├── tests/                      # smoke-тесты (53 passed / 9 known-fail baseline)
@@ -1160,9 +1160,7 @@ print(model.param_count())   # 146,125,268 (146.13M; внутри модели ~
 - **Генерация (FCF-CPR + smart)**: `python scripts/generate.py checkpoints/best.pt --prompt "..." --tokens 80`
    — авто-декомпрессия сжатого чекпоинта; `--skip-compression` для обычного; `--smart` для τ-адаптивного
    режима; `--no-top` — чистый temperature-семплинг без top-p/top-k.
-- **Журналы обучения**: `docs/TRAINING_JOURNAL.md` (история, главы 1–73) и
-   `docs/LIVE_TRAINING_LOG.md` (актуальный, round 0–2200) — динамика валидации,
-   фазы обучения, сравнение чекпоинтов, гипотезы (резервуар, эксперты-предикторы), watchlist.
+- **Журнал обучения**: `docs/LIVE_TRAINING_LOG.md` — единственный актуальный лог текущего запуска (конфиг, чекпоинт, траектория val, фазовый переход, сырой лог, вердикт analyze).
 
 ---
 
