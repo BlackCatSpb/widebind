@@ -27,8 +27,8 @@
 
 | Метрика | Значение |
 |---|---|
-| Шаг сохранения best | **10252** (проанализирован: WAKE-CANDIDATE, отчёт `best_10252_report.html`). Прогон: val 9.4035@9087 → 9.3663@9320 → 9.3310@9553 → 9.2989@9786 → 9.2646@10019 → **9.2307@10252** (новый best). |
-| val_loss / ppl | 9.2307 / ~10238 |
+| Шаг сохранения best (локальный) | **10252** (проанализирован: WAKE-CANDIDATE, отчёт `best_10252_report.html`). Прогон: val 9.4035@9087 → 9.3663@9320 → 9.3310@9553 → 9.2989@9786 → 9.2646@10019 → 9.2307@10252 → **9.1963@10485** (новый best прогона — пока не скопирован локально). |
+| val_loss / ppl | 9.2307 / ~10238 (локальный best.pt); прогон: **9.1963@10485** |
 | Зрелость `mat` | 0.716–0.755 (текущий 0.7499@10252 — устойчивый режим после прорыва) |
 | `bridge_conn` (raw cosine-loss моста) | ~0.09 в новом бассейне (во время перестройки падал до ~0.015 — мост был гипер-компетентен и дестабилизировал ствол; после прорыва баланс восстановлен) |
 | `mod_mlp` (live) | ~0.327–0.331 (здоров, не схлопнут) |
@@ -37,7 +37,7 @@
 
 ### Траектория val (монотонно улучшается)
 
-10.0216 (5126) → 9.9749 (5359) → 9.9283 (5592) → 9.8816 (5825) → 9.8366 (6058) → 9.7956 (6291) → 9.7516 (6524) → 9.7113 (6757) → 9.6820 (6990) → 9.6390 (7223) → *перестройка (7689=11.09, 7922=15.74)* → **9.5201 (8388) → 9.4821 (8621) → 9.4425 (8854) → 9.4035 (9087) → 9.3663 (9320) → 9.3310 (9553) → 9.2989 (9786) → 9.2646 (10019) → **9.2307 (10252)** — монотонно улучшается после прорыва.
+10.0216 (5126) → 9.9749 (5359) → 9.9283 (5592) → 9.8816 (5825) → 9.8366 (6058) → 9.7956 (6291) → 9.7516 (6524) → 9.7113 (6757) → 9.6820 (6990) → 9.6390 (7223) → *перестройка (7689=11.09, 7922=15.74)* → **9.5201 (8388) → 9.4821 (8621) → 9.4425 (8854) → 9.4035 (9087) → 9.3663 (9320) → 9.3310 (9553) → 9.2989 (9786) → 9.2646 (10019) → 9.2307 (10252) → **9.1963 (10485)** — монотонно улучшается после прорыва.
 
 ### ⚠️ Событие перестройки (step 7689 → 7922)
 
@@ -58,7 +58,7 @@
 - **EVAL 8621 = 9.4821 / ppl 13122** → **Saved best**.
 - **EVAL 8854 = 9.4425 / ppl 12613** → **Saved best** (текущий best). CE трейна ~8.5–9.6; `mat` осел к **0.716–0.726** (новый устойчивый режим, ниже пика 0.755 во время перестройки); `bridge_conn` raw вернулся к **~0.09** (сбалансированный, не гипер-компетентный как ~0.015 в момент дестабилизации); LR восстановлен до **~3e-4** (`lr_adapt` вернул mult к ~1.0 после прорыва).
 
-Интерпретация: перестройка — **успешный прорыв** в лучший бассейн. Модель «переломала» старое устойчивое внутреннее пространство и нашла более обобщающее (val 9.44 вместо 9.64). Ствол оставался жив (CE < 15), watchdog не срабатывал. Обучение продолжается к цели `val ≈ 8.5`. Локальный `checkpoints/best.pt` = 10252 (свежий, проанализирован: WAKE-CANDIDATE, отчёт `best_10252_report.html`); после 8854 val продолжил снижаться **9.4425@8854 → 9.4035@9087 → 9.3663@9320 → 9.3310@9553 → 9.2989@9786 → 9.2646@10019 → 9.2307@10252**.
+Интерпретация: перестройка — **успешный прорыв** в лучший бассейн. Модель «переломала» старое устойчивое внутреннее пространство и нашла более обобщающее (val 9.44 вместо 9.64). Ствол оставался жив (CE < 15), watchdog не срабатывал. Обучение продолжается к цели `val ≈ 8.5`. Локальный `checkpoints/best.pt` = 10252 (свежий, проанализирован: WAKE-CANDIDATE, отчёт `best_10252_report.html`); на прогоне val продолжил снижаться **9.4425@8854 → 9.4035@9087 → 9.3663@9320 → 9.3310@9553 → 9.2989@9786 → 9.2646@10019 → 9.2307@10252 → 9.1963@10485** (новый best прогона — пока не скопирован локально).
 
 ### Фазовый переход (созревание и каскад, step 4950 → 6105)
 
@@ -68,7 +68,7 @@
 - **Каскад созревания (~5995–6105):** `bridge_readiness` догоняет — `bridge_conn` (raw) падает **0.237 → 0.074 → 0.038** (мост научился предсказывать эталонный next-token), `mat` прыгает **0.626 → 0.684 → 0.734**, `ce` **9.29 → 8.80**. Здоровый каскад (не расходимость): maturation-гейт держит `ρ(J_l) ≈ 1`.
 - **Плато (6105 → 7205+):** `mat` стабилизируется **0.730–0.735**, `bridge_conn` (raw) ~0.03–0.07, живые ветви (live BridgeGLU, injection моста, intent-шина, запись приватной памяти) раскрыты полностью; `mod_mlp`~0.327, CE плавает 8.5–10.1.
 
-⏳ *Сырой лог за 8965 → 10010 получен (ниже); локальный `best.pt` = **10252** (val 9.2307, WAKE-CANDIDATE, отчёт `best_10252_report.html`). Зафиксирован устойчивый steady-state после прорыва: `mat` 0.750–0.751, CE трейна ~7.8–8.9 (step 9845 = 7.81 — новый минимум), `intent_w`~2.14, `bridge_conn` raw ~0.025 (уравновешен). Обучение продолжается к цели `val ≈ 8.5`.*
+⏳ *Сырой лог за 8965 → 10615 получен (ниже); локальный `best.pt` = **10252** (val 9.2307, WAKE-CANDIDATE, отчёт `best_10252_report.html`), на прогоне новый best **9.1963@10485** (пока не скопирован локально). Steady-state держится: `mat` 0.750, CE трейна **7.36** (step 10450 — новый минимум), `intent_w`~2.14, `bridge_conn` raw ~0.026. Обучение продолжается к цели `val ≈ 8.5`.*
 
 ### Вердикт analyze (`checkpoints/best.pt`@10252) — WAKE-CANDIDATE
 
@@ -82,7 +82,7 @@
 
 **Цель:** выйти к историческому рубежу `val ≈ 8.5` при сохранении устойчивого CE.
 
-### Сырой лог (текущий запуск, step 4934 → 10010)
+### Сырой лог (текущий запуск, step 4934 → 10615)
 
 ```
 In-core SemanticBridge active (bridge_conn=0.1, bridge_dim=256, params=2,034,948)
@@ -320,4 +320,33 @@ step=  9955  loss=8914.4173  ce=8.4623  mod_mlp=0.325 mod_std=0.076 lr=3.00e-04 
   aux: alpha_novelty=-0.0005 balance=0.0434 branch=33.0806 bridge_conn=0.0256 decorr=0.0612 div=-0.1156 diversity=25.5937 gate_l1=0.3848 gate_repulse=-0.1901 gradalign=20.0239 intent_tau=0.6588 ls_reg=10.2363 nuc=161.3521 pred=2.5060 ranking=8650.4902 reinforce=0.2225 signal_ent=1.4240 w_m2v=0.1580
 step= 10010  loss=8901.1953  ce=8.3277  mod_mlp=0.325 mod_std=0.077 lr=3.00e-04  tok/s=28  mem=9.8GB  intent_w=2.1410  mlp_out=720.6 usef=0.501  mat=0.750[0.750,0.750]
   aux: alpha_novelty=-0.0005 balance=0.0433 branch=34.7387 bridge_conn=0.0258 decorr=0.0605 div=-0.1156 diversity=25.8542 gate_l1=0.3845 gate_repulse=-0.1888 gradalign=20.0267 intent_tau=0.6588 ls_reg=10.2329 nuc=163.3412 pred=2.5392 ranking=8633.4629 reinforce=0.2217 signal_ent=1.4240 w_m2v=0.1580
+  EVAL step=10019: val_loss=9.2646 val_ppl=10557.17
+  Saved best to best.pt
+step= 10065  loss=8422.3472  ce=8.7149  mod_mlp=0.325 mod_std=0.078 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=2.1407  mlp_out=730.5 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0436 branch=33.5573 bridge_conn=0.0265 decorr=0.0612 div=-0.1156 diversity=12.0934 gate_l1=0.3796 gate_repulse=-0.1879 gradalign=19.8489 intent_tau=0.6588 ls_reg=10.2295 nuc=163.2010 pred=2.5445 ranking=8169.4883 reinforce=0.2218 signal_ent=1.4240 w_m2v=0.1580
+step= 10120  loss=8406.6055  ce=8.9323  mod_mlp=0.326 mod_std=0.078 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=2.1403  mlp_out=733.9 usef=0.502  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0443 branch=33.1936 bridge_conn=0.0269 decorr=0.0628 div=-0.1156 diversity=8.0514 gate_l1=0.3774 gate_repulse=-0.1872 gradalign=19.6537 intent_tau=0.6588 ls_reg=10.2261 nuc=159.9469 pred=2.5357 ranking=8161.3955 reinforce=0.2213 signal_ent=1.4240 w_m2v=0.1580
+step= 10175  loss=8419.9290  ce=8.3740  mod_mlp=0.326 mod_std=0.076 lr=3.00e-04  tok/s=28  mem=9.8GB  intent_w=2.1400  mlp_out=725.4 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0443 branch=34.4541 bridge_conn=0.0268 decorr=0.0620 div=-0.1156 diversity=7.8848 gate_l1=0.3778 gate_repulse=-0.1873 gradalign=19.7619 intent_tau=0.6588 ls_reg=10.2227 nuc=164.7987 pred=2.5381 ranking=8169.2266 reinforce=0.2198 signal_ent=1.4240 w_m2v=0.1580
+step= 10230  loss=8181.7528  ce=9.3922  mod_mlp=0.326 mod_std=0.076 lr=3.00e-04  tok/s=28  mem=9.8GB  intent_w=2.1396  mlp_out=723.8 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0435 branch=33.4974 bridge_conn=0.0268 decorr=0.0612 div=-0.1156 diversity=8.0533 gate_l1=0.3798 gate_repulse=-0.1870 gradalign=19.5913 intent_tau=0.6588 ls_reg=10.2193 nuc=165.2737 pred=2.5266 ranking=7930.5322 reinforce=0.2177 signal_ent=1.4240 w_m2v=0.1580
+  EVAL step=10252: val_loss=9.2307 val_ppl=10205.92
+  Saved best to best.pt
+step= 10285  loss=7911.9537  ce=8.4841  mod_mlp=0.326 mod_std=0.075 lr=3.00e-04  tok/s=28  mem=9.8GB  intent_w=2.1393  mlp_out=737.3 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0448 branch=34.9285 bridge_conn=0.0262 decorr=0.0627 div=-0.1156 diversity=22.3367 gate_l1=0.3707 gate_repulse=-0.1870 gradalign=19.8188 intent_tau=0.6588 ls_reg=10.2159 nuc=165.6268 pred=2.5397 ranking=7645.3428 reinforce=0.2184 signal_ent=1.4240 w_m2v=0.1580
+step= 10340  loss=8069.0371  ce=8.8898  mod_mlp=0.326 mod_std=0.075 lr=3.02e-04  tok/s=28  mem=9.8GB  intent_w=2.1390  mlp_out=739.7 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0447 branch=35.4553 bridge_conn=0.0262 decorr=0.0631 div=-0.1156 diversity=32.2183 gate_l1=0.3673 gate_repulse=-0.1836 gradalign=19.9664 intent_tau=0.6588 ls_reg=10.2125 nuc=163.0538 pred=2.5185 ranking=7794.0635 reinforce=0.2165 signal_ent=1.4240 w_m2v=0.1580
+step= 10395  loss=8094.4179  ce=8.3682  mod_mlp=0.327 mod_std=0.074 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=2.1386  mlp_out=739.8 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0445 branch=36.6833 bridge_conn=0.0263 decorr=0.0639 div=-0.1156 diversity=32.4165 gate_l1=0.3672 gate_repulse=-0.1824 gradalign=20.1561 intent_tau=0.6588 ls_reg=10.2091 nuc=165.6677 pred=2.4935 ranking=7815.7642 reinforce=0.2152 signal_ent=1.4240 w_m2v=0.1580
+  lr_adapt: var(ls)=13.518660 |1-a|=0.095720 gate_var=0.181764 |mirror|=230.3600 tau_var=13.524200 mult=1.0040 lr=3.01e-04 ls_mult[min=1.001 max=1.010]
+step= 10450  loss=7912.7833  ce=7.3612  mod_mlp=0.327 mod_std=0.074 lr=3.01e-04  tok/s=28  mem=9.8GB  intent_w=2.1383  mlp_out=748.7 usef=0.502  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0442 branch=36.8971 bridge_conn=0.0264 decorr=0.0643 div=-0.1155 diversity=14.7752 gate_l1=0.3670 gate_repulse=-0.1817 gradalign=20.1803 intent_tau=0.6588 ls_reg=10.2057 nuc=161.1054 pred=2.4872 ranking=7657.1113 reinforce=0.2149 signal_ent=1.4240 w_m2v=0.1580
+  EVAL step=10485: val_loss=9.1963 val_ppl=9860.78
+  Saved best to best.pt
+step= 10505  loss=8283.4876  ce=8.2696  mod_mlp=0.327 mod_std=0.075 lr=3.03e-04  tok/s=28  mem=9.8GB  intent_w=2.1379  mlp_out=751.0 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0414 branch=37.3921 bridge_conn=0.0267 decorr=0.0597 div=-0.1155 diversity=22.7318 gate_l1=0.3716 gate_repulse=-0.1755 gradalign=19.9129 intent_tau=0.6588 ls_reg=10.2022 nuc=160.6842 pred=2.5077 ranking=8019.1289 reinforce=0.2096 signal_ent=1.4240 w_m2v=0.1580
+step= 10560  loss=8484.8909  ce=8.4375  mod_mlp=0.327 mod_std=0.076 lr=3.03e-04  tok/s=28  mem=9.8GB  intent_w=2.1376  mlp_out=745.6 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0404 branch=38.3313 bridge_conn=0.0270 decorr=0.0597 div=-0.1155 diversity=33.4280 gate_l1=0.3739 gate_repulse=-0.1740 gradalign=19.4640 intent_tau=0.6588 ls_reg=10.1988 nuc=162.1544 pred=2.5169 ranking=8207.6992 reinforce=0.2089 signal_ent=1.4240 w_m2v=0.1580
+step= 10615  loss=9264.0515  ce=7.9585  mod_mlp=0.326 mod_std=0.074 lr=3.03e-04  tok/s=28  mem=9.8GB  intent_w=2.1508  mlp_out=762.6 usef=0.501  mat=0.750[0.750,0.750]
+  aux: alpha_novelty=-0.0005 balance=0.0398 branch=32.8230 bridge_conn=0.0238 decorr=0.0615 div=-0.1155 diversity=15.4927 gate_l1=0.3776 gate_repulse=-0.1695 gradalign=18.8877 intent_tau=0.6587 ls_reg=10.1953 nuc=162.6196 pred=2.5748 ranking=9010.8379 reinforce=0.2041 signal_ent=1.4240 w_m2v=0.1580
 ```
