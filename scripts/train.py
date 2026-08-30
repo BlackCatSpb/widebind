@@ -238,7 +238,7 @@ def train(cfg=None, resume_path=None):
             print(f'Auto-resuming from latest: {resume_path}')
     if resume_path and os.path.exists(resume_path):
         print(f'Resuming from {resume_path}')
-        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         sd = dict(ckpt['model'])
         from core.migrate import migrate_state_dict
         sd, n_migrated = migrate_state_dict(sd, model)
