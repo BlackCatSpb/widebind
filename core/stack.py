@@ -8,6 +8,7 @@ from .config import WideBindConfig
 from .block import WideBindBlock, PrecisionGate, ExactSequenceMemory
 from .bridge import SemanticBridge
 from .maturation import MaturationController
+from .layer_bridge_gate import LayerBridgeGate
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
@@ -87,6 +88,13 @@ class WideBindStack(nn.Module):
             depth=getattr(cfg, 'bridge_depth', True),
             cfg=cfg,
         ) if getattr(cfg, 'bridge_conn', 0.0) > 0.0 else None
+        # ─── Layer Bridge Gate (intelligent per-layer gating to bridge) ───
+        # Каждый слой получает per-layer health MLP, gate = sigmoid(health) * tau.
+        # Управляет вкладом каждого слоя в SemanticBridge на основе diagnostics.
+        self.layer_bridge_gate = LayerBridgeGate(
+            cfg.n_layers,
+            health_features=6,
+        ) if getattr(cfg, 'bridge_conn', 0.0) > 0.0 else None
         # ─── Idea 1: Learnable VSA timescales ───
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         # ─── Idea 4: Per-layer τ_l deviation ───
@@ -116,6 +124,8 @@ class WideBindStack(nn.Module):
         self.register_buffer('_expl_ema', torch.zeros(1), persistent=False)
         # Триада: сколько ре-циркуляций сделал Рассудок на последнем проходе (диагностика)
         self._triad_passes = 0
+        # ─── Layer Bridge Gate diagnostics cache ───
+        self._layer_diagnostics = {}  # filled during forward
     
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
                 context_mem=None, allow_write=None, step=None,
@@ -362,7 +372,18 @@ class WideBindStack(nn.Module):
                 # gradient into h destabilised CE; detaching keeps the bridge's
                 # forward signal (stream injection) while removing the diverging
                 # gradient path. The gate still gets its gradient from the main CE.
-                _s_l = self.bridge.probe_layer(h.detach())  # (B, L, bridge_dim)
+                # ─── Layer Bridge Gate: scale probe input by per-layer health ───
+                if self.layer_bridge_gate is not None and i in self._layer_diagnostics:
+                    _h_det = h.detach()
+                    _health = self._layer_diagnostics[i]  # (6,)
+                    _tau_i = mat_gate[i] if mat_gate is not None else torch.ones(1, device=h.device)
+                    # gate = sigmoid(health_mlp(diagnostics)) * tau
+                    _gate_i = self.layer_bridge_gate.health_mlps[i](_health).sigmoid() * _tau_i
+                    _gate_i = torch.clamp(_gate_i, min=0.0, max=2.0)
+                    _h_det = _h_det * _gate_i.view(1, 1, 1)  # scale hidden state
+                    _s_l = self.bridge.probe_layer(_h_det)
+                else:
+                    _s_l = self.bridge.probe_layer(h.detach())
                 self.bridge.record(_s_l)
                 self.bridge.update_stream(i, _s_l)
             if self.cfg.gradient_checkpointing and self.training:
@@ -392,6 +413,40 @@ class WideBindStack(nn.Module):
                 _pe = layer.mirror._cached_pred_error_norm
                 if _pe is not None:
                     pred_errs.append(_pe.detach().mean())
+            # ─── Layer Bridge Gate: collect per-layer diagnostics ───
+            if self.layer_bridge_gate is not None:
+                with torch.no_grad():
+                    mir = layer.mirror
+                    _diag = torch.zeros(6, device=h.device, dtype=h.dtype)
+                    # 0. pred_error_norm (низкая = хорошо)
+                    _pe = getattr(mir, '_cached_pred_error_norm', None)
+                    if _pe is not None:
+                        _diag[0] = _pe.detach().mean().clamp(0.0, 1.0)
+                    # 1. gate_l1 (низкая = стабильно)
+                    _gl = getattr(mir, '_cached_gate_l1', None)
+                    if _gl is not None:
+                        _diag[1] = _gl.detach().clamp(0.0, 1.0)
+                    # 2. mirror_norm (умеренная = хорошо)
+                    _mp = getattr(mir, '_cached_pred_k', None)
+                    if _mp is not None:
+                        _mn = _mp.detach().norm()
+                        _diag[2] = (_mn / 1000.0).clamp(0.0, 1.0)
+                    # 3. bridge_contribution (placeholder — обновится после bridge)
+                    _diag[3] = 0.5
+                    # 4. expert_entropy (умеренная = хорошо)
+                    _hp = getattr(mir, '_cached_hp', None)
+                    if _hp is not None:
+                        _hp_det = _hp.detach()
+                        _hp_norm = torch.sigmoid(_hp_det)
+                        _hp_norm = _hp_norm / _hp_norm.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                        _entropy = -(_hp_norm * _hp_norm.clamp_min(1e-9).log()).sum()
+                        _max_entropy = math.log(_hp_det.shape[-1])
+                        _diag[4] = (_entropy / _max_entropy).clamp(0.0, 1.0)
+                    # 5. diversity (умеренная = хорошо)
+                    _gl2 = getattr(mir, '_cached_gate_l1', None)
+                    if _gl2 is not None:
+                        _diag[5] = (1.0 - _gl2).clamp(0.0, 1.0)
+                    self._layer_diagnostics[i] = _diag
             if s_out is not None:
                 mem_state_out = s_out[0]  # (B, S*D) — multi-scale memory state
                 B = h.shape[0]
@@ -1000,6 +1055,22 @@ class WideBindStack(nn.Module):
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
+        # ─── Layer Bridge Gate: log per-layer gate weights ───
+        if self.layer_bridge_gate is not None and self._layer_diagnostics:
+            with torch.no_grad():
+                _gates = []
+                for l in range(len(self.layers)):
+                    if l in self._layer_diagnostics:
+                        _h = self.layer_bridge_gate.health_mlps[l](self._layer_diagnostics[l])
+                        _gates.append(_h.sigmoid().item())
+                    else:
+                        _gates.append(0.5)
+                _gates_t = torch.tensor(_gates)
+                self._cached_losses['lbg_mean'] = _gates_t.mean().item()
+                self._cached_losses['lbg_std'] = _gates_t.std().item()
+                self._cached_losses['lbg_min'] = _gates_t.min().item()
+                self._cached_losses['lbg_max'] = _gates_t.max().item()
+            self._layer_diagnostics = {}  # reset for next step
         pred_w_loss = 0.0
         n_pred_w = 0
         head = getattr(self, 'lm_head', None)
@@ -1052,6 +1123,22 @@ class WideBindStack(nn.Module):
             aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
             aux_dict['ls_reg'] = log_scale_reg
+        # ─── Layer Bridge Gate: log per-layer gate weights ───
+        if self.layer_bridge_gate is not None and self._layer_diagnostics:
+            with torch.no_grad():
+                _gates = []
+                for l in range(n_layers):
+                    if l in self._layer_diagnostics:
+                        _h = self.layer_bridge_gate.health_mlps[l](self._layer_diagnostics[l])
+                        _gates.append(_h.sigmoid().item())
+                    else:
+                        _gates.append(0.5)
+                _gates_t = torch.tensor(_gates)
+                aux_dict['layer_gate_mean'] = _gates_t.mean().item()
+                aux_dict['layer_gate_std'] = _gates_t.std().item()
+                aux_dict['layer_gate_min'] = _gates_t.min().item()
+                aux_dict['layer_gate_max'] = _gates_t.max().item()
+            self._layer_diagnostics = {}  # reset for next step
         # ─── Semantic Bridge aux loss (per-layer next-token embedding prediction) ───
         # Each layer's probe is self-supervised to predict the next token's
         # embedding (cosine). Dense, well-distributed gradient at every depth;
@@ -1150,7 +1237,7 @@ class WideBindStack(nn.Module):
         cfg = self.cfg
         lr = lr or cfg.lr
         wd = weight_decay or cfg.weight_decay
-        bridge_lr = lr * getattr(cfg, 'bridge_lr_mult', 0.1)
+        bridge_lr = lr  # bridge uses base LR (LayerBridgeGate handles routing)
         
         if getattr(cfg, 'lambda_lr_hierarchy', False):
             from .lambda_utils import lambda_d
@@ -1180,7 +1267,8 @@ class WideBindStack(nn.Module):
             for name, p in self.named_parameters():
                 # Bridge params: bridge.*, bridge_glu_net.*, intent_probe, bus_head_proj
                 is_bridge = ('bridge.' in name or 'bridge_glu_net' in name
-                             or 'intent_probe' in name or 'bus_head_proj' in name)
+                             or 'intent_probe' in name or 'bus_head_proj' in name
+                             or 'layer_bridge_gate.' in name)
                 if is_bridge:
                     k = 'bridge' if p.ndim >= 2 else 'bridge_nd'
                     groups[k]['params'].append(p)
@@ -1233,7 +1321,8 @@ class WideBindStack(nn.Module):
                 continue
             # Bridge params: bridge.*, bridge_glu_net.*, intent_probe, bus_head_proj
             is_bridge = ('bridge.' in name or 'bridge_glu_net' in name
-                         or 'intent_probe' in name or 'bus_head_proj' in name)
+                         or 'intent_probe' in name or 'bus_head_proj' in name
+                         or 'layer_bridge_gate.' in name)
             if is_bridge:
                 if p.ndim < 2:
                     bridge_no_decay.append(p)
