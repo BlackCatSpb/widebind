@@ -25,6 +25,15 @@ staying smooth enough to avoid the original divergence.
 The FROZEN base MLP gate (sigmoid(mod_scale_mlp) ~ 0.667) stays OPEN regardless
 (no deadlock). `readiness` is still tracked (see update) and exposed for
 diagnostics, but it no longer blocks the gate.
+
+INTELLIGENT WARMUP (after resume):
+  When resuming from a checkpoint, the time ramp is frozen for
+  `matur_warmup_steps` (default 2000). During this period, only
+  bridge_readiness gates the maturation. This prevents "unfreezing shock"
+  where deep layers open too fast before the bridge has adapted to the
+  new learning rate. After warmup, the time ramp gradually takes over
+  with a smooth blend: gate = (1-α)*readiness + α*time_ramp, where α
+  ramps from 0 to 1 over warmup_steps.
 """
 
 import math
@@ -56,7 +65,18 @@ class MaturationController(nn.Module):
         self.rs = float(getattr(cfg, "matur_rs", 0.2))
         self.ema = float(getattr(cfg, "matur_ema", 0.999))
         self.warm = int(getattr(cfg, "matur_warm", 300))
+
+        # Intelligent warmup after resume
+        self.warmup_steps = int(getattr(cfg, "matur_warmup_steps", 2000))
+        self.register_buffer("_resume_step", torch.tensor(0, dtype=torch.long))
+        self._is_resumed = False
+
         self._update_tau_norm(torch.zeros(self.n_layers))  # dev = 0 initially
+
+    def set_resume_step(self, step):
+        """Call this when resuming from a checkpoint to activate warmup."""
+        self._resume_step.fill_(int(step))
+        self._is_resumed = True
 
     def _update_tau_norm(self, dev):
         # dev: (n_layers,) per-layer tau deviation (log-scale param _tau_l_dev).
@@ -72,26 +92,58 @@ class MaturationController(nn.Module):
     def step_gate(self, step, tau_dev=None, bridge_readiness=None):
         """Gate for THIS step: max(TIME/τ ramp, bridge-readiness).
 
-        gate_l(t) = sigmoid((t - (T0 + alpha*tau_norm_l*T_delay)) / delta_t)
-        effective = max(gate_l, bridge_readiness)   # ветви открываются, как
-        только bridge стал компетентным (его косинус-лосс упал), а не по
-        слепым часам T0. При init bridge случаен => readiness=0 => gate=time
-        (≈0) => ствол не возмущается => стабильность сохранена. pred_err-
-        готовность (update) не зацикливается, т.к. bridge учится предсказывать
-        ЭТАЛОННЫЙ next-token embedding независимо от LM-лосса ствола.
+        INTELLIGENT WARMUP: After resume, the time ramp is frozen for
+        `warmup_steps`. Only bridge_readiness is used during this period.
+        After warmup, the time ramp gradually blends in:
+          α = (step - resume_step - warmup_steps) / warmup_steps  (clamped to [0,1])
+          gate = max((1-α)*readiness + α*time_ramp, readiness)
+
+        This prevents the "unfreezing shock" where deep layers open too fast
+        before the bridge has adapted to the new learning rate.
         """
         if tau_dev is not None:
             self._update_tau_norm(tau_dev)
         t = float(step)
-        # Top-down ramp: глубокие (глобальные) слои (tau_norm->1) открываются
-        # первыми — модель сначала опирается на грубую глобальную структуру, затем
-        # подключает локальную детализацию мелких слоёв. Инверсия исходного
-        # bottom-up порядка (где открывались сначала мелкие).
-        gate = torch.sigmoid(
+
+        # Compute time ramp (always, for diagnostics)
+        time_ramp = torch.sigmoid(
             (t - (self.T0 + self.alpha * (1.0 - self.tau_norm) * self.T_delay)) / self.delta_t)
-        if bridge_readiness is not None:
-            br = bridge_readiness.to(gate.device).reshape(1)
-            gate = torch.maximum(gate, br.expand_as(gate))
+
+        # Intelligent warmup: blend readiness and time_ramp after resume
+        if self._is_resumed and self.warmup_steps > 0:
+            steps_since_resume = t - self._resume_step.item()
+            if steps_since_resume < 0:
+                # Before resume step (shouldn't happen, but safety)
+                alpha = 0.0
+            elif steps_since_resume < self.warmup_steps:
+                # During warmup: only readiness (time ramp frozen)
+                alpha = 0.0
+            else:
+                # After warmup: gradually blend in time ramp over another warmup_steps
+                blend_steps = steps_since_resume - self.warmup_steps
+                alpha = min(1.0, blend_steps / self.warmup_steps)
+
+            if alpha < 1.0:
+                # Blend: (1-α)*readiness + α*time_ramp, then max with readiness
+                if bridge_readiness is not None:
+                    br = bridge_readiness.to(time_ramp.device).reshape(1)
+                    blended = (1.0 - alpha) * br.expand_as(time_ramp) + alpha * time_ramp
+                    gate = torch.maximum(blended, br.expand_as(time_ramp))
+                else:
+                    gate = (1.0 - alpha) * time_ramp + alpha * time_ramp  # just time_ramp
+            else:
+                # Full time ramp
+                gate = time_ramp
+                if bridge_readiness is not None:
+                    br = bridge_readiness.to(gate.device).reshape(1)
+                    gate = torch.maximum(gate, br.expand_as(gate))
+        else:
+            # No resume or warmup_steps=0: original behavior
+            gate = time_ramp
+            if bridge_readiness is not None:
+                br = bridge_readiness.to(gate.device).reshape(1)
+                gate = torch.maximum(gate, br.expand_as(gate))
+
         self.gate.copy_(gate)
         return gate
 

@@ -1145,10 +1145,12 @@ class WideBindStack(nn.Module):
           p=+1: mirror projections, α    (1.84×)
           p=+2: gates, w_i, b_i, etc     (3.38×)
           vsa:  b_d, b_i                 (λ^{-4} ≈ 0.087×)
+          bridge: bridge_*, intent_*     (bridge_lr_mult ×, default 0.1×)
         """
         cfg = self.cfg
         lr = lr or cfg.lr
         wd = weight_decay or cfg.weight_decay
+        bridge_lr = lr * getattr(cfg, 'bridge_lr_mult', 0.1)
         
         if getattr(cfg, 'lambda_lr_hierarchy', False):
             from .lambda_utils import lambda_d
@@ -1170,11 +1172,19 @@ class WideBindStack(nn.Module):
                 'gate':     {'params': [], 'lr': lr * mlr['gate'],  'weight_decay': 0},
                 'gate_wd':  {'params': [], 'lr': lr * mlr['gate'],  'weight_decay': wd},
                 'vsa':      {'params': [], 'lr': lr * mlr['vsa'],   'weight_decay': 0},
+                'bridge':   {'params': [], 'lr': bridge_lr,          'weight_decay': wd},
+                'bridge_nd':{'params': [], 'lr': bridge_lr,          'weight_decay': 0},
                 'default':  {'params': [], 'lr': lr,                'weight_decay': 0},
                 'default_wd':{'params': [], 'lr': lr,               'weight_decay': wd},
             }
             for name, p in self.named_parameters():
-                if '.b_d' in name or '.b_i' in name or '.scale_w' in name:
+                # Bridge params: bridge.*, bridge_glu_net.*, intent_probe, bus_head_proj
+                is_bridge = ('bridge.' in name or 'bridge_glu_net' in name
+                             or 'intent_probe' in name or 'bus_head_proj' in name)
+                if is_bridge:
+                    k = 'bridge' if p.ndim >= 2 else 'bridge_nd'
+                    groups[k]['params'].append(p)
+                elif '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                     groups['vsa']['params'].append(p)
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
@@ -1215,9 +1225,20 @@ class WideBindStack(nn.Module):
         gate_decay = []
         gate_no_decay = []
         vsa_bias = []
+        bridge_decay = []
+        bridge_no_decay = []
         for name, p in self.named_parameters():
             if '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                 vsa_bias.append(p)
+                continue
+            # Bridge params: bridge.*, bridge_glu_net.*, intent_probe, bus_head_proj
+            is_bridge = ('bridge.' in name or 'bridge_glu_net' in name
+                         or 'intent_probe' in name or 'bus_head_proj' in name)
+            if is_bridge:
+                if p.ndim < 2:
+                    bridge_no_decay.append(p)
+                else:
+                    bridge_decay.append(p)
                 continue
             is_gate = any(g in name for g in ['.w_i', '.w_d', '.w_q', '.w_q_leaf', '.w_q_ctx', '.w_mem2v',
                                                '.w_k_mu', '.w_q_mu', '.w_mu_mem',
@@ -1253,6 +1274,10 @@ class WideBindStack(nn.Module):
         if vsa_bias:
             vsa_lr_mult = getattr(cfg, 'vsa_b_lr_mult', 0.1)
             groups.append({'params': vsa_bias, 'lr': lr * vsa_lr_mult, 'weight_decay': 0})
+        if bridge_decay:
+            groups.append({'params': bridge_decay, 'lr': bridge_lr, 'weight_decay': wd})
+        if bridge_no_decay:
+            groups.append({'params': bridge_no_decay, 'lr': bridge_lr, 'weight_decay': 0})
         return groups
 
 

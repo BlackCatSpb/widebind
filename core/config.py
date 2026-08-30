@@ -112,6 +112,7 @@ class WideBindConfig:
     matur_rs: float = 0.2           # readiness sigmoid slope (lower = sharper transition)
     matur_ema: float = 0.999        # pred-error EMA decay (smoothness)
     matur_warm: int = 300           # warm steps: capture random-regime pred_err_init
+    matur_warmup_steps: int = 2000  # after resume: freeze time ramp for N steps, only bridge_readiness
     matur_write_thr: float = 0.3    # maturity needed before private-memory writes
     # ─── Maturity готовность по компетентности bridge (вместо слепой time-рампы) ───
     # effective maturity = max(time_ramp, bridge_readiness). Ветви (bridge-инъекция,
@@ -287,6 +288,11 @@ class WideBindConfig:
     # back into each layer. If False the bridge still predicts next-token
     # embeddings but does not inject a spatial stream signal.
     bridge_depth: bool = True
+
+    # bridge_lr_mult: LR множитель для bridge параметров (probe, stream, bridge_glu, intent_probe).
+    # Мост общий на все слои — быстрое обучение вызывает catastrophic interference.
+    # 0.1 = bridge учится в 10 раз медленнее основной модели.
+    bridge_lr_mult: float = 0.1
 
     # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
     # Все точки комбинации смыслов используют нормированное сигмоид-среднее

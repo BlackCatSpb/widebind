@@ -283,6 +283,9 @@ def train(cfg=None, resume_path=None):
         print('  Optimizer/scheduler rebuilt FRESH (no momentum restore)')
         start_step = ckpt['step']
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        if getattr(model, 'maturation', None) is not None:
+            model.maturation.set_resume_step(start_step)
+            print(f'  Maturation warmup: freeze time ramp for {cfg.matur_warmup_steps} steps after step {start_step}')
     reasoning_enabled_step = ckpt.get('reasoning_enabled_step', 0) if resume_path and os.path.exists(resume_path) else 0
     
     # State for recurrent layers
