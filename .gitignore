@@ -38,3 +38,7 @@ generation_output.txt
 *_report.html
 eva_monitor*.txt
 gen_*.txt
+
+# Scratch analysis outputs (локальные, не коммитить)
+analyze_*.txt
+scripts/mini_result_*.txt
