@@ -49,11 +49,11 @@ class MaturationController(nn.Module):
         self.register_buffer("_warm_done", torch.zeros(1))
 
         self.alpha = float(getattr(cfg, "matur_alpha", 1.0))
-        self.T0 = float(getattr(cfg, "matur_T0", 20000.0))
-        self.T_delay = float(getattr(cfg, "matur_T_delay", 20000.0))
-        self.delta_t = float(getattr(cfg, "matur_delta", 6000.0))
-        self.r0 = float(getattr(cfg, "matur_r0", 0.6))
-        self.rs = float(getattr(cfg, "matur_rs", 0.3))
+        self.T0 = float(getattr(cfg, "matur_T0", 8000.0))
+        self.T_delay = float(getattr(cfg, "matur_T_delay", 8000.0))
+        self.delta_t = float(getattr(cfg, "matur_delta", 4000.0))
+        self.r0 = float(getattr(cfg, "matur_r0", 0.3))
+        self.rs = float(getattr(cfg, "matur_rs", 0.2))
         self.ema = float(getattr(cfg, "matur_ema", 0.999))
         self.warm = int(getattr(cfg, "matur_warm", 300))
         self._update_tau_norm(torch.zeros(self.n_layers))  # dev = 0 initially

@@ -99,17 +99,17 @@ class WideBindConfig:
     # The frozen base MLP gate (~0.667) stays OPEN regardless (no deadlock).
     maturation_enabled: bool = True
     matur_alpha: float = 1.0        # geometry delay strength
-    matur_T0: float = 20000.0       # gate starts opening at ~T0 steps (smooth ramp-in)
-    matur_T_delay: float = 20000.0  # deepest layer opens at ~T0 + alpha*T_delay steps
-    matur_delta: float = 6000.0     # geometry ramp width (steps)
+    matur_T0: float = 8000.0        # gate starts opening at ~T0 steps (smooth ramp-in)
+    matur_T_delay: float = 8000.0   # deepest layer opens at ~T0 + alpha*T_delay steps
+    matur_delta: float = 4000.0     # geometry ramp width (steps)
     # NOTE: matur_T0 здесь — лишь Safety-Floor ВНУТРИ fused maturity
     # (= max(time_ramp, bridge_readiness)). Снижать его вручную НЕ нужно:
     # bridge_readiness открывает ветви рано, как только in-core bridge
     # научился предсказывать next-token (его косинус-лосс упал), а time_ramp
     # гарантирует открытие даже при «мёртвом» bridge. T0 не блокирует
     # раннее включение — оно управляется компетентностью, а не часами.
-    matur_r0: float = 0.6           # readiness sigmoid center (diagnostics only)
-    matur_rs: float = 0.3           # readiness sigmoid slope (diagnostics only)
+    matur_r0: float = 0.3           # readiness sigmoid center (lower = earlier opening)
+    matur_rs: float = 0.2           # readiness sigmoid slope (lower = sharper transition)
     matur_ema: float = 0.999        # pred-error EMA decay (smoothness)
     matur_warm: int = 300           # warm steps: capture random-regime pred_err_init
     matur_write_thr: float = 0.3    # maturity needed before private-memory writes
@@ -121,9 +121,11 @@ class WideBindConfig:
     # независимо от LM-лосса ствола => готовность НЕ зацикливается (в отличие от
     # pred_err зеркала). У init bridge случаен => readiness=0 => ствол не
     # возмущается => стабильность обучения сохранена.
+    # T0/T_delay снижены (8000/8000) для ускорения открытия рампа после прорыва;
+    # r0/rs снижены (0.3/0.2) для поднятия потолка readiness с ~0.76 до ~0.97.
     matur_bridge_readiness: bool = True
-    matur_bridge_r0: float = 0.5    # центр сигмоиды готовности (доля падения лосса)
-    matur_bridge_rs: float = 0.25   # наклон сигмоиды готовности
+    matur_bridge_r0: float = 0.3    # центр сигмоиды готовности (доля падения лосса)
+    matur_bridge_rs: float = 0.2    # наклон сигмоиды готовности
 
     # ─── Spec 1: Asymmetric expert init ───
     expert_asymmetry: bool = True  # break symmetry: different alpha, log_scale, W_proj per expert

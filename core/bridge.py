@@ -44,8 +44,8 @@ class SemanticBridge(nn.Module):
         # bridge_readiness): ветви открываются, как только bridge стал
         # компетентным, а не по слепым часам, и при этом у init закрыты
         # (bridge случаен => readiness=0 => стабильность сохранена).
-        self._br_r0 = float(getattr(cfg, 'matur_bridge_r0', 0.5))
-        self._br_rs = float(getattr(cfg, 'matur_bridge_rs', 0.25))
+        self._br_r0 = float(getattr(cfg, 'matur_bridge_r0', 0.3))
+        self._br_rs = float(getattr(cfg, 'matur_bridge_rs', 0.2))
         # baseline случайного режима (running max косинус-лосса) и EMA лосса
         self.register_buffer('bridge_loss_init', torch.tensor(1.0), persistent=False)
         self.register_buffer('bridge_loss_ema', torch.tensor(1.0), persistent=False)
