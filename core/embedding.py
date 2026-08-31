@@ -208,8 +208,12 @@ class SigmoidCodedHead(nn.Module):
 
     def _su(self, zt):
         sig = torch.sigmoid(zt)
-        ls = torch.log(sig.clamp_min(1e-9))
-        lms = torch.log((1 - sig).clamp_min(1e-9))
+        tau = torch.exp(self.log_temp).clamp(0.1, 10.0)
+        rel = torch.softmax(zt / tau, dim=-1)
+        gate = sig * (1.0 + rel)
+        gate = gate.clamp(1e-7, 1 - 1e-7)
+        ls = torch.log(gate)
+        lms = torch.log(1 - gate)
         u = ls - lms
         base = lms.sum(-1)
         return u, base
@@ -243,8 +247,12 @@ class SigmoidCodedHead(nn.Module):
             return raw[:, idx, targets] + self.token_bias[targets]
         zt = self._gates(h_in, bus_bias=bus_bias)
         sig = torch.sigmoid(zt)
-        ls = torch.log(sig.clamp_min(1e-9))
-        lms = torch.log((1 - sig).clamp_min(1e-9))
+        tau = torch.exp(self.log_temp).clamp(0.1, 10.0)
+        rel = torch.softmax(zt / tau, dim=-1)
+        gate = sig * (1.0 + rel)
+        gate = gate.clamp(1e-7, 1 - 1e-7)
+        ls = torch.log(gate)
+        lms = torch.log(1 - gate)
         c = self.codes[targets].float()
         if h_2d:
             c = c.unsqueeze(1)
