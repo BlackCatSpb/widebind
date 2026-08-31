@@ -502,10 +502,47 @@ Deep-first monotonic → стабильно. Skip connections в shallow сло�
 | `checkpoints/best 3.pt` | 932 | 10.87 | HTML-отчёт: `best 3_932_report.html` |
 | `checkpoints/best_15844_report.html` | 15844 | 8.7692 | Лучший исторический (предыдущий прогон) |
 
+---
+
+## Перезапуск: per-layer maturation ACTIVE (a735ac0)
+
+### Первые данные (step 1398→1430, Colab T4, fp32)
+
+```
+step= 1398: val=10.8360  mat=0.076[0.026,0.160]  bridge_conn=0.098
+step= 1430: ce=10.59     mat=0.076[0.026,0.160]  bridge_conn=0.098
+```
+
+**Ключевые отличия от старого кода:**
+
+| Метрика | Старый код (step 935) | Новый код (step 1430) |
+|---|---|---|
+| **mat** | 0.779[0.779,0.779] | **0.076[0.026,0.160]** |
+| **bridge_conn** | 0.056 | **0.098** |
+| **intent_w** | 0.482 | **0.585** |
+| **mod_mlp** | 0.286 | **0.370** |
+| **gradalign** | 19.4 | **23.0** |
+
+### Per-layer maturation ПОДТВЕРЖДЕНА
+
+- **L0=0.026** (shallow, tau≈8) — ещё не открылся (ожидается T_eff≈16000)
+- **L23=0.160** (deep, tau≈515) — уже начал открываться (ожидается T_eff≈8000)
+- **Monotonic**: 0.026 < ... < 0.160 ✓
+- **Global readiness**: FALSE (все слои < 0.1)
+
+### Интерпретация
+
+Per-layer maturation работает как задумано:
+1. Deep layers (L23) открываются быстрее → bridge получает доступ к зрелым представлениям
+2. Shallow layers (L0) медленнее → skip connections сохраняют gradient
+3. Bridge conn здоровее (0.098 vs 0.056 на старом коде) — per-layer diversity помогает
+4. intent_w выше (0.585 vs 0.482) — bridge модуляция сильнее
+5. gradalign выше (23.0 vs 19.4) — градиенты лучше выровнены
+
 ### Следующие шаги
 
-1. Продолжить обучение — CE снижается, bridge стабилен. Ждать step ~8000+ для per-layer maturation effects.
-2. Задеплоить per-layer maturation (a735ac0) в следующем запуске — сравнивать uniform vs per-layer.
+1. Продолжить обучение — ждать step ~8000 для global_ready (все слои M_l > 0.1)
+2. Сравнить val trajectory: per-layer vs uniform maturation
 3. Цель: `val ≈ 8.5` (лучший исторический: 8.7692@15844)
 ```
 
