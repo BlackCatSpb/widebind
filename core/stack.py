@@ -284,18 +284,19 @@ class WideBindStack(nn.Module):
         # not known yet). M_l gates live BridgeGLU, memory write, bridge injection
         # and the intent bus. At M_l~0 only the frozen base MLP (~0.667) is active.
         mat_gate = None
+        _global_ready = False
         if self.maturation is not None:
             if step is None:
                 # Inference/eval: reuse the LAST training gate (never force-open, which
                 # would scramble eval vs train — the bug that produced ppl 485M).
                 mat_gate = self.maturation.gate
+                _global_ready = self.maturation.global_ready
             else:
-                # Bridge-readiness: maturity = max(time_ramp, bridge готовность).
-                # Ветви открываются, как только in-core SemanticBridge стал
-                # компетентным (его косинус-лосс упал), а не по слепым часам.
-                br = self.bridge.readiness() if self.bridge is not None else None
-                mat_gate = self.maturation.step_gate(
-                    step, self._tau_l_dev.detach(), bridge_readiness=br)
+                # Pure time-ramp per-layer gate (no scalar readiness override).
+                # Deep layers (large tau) open first, shallow layers later.
+                # Monotonic → mathematically stable (skip connections preserve gradient).
+                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
+                _global_ready = self.maturation.global_ready
         if self.bridge is not None:
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):
@@ -373,14 +374,20 @@ class WideBindStack(nn.Module):
                 # forward signal (stream injection) while removing the diverging
                 # gradient path. The gate still gets its gradient from the main CE.
                 # ─── Layer Bridge Gate: scale probe input by per-layer health ───
+                # Before global_ready: simple maturation gating (no SpectrumGate).
+                # After global_ready: full per-layer SpectrumGate with tau-driven diversity.
                 if self.layer_bridge_gate is not None and i in self._layer_diagnostics:
                     _h_det = h.detach()
-                    _health = self._layer_diagnostics[i]  # (6,)
                     _tau_i = mat_gate[i] if mat_gate is not None else torch.ones(1, device=h.device)
-                    # SpectrumGate with maturation-driven tau
-                    _mat_tau = self.layer_bridge_gate._effective_tau(_tau_i)
-                    _gated = self.layer_bridge_gate.gates[i](_health, tau_external=_mat_tau)
-                    _gate_i = _gated.mean() * _tau_i
+                    if _global_ready:
+                        # Full SpectrumGate: maturation tau drives diversity/precision
+                        _health = self._layer_diagnostics[i]  # (6,)
+                        _mat_tau = self.layer_bridge_gate._effective_tau(_tau_i)
+                        _gated = self.layer_bridge_gate.gates[i](_health, tau_external=_mat_tau)
+                        _gate_i = _gated.mean() * _tau_i
+                    else:
+                        # Simple maturation gating: just scale by maturity
+                        _gate_i = _tau_i
                     _gate_i = torch.clamp(_gate_i, min=0.0, max=2.0)
                     _h_det = _h_det * _gate_i.view(1, 1, 1)
                     _s_l = self.bridge.probe_layer(_h_det)
@@ -1062,13 +1069,20 @@ class WideBindStack(nn.Module):
             with torch.no_grad():
                 _gates = []
                 _taus = []
+                _gr = False
+                if getattr(self, 'maturation', None) is not None:
+                    _gr = self.maturation.global_ready
                 for l in range(len(self.layers)):
                     if l in self._layer_diagnostics:
                         _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
-                        _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
-                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
-                        _gates.append(_gated.mean().item())
-                        _taus.append(_mat_tau.item())
+                        if _gr:
+                            _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
+                            _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
+                            _gates.append(_gated.mean().item())
+                            _taus.append(_mat_tau.item())
+                        else:
+                            _gates.append(_mat.item())
+                            _taus.append(self.layer_bridge_gate.tau_max)
                     else:
                         _gates.append(0.5)
                         _taus.append(1.0)
@@ -1078,6 +1092,7 @@ class WideBindStack(nn.Module):
                 self._cached_losses['lbg_min'] = _gates_t.min().item()
                 self._cached_losses['lbg_max'] = _gates_t.max().item()
                 self._cached_losses['lbg_tau'] = sum(_taus) / len(_taus)
+                self._cached_losses['lbg_global_ready'] = 1.0 if _gr else 0.0
             self._layer_diagnostics = {}  # reset for next step
         pred_w_loss = 0.0
         n_pred_w = 0
@@ -1135,12 +1150,18 @@ class WideBindStack(nn.Module):
         if self.layer_bridge_gate is not None and self._layer_diagnostics:
             with torch.no_grad():
                 _gates = []
+                _gr = False
+                if getattr(self, 'maturation', None) is not None:
+                    _gr = self.maturation.global_ready
                 for l in range(n_layers):
                     if l in self._layer_diagnostics:
                         _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
-                        _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
-                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
-                        _gates.append(_gated.mean().item())
+                        if _gr:
+                            _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
+                            _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
+                            _gates.append(_gated.mean().item())
+                        else:
+                            _gates.append(_mat.item())
                     else:
                         _gates.append(0.5)
                 _gates_t = torch.tensor(_gates)
@@ -1148,6 +1169,7 @@ class WideBindStack(nn.Module):
                 aux_dict['layer_gate_std'] = _gates_t.std().item()
                 aux_dict['layer_gate_min'] = _gates_t.min().item()
                 aux_dict['layer_gate_max'] = _gates_t.max().item()
+                aux_dict['lbg_global_ready'] = 1.0 if _gr else 0.0
             self._layer_diagnostics = {}  # reset for next step
         # ─── Semantic Bridge aux loss (per-layer next-token embedding prediction) ───
         # Each layer's probe is self-supervised to predict the next token's

@@ -3,6 +3,10 @@
 Каждый слой имеет SpectrumGate, который агрегирует diagnostics в gate value.
 Gate = SpectrumGate(diagnostics) * tau_maturation — связь с maturation.
 SpectrumGate = sigmoid(logits) * (1 + softmax(logits/tau)) — оба преимущества.
+
+GLOBAL READINESS: LayerBridgeGate активен только когда maturation.global_ready
+=True (все слои проснулись). До этого — uniform weights (простое per-layer
+maturation gating без сложного SpectrumGate).
 """
 
 from __future__ import annotations
@@ -91,10 +95,10 @@ class LayerBridgeGate(nn.Module):
         """Compute effective tau from maturation.
         
         Args:
-            maturation: (n_layers,) — maturation gate values in [0, 1]
+            maturation: (n_layers,) or scalar — maturation gate values in [0, 1]
             
         Returns:
-            effective_tau: (n_layers,) — tau for each layer
+            effective_tau: same shape — tau for each layer
         """
         return self.tau_max * (1.0 - maturation) + self.tau_min * maturation
     
@@ -103,13 +107,18 @@ class LayerBridgeGate(nn.Module):
         layer_outputs: torch.Tensor,  # (n_layers, B, D)
         diagnostics: torch.Tensor,    # (n_layers, health_features)
         tau_maturation: torch.Tensor, # (n_layers,) — maturation gate values
+        global_ready: bool = False,   # True when ALL layers are mature enough
     ):
         """Compute weighted bridge input from layer outputs.
+        
+        When global_ready=False: return uniform weights (simple maturation gating).
+        When global_ready=True: full SpectrumGate with per-layer tau-driven diversity.
         
         Args:
             layer_outputs: (n_layers, B, D) — per-layer hidden states
             diagnostics: (n_layers, health_features) — per-layer diagnostics
             tau_maturation: (n_layers,) — maturation gate values
+            global_ready: bool — True when all layers are mature enough
             
         Returns:
             bridge_input: (B, D) — weighted sum of layer outputs
@@ -118,6 +127,25 @@ class LayerBridgeGate(nn.Module):
         """
         n_layers = self.n_layers
         
+        # ─── Global readiness gate ───
+        # Before all layers are mature: uniform weights (no SpectrumGate).
+        # This prevents the complex per-layer bridge routing from killing
+        # immature layers. Bridge injection is still scaled by per-layer
+        # maturation (in inject_layer), so immature layers get less injection.
+        if not global_ready:
+            normalized_gates = torch.ones(n_layers, device=layer_outputs.device, dtype=layer_outputs.dtype) / n_layers
+            gate_info = {
+                'lbg_tau': [self.tau_max] * n_layers,
+                'lbg_raw_mean': 1.0 / n_layers,
+                'lbg_tau_min': self.tau_max,
+                'lbg_tau_max': self.tau_max,
+                'lbg_global_ready': False,
+            }
+            weighted = normalized_gates.unsqueeze(-1).unsqueeze(-1) * layer_outputs
+            bridge_input = weighted.sum(dim=0)
+            return bridge_input, normalized_gates.unsqueeze(-1), gate_info
+        
+        # ─── Full SpectrumGate per-layer (global_ready=True) ───
         # 1. Compute effective tau from maturation (self-regulation)
         effective_tau = self._effective_tau(tau_maturation)  # (n_layers,)
         
@@ -168,6 +196,7 @@ class LayerBridgeGate(nn.Module):
             'lbg_raw_mean': raw_gates.mean().item(),
             'lbg_tau_min': min(gate_taus),
             'lbg_tau_max': max(gate_taus),
+            'lbg_global_ready': True,
         }
         
         return bridge_input, normalized_gates.unsqueeze(-1), gate_info

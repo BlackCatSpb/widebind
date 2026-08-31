@@ -25,6 +25,17 @@ staying smooth enough to avoid the original divergence.
 The FROZEN base MLP gate (sigmoid(mod_scale_mlp) ~ 0.667) stays OPEN regardless
 (no deadlock). `readiness` is still tracked (see update) and exposed for
 diagnostics, but it no longer blocks the gate.
+
+PER-LAYER MATURATION: deep layers (large tau) open first, shallow layers (small
+tau) open later. This is MONOTONIC (deep-first) and mathematically stable:
+skip connections in shallow layers preserve gradient flow while deep layers
+learn. Bridge injection per-layer is gated by M_l, so immature layers are
+protected from perturbation.
+
+GLOBAL READINESS: When ALL layers have M_l > bridge_control_threshold, the
+system is "globally ready" for distributed bridge control (LayerBridgeGate
+with SpectrumGate). Before that, bridge uses simple maturation gating only.
+This prevents the complex per-layer bridge routing from killing immature layers.
 """
 
 import math
@@ -56,6 +67,11 @@ class MaturationController(nn.Module):
         self.ema = float(getattr(cfg, "matur_ema", 0.999))
         self.warm = int(getattr(cfg, "matur_warm", 300))
 
+        # Global readiness threshold: when ALL layers' gates exceed this,
+        # the system is ready for distributed bridge control (LayerBridgeGate).
+        self.bridge_control_threshold = float(
+            getattr(cfg, "matur_bridge_control_threshold", 0.1))
+
         self._update_tau_norm(torch.zeros(self.n_layers))  # dev = 0 initially
 
     def _update_tau_norm(self, dev):
@@ -67,21 +83,45 @@ class MaturationController(nn.Module):
             denom = 1.0
         self.tau_norm.copy_(((log_tau - math.log(self.tau_min)) / denom).clamp(0.0, 1.0))
 
-    def step_gate(self, step, tau_dev=None, bridge_readiness=None):
-        """Gate for THIS step: max(time_ramp, bridge_readiness)."""
+    def step_gate(self, step, tau_dev=None):
+        """Pure time-ramp gate for each layer. NO scalar readiness override.
+
+        Deep layers (tau_norm≈1) open first (T_eff = T0).
+        Shallow layers (tau_norm≈0) open later (T_eff = T0 + T_delay).
+
+        Args:
+            step: current training step
+            tau_dev: (n_layers,) deviation from base tau ladder (optional)
+
+        Returns:
+            gate: (n_layers,) per-layer maturation values in [0, 1]
+        """
         if tau_dev is not None:
             self._update_tau_norm(tau_dev)
         t = float(step)
 
+        # Per-layer effective T0: deep layers (tau_norm≈1) → T_eff = T0
+        # shallow layers (tau_norm≈0) → T_eff = T0 + T_delay
         gate = torch.sigmoid(
             (t - (self.T0 + self.alpha * (1.0 - self.tau_norm) * self.T_delay)) / self.delta_t)
 
-        if bridge_readiness is not None:
-            br = bridge_readiness.to(gate.device).reshape(1)
-            gate = torch.maximum(gate, br.expand_as(gate))
-
         self.gate.copy_(gate)
         return gate
+
+    @property
+    def global_ready(self) -> bool:
+        """True when ALL layers have maturation above bridge_control_threshold.
+
+        Before global_ready, LayerBridgeGate is bypassed — bridge uses simple
+        maturation gating only. This prevents the complex per-layer bridge
+        routing from killing immature layers.
+        """
+        return bool((self.gate > self.bridge_control_threshold).all().item())
+
+    @property
+    def global_readiness_ratio(self) -> float:
+        """Fraction of layers that have crossed the bridge_control_threshold."""
+        return float((self.gate > self.bridge_control_threshold).float().mean().item())
 
     def update(self, step, pred_err):
         """Update readiness EMA from this step's per-layer pred_err (detached, (n_layers,))."""
