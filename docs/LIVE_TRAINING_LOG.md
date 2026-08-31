@@ -511,6 +511,10 @@ Deep-first monotonic → стабильно. Skip connections в shallow сло�
 ```
 step= 1398: val=10.8360  mat=0.076[0.026,0.160]  bridge_conn=0.098
 step= 1430: ce=10.59     mat=0.076[0.026,0.160]  bridge_conn=0.098
+step= 1485: ce=10.65     mat=0.077[0.026,0.162]  bridge_conn=0.096
+step= 1540: ce=10.57     mat=0.078[0.026,0.164]  bridge_conn=0.097
+step= 1595: ce=10.56     mat=0.079[0.027,0.166]  bridge_conn=0.097
+step= 1631: val=10.6918  mat≈0.079               bridge_conn≈0.097  ← NEW BEST
 ```
 
 **Ключевые отличия от старого кода:**
