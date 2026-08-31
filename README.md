@@ -1226,7 +1226,41 @@ M_l(t) = max(gate_l(t), bridge_readiness)                       # ветви о�
 Проверено на mini/smoke: `mat_gate≈0` в фазе warm, `mlp_mod` здоров (~0.33 =
 базовый гейт·usefulness, НЕ схлопнут), CE ограничен клиппером.
 
-### 17.2 Triad: Рассудок как участник (замыкание Триады)
+### 17.2 SpectrumGate — гибрид sigmoid × softmax
+
+`LayerBridgeGate` (`core/layer_bridge_gate.py`) управляет вкладом каждого слоя
+в семантический мост. Ключевая идея — **гибрид sigmoid × softmax**, который
+сочетает преимущества обоих:
+
+```
+gate = sigmoid(logits) * (1 + softmax(logits / tau))
+```
+
+- **sigmoid** — независимая активация по каждому признаку (без zero-sum
+  ограничения). Каждый diagnostic decide independently.
+- **softmax** — относительный акцент между признаками (diversity pressure).
+- **tau** — параметр гибрида: `tau → ∞` = softmax доминирует (diversity),
+  `tau → 0` = sigmoid доминирует (precision).
+
+**Self-regulation через maturation:**
+
+```
+effective_tau = tau_max * (1 - maturation) + tau_min * maturation
+```
+
+- **Незрелые слои** (mat≈0) → tau_max=5.0 → softmax доминирует → diversity
+  (все диагностические признаки активны).
+- **Зрелые слои** (mat≈1) → tau_min=0.3 → sigmoid доминирует → precision
+  (топ-диагностики доминируют).
+
+**Global readiness gate:** до `global_ready=True` (все слои M_l > 0.1)
+LayerBridgeGate возвращает **uniform weights** (простое per-layer maturation
+gating). После — полный SpectrumGate с per-layer tau-driven diversity.
+
+Результат (обучение step 0→1631): bridge_conn стабилен 0.097 (vs 0.056 на
+старом коде), val 10.84→10.69, gradalign 19→23.
+
+### 17.3 Triad: Рассудок как участник (замыкание Триады)
 
 Манифест требует, чтобы Рассудок не просто верифицировал готовый ствол, а
 **участвовал** в его формировании. Реализовано в `core/stack.py` как
