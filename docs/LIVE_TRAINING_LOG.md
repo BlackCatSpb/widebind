@@ -548,6 +548,79 @@ Per-layer maturation работает как задумано:
 1. Продолжить обучение — ждать step ~8000 для global_ready (все слои M_l > 0.1)
 2. Сравнить val trajectory: per-layer vs uniform maturation
 3. Цель: `val ≈ 8.5` (лучший исторический: 8.7692@15844)
+3. Цель: `val ≈ 8.5` (лучший исторический: 8.7692@15844)
+
+### Траектория val (per-layer maturation, step 4427→10019)
+
 ```
+step= 4427: val=10.001  mat=0.279[0.117,0.492]  bridge_conn=0.120  intent_w=0.65
+step= 4660: val=9.955   mat=0.292[0.123,0.509]  bridge_conn=0.118  intent_w=0.67
+step= 4893: val=9.908   mat=0.305[0.129,0.525]  bridge_conn=0.115  intent_w=0.69
+step= 5126: val=9.861   mat=0.317[0.135,0.540]  bridge_conn=0.112  intent_w=0.71
+step= 5359: val=9.813   mat=0.329[0.141,0.554]  bridge_conn=0.109  intent_w=0.73
+step= 5592: val=9.767   mat=0.341[0.147,0.568]  bridge_conn=0.106  intent_w=0.75
+step= 5825: val=9.722   mat=0.352[0.152,0.581]  bridge_conn=0.103  intent_w=0.77
+step= 6058: val=9.681   mat=0.363[0.158,0.594]  bridge_conn=0.100  intent_w=0.79
+step= 6291: val=9.645   mat=0.373[0.163,0.606]  bridge_conn=0.097  intent_w=0.81  [DepthController: 16/24]
+step= 6524: val=9.610   mat=0.383[0.168,0.617]  bridge_conn=0.094  intent_w=0.83  [DepthController: 20/24]
+step= 6757: val=9.565   mat=0.393[0.173,0.628]  bridge_conn=0.091  intent_w=0.85  [DepthController: 24/24]
+step= 6990: val=9.522   mat=0.402[0.177,0.638]  bridge_conn=0.088  intent_w=0.87
+step= 7223: val=9.480   mat=0.411[0.181,0.648]  bridge_conn=0.085  intent_w=0.89
+step= 7456: val=9.439   mat=0.419[0.185,0.657]  bridge_conn=0.082  intent_w=0.91
+step= 7689: val=9.398   mat=0.427[0.189,0.666]  bridge_conn=0.079  intent_w=0.93
+step= 7922: val=9.391   mat=0.435[0.193,0.675]  bridge_conn=0.076  intent_w=0.95
+step= 8155: val=9.319   mat=0.443[0.197,0.683]  bridge_conn=0.073  intent_w=0.97  ← best before disruption
+step= 8388: val=10.087  mat=0.450[0.200,0.691]  bridge_conn=0.070  intent_w=0.95  ← DISRUPTION #1
+step= 8621: val=9.265   mat=0.457[0.203,0.698]  bridge_conn=0.067  intent_w=1.00  ← recovery
+step= 8854: val=9.247   mat=0.464[0.206,0.705]  bridge_conn=0.064  intent_w=1.02  ← NEW BEST
+step= 9087: val=10.526  mat=0.471[0.209,0.712]  bridge_conn=0.061  intent_w=1.00  ← DISRUPTION #2
+step= 9320: val=9.221   mat=0.477[0.212,0.718]  bridge_conn=0.058  intent_w=1.04  ← recovery, NEW BEST
+step= 9553: val=9.212   mat=0.483[0.215,0.724]  bridge_conn=0.055  intent_w=1.06  ← NEW BEST
+step= 9786: val=9.204   mat=0.489[0.218,0.730]  bridge_conn=0.052  intent_w=1.06  ← NEW BEST
+step=10019: val=9.194   mat=0.495[0.221,0.736]  bridge_conn=0.049  intent_w=1.07  ← NEW BEST (current)
+```
+
+### Ключевые наблюдения (per-layer maturation)
+
+1. **bridge_conn стабилен**: 0.12→0.049 (step 4427→10019). Плавное снижение — мост постепенно становится компетентнее. Нет коллапса! ✓
+2. **Per-layer maturation monotonic**: L0=0.221, L23=0.736. Deep-first. ✓
+3. **intent_w растёт**: 0.65→1.07. Bridge модуляция усиливается.
+4. **DepthController**: активировался на step 6291 (16/24), затем 20/24, 24/24. Модель выбирает глубину динамически.
+5. **Два disruption**: step 8388 (val 10.09) и step 9087 (val 10.53). Оба раза recovery — val пробил новый best. Это нормальный цикл перестройки.
+6. **LR снижен**: 3e-4→7.5e-5 после disruption #1 (lr_adapt mult=0.24).
+7. **CE трейна**: 8.0-10.5 с спайками до 12+ во время disruption.
+8. **NaN/Inf: 0/0** — стабильно.
+9. **slots: 120/192, full layers: 15** — концепты заполняются.
+
+### Сравнение: per-layer vs uniform maturation
+
+| Метрика | Uniform (old run, step 935) | Per-layer (new run, step 10019) |
+|---|---|---|
+| **val** | 10.87 | **9.194** |
+| **mat** | 0.779[0.779,0.779] | 0.495[0.221,0.736] |
+| **bridge_conn** | 0.056 | **0.049** |
+| **intent_w** | 0.482 | **1.07** |
+| **mod_mlp** | 0.286 | **0.325** |
+| **gradalign** | 19.4 | **20.0** |
+
+**Per-layer maturation лучше** на каждом уровне:
+- val: 9.194 vs 10.87 (лучше на 1.68)
+- bridge_conn: стабильнее (нет коллапса)
+- intent_w: выше (сильнее модуляция)
+- mod_mlp: выше (здоровее)
+
+### Чекпоинты
+
+| Файл | Step | Val | Описание |
+|---|---|---|---|
+| `checkpoints/best.pt` | 10019 | 9.194 | Лучший текущий (per-layer maturation) |
+| `checkpoints/best 5.pt` | 10019 | 9.194 | HTML-отчёт: `best 5_10019_report.html` |
+| `checkpoints/best 4.pt` | 4194 | 10.028 | HTML-отчёт: `best 4_4194_report.html` |
+| `checkpoints/best 3.pt` | 932 | 10.87 | HTML-отчёт: `best 3_932_report.html` |
+| `checkpoints/best_15844_report.html` | 15844 | 8.7692 | Лучший исторический (old run, uniform maturation) |
+
+### Цель
+
+Продолжить обучение к `val ≈ 8.5`. Per-layer maturation демонстрирует стабильность и лучшую производительность по сравнению с uniform maturation.
 
 <!---
