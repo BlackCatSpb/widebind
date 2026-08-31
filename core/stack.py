@@ -377,8 +377,9 @@ class WideBindStack(nn.Module):
                     _h_det = h.detach()
                     _health = self._layer_diagnostics[i]  # (6,)
                     _tau_i = mat_gate[i] if mat_gate is not None else torch.ones(1, device=h.device)
-                    # gate = sigmoid(health_mlp(diagnostics)) * tau
-                    _gate_i = self.layer_bridge_gate.health_mlps[i](_health).sigmoid() * _tau_i
+                    # SpectrumGate: sigmoid(independent) * (1 + softmax(relative))
+                    _gated = self.layer_bridge_gate.gates[i](_health)  # (6,)
+                    _gate_i = _gated.mean() * _tau_i  # scalar * maturation
                     _gate_i = torch.clamp(_gate_i, min=0.0, max=2.0)
                     _h_det = _h_det * _gate_i.view(1, 1, 1)  # scale hidden state
                     _s_l = self.bridge.probe_layer(_h_det)
@@ -1055,21 +1056,25 @@ class WideBindStack(nn.Module):
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
-        # ─── Layer Bridge Gate: log per-layer gate weights ───
+        # ─── Layer Bridge Gate: log per-layer gate weights (SpectrumGate) ───
         if self.layer_bridge_gate is not None and self._layer_diagnostics:
             with torch.no_grad():
                 _gates = []
+                _taus = []
                 for l in range(len(self.layers)):
                     if l in self._layer_diagnostics:
-                        _h = self.layer_bridge_gate.health_mlps[l](self._layer_diagnostics[l])
-                        _gates.append(_h.sigmoid().item())
+                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l])
+                        _gates.append(_gated.mean().item())
+                        _taus.append(self.layer_bridge_gate.gates[l].tau.item())
                     else:
                         _gates.append(0.5)
+                        _taus.append(1.0)
                 _gates_t = torch.tensor(_gates)
                 self._cached_losses['lbg_mean'] = _gates_t.mean().item()
                 self._cached_losses['lbg_std'] = _gates_t.std().item()
                 self._cached_losses['lbg_min'] = _gates_t.min().item()
                 self._cached_losses['lbg_max'] = _gates_t.max().item()
+                self._cached_losses['lbg_tau'] = sum(_taus) / len(_taus)
             self._layer_diagnostics = {}  # reset for next step
         pred_w_loss = 0.0
         n_pred_w = 0
@@ -1123,14 +1128,14 @@ class WideBindStack(nn.Module):
             aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
             aux_dict['ls_reg'] = log_scale_reg
-        # ─── Layer Bridge Gate: log per-layer gate weights ───
+        # ─── Layer Bridge Gate: log per-layer gate weights (SpectrumGate) ───
         if self.layer_bridge_gate is not None and self._layer_diagnostics:
             with torch.no_grad():
                 _gates = []
                 for l in range(n_layers):
                     if l in self._layer_diagnostics:
-                        _h = self.layer_bridge_gate.health_mlps[l](self._layer_diagnostics[l])
-                        _gates.append(_h.sigmoid().item())
+                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l])
+                        _gates.append(_gated.mean().item())
                     else:
                         _gates.append(0.5)
                 _gates_t = torch.tensor(_gates)

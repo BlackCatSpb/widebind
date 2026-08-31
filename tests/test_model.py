@@ -639,10 +639,10 @@ def test_layer_bridge_gate_shape():
     layer_outputs = torch.randn(n_layers, 2, D)
     diagnostics = torch.randn(n_layers, 6)
     tau = torch.tensor([0.5, 0.8])
-    bridge_input, gate_weights, health_scores = gate(layer_outputs, diagnostics, tau)
+    bridge_input, gate_weights, gate_info = gate(layer_outputs, diagnostics, tau)
     assert bridge_input.shape == (2, D)
     assert gate_weights.shape[0] == n_layers
-    assert health_scores.dim() >= 1
+    assert isinstance(gate_info, dict)
 
 
 def test_layer_bridge_gate_nan_control():
