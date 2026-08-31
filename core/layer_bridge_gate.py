@@ -21,6 +21,10 @@ class SpectrumGate(nn.Module):
     - sigmoid: independent activation per feature (no zero-sum)
     - softmax: relative emphasis among features
     - tau controls the blend (high=diversity, low=precision)
+    
+    tau can be:
+    - Learnable (log_tau parameter) — model learns the blend
+    - External (from maturation) — self-regulation through system tau
     """
     
     def __init__(self, n_features: int, tau_init: float = 1.0):
@@ -28,8 +32,16 @@ class SpectrumGate(nn.Module):
         self.n_features = n_features
         self.log_tau = nn.Parameter(torch.tensor(math.log(tau_init)))
     
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        tau = torch.exp(self.log_tau).clamp(0.1, 10.0)
+    def forward(self, logits: torch.Tensor, tau_external: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            logits: (*, n_features) — raw feature scores
+            tau_external: (*) — external tau (e.g., from maturation). If provided, overrides learnable tau.
+        """
+        if tau_external is not None:
+            tau = tau_external.clamp(0.1, 10.0).unsqueeze(-1)  # (*, 1)
+        else:
+            tau = torch.exp(self.log_tau).clamp(0.1, 10.0)
         independent = torch.sigmoid(logits)
         relative = F.softmax(logits / tau, dim=-1)
         return independent * (1.0 + relative)
@@ -42,10 +54,11 @@ class SpectrumGate(nn.Module):
 class LayerBridgeGate(nn.Module):
     """Per-layer intelligent gate to SemanticBridge with SpectrumGate.
     
-    Каждый слой:
-    - Per-layer SpectrumGate (6 diagnostics → 6 gated values → scalar gate)
-    - Gate tau TIED to maturation: immature=diversity, mature=precision
-    - NaN/explosion protection
+    Self-regulation through tau:
+    - Immature layers (mat≈0) → tau→∞ → diversity (all diagnostics active)
+    - Mature layers (mat≈1) → tau→0 → precision (top diagnostics dominate)
+    
+    Formula: effective_tau = tau_max * (1 - maturation) + tau_min * maturation
     
     Diagnostic features (per layer):
     0. pred_error_norm: предсказание зеркала (низкая = хорошо)
@@ -56,10 +69,13 @@ class LayerBridgeGate(nn.Module):
     5. diversity: разнообразие представлений (умеренная = хорошо)
     """
     
-    def __init__(self, n_layers: int, health_features: int = 6):
+    def __init__(self, n_layers: int, health_features: int = 6,
+                 tau_min: float = 0.3, tau_max: float = 5.0):
         super().__init__()
         self.n_layers = n_layers
         self.health_features = health_features
+        self.tau_min = tau_min
+        self.tau_max = tau_max
         
         # Per-layer SpectrumGate: each layer decides its own sigmoid/softmax blend
         self.gates = nn.ModuleList([
@@ -70,6 +86,17 @@ class LayerBridgeGate(nn.Module):
         # NaN/explosion control
         self._nan_count = 0
         self._max_nan = 10
+    
+    def _effective_tau(self, maturation: torch.Tensor) -> torch.Tensor:
+        """Compute effective tau from maturation.
+        
+        Args:
+            maturation: (n_layers,) — maturation gate values in [0, 1]
+            
+        Returns:
+            effective_tau: (n_layers,) — tau for each layer
+        """
+        return self.tau_max * (1.0 - maturation) + self.tau_min * maturation
     
     def forward(
         self,
@@ -91,39 +118,39 @@ class LayerBridgeGate(nn.Module):
         """
         n_layers = self.n_layers
         
-        # 1. Per-layer SpectrumGate: each layer processes its own diagnostics
+        # 1. Compute effective tau from maturation (self-regulation)
+        effective_tau = self._effective_tau(tau_maturation)  # (n_layers,)
+        
+        # 2. Per-layer SpectrumGate with maturation-driven tau
         raw_gates = []
         gate_taus = []
         for l in range(n_layers):
-            # SpectrumGate: (health_features,) → (health_features,)
-            gated_features = self.gates[l](diagnostics[l])
+            # SpectrumGate: maturation tau overrides learnable tau
+            gated_features = self.gates[l](diagnostics[l], tau_external=effective_tau[l])
             # Reduce to scalar: mean of gated features
             scalar_gate = gated_features.mean()
             raw_gates.append(scalar_gate)
-            gate_taus.append(self.gates[l].tau.item())
+            gate_taus.append(effective_tau[l].item())
         
         raw_gates = torch.stack(raw_gates)  # (n_layers,)
         
-        # 2. TIE TO MATURATION: gate = raw_gate * maturation
-        #    Immature layers (mat≈0) → gate≈0 (conservative)
-        #    Mature layers (mat≈1) → gate=raw_gate (full participation)
+        # 3. Gate = raw_gate * maturation (conservative for immature layers)
         gates = raw_gates * tau_maturation  # (n_layers,)
         
-        # 3. NaN/explosion control
+        # 4. NaN/explosion control
         gates = torch.where(torch.isnan(gates), torch.zeros_like(gates), gates)
         gates = torch.clamp(gates, min=0.0, max=2.0)
         
-        # 4. Weighted average normalization
+        # 5. Weighted average normalization
         gate_sum = gates.sum()
         gate_sum = torch.clamp(gate_sum, min=1e-6)
         normalized_gates = gates / gate_sum  # (n_layers,)
         
-        # 5. Fallback: if all gates are zero, use equal weights
+        # 6. Fallback: if all gates are zero, use equal weights
         if gate_sum < 1e-6:
             normalized_gates = torch.ones_like(gates) / n_layers
             self._nan_count += 1
             if self._nan_count > self._max_nan:
-                # Reset SpectrumGate tau if too many NaNs
                 with torch.no_grad():
                     for g in self.gates:
                         g.log_tau.fill_(0.0)  # tau=1.0
@@ -131,17 +158,16 @@ class LayerBridgeGate(nn.Module):
         else:
             self._nan_count = 0
         
-        # 6. Weighted sum of layer outputs
+        # 7. Weighted sum of layer outputs
         weighted = normalized_gates.unsqueeze(-1).unsqueeze(-1) * layer_outputs
         bridge_input = weighted.sum(dim=0)  # (B, D)
         
-        # 7. Diagnostic info for logging
+        # 8. Diagnostic info for logging
         gate_info = {
             'lbg_tau': gate_taus,
             'lbg_raw_mean': raw_gates.mean().item(),
-            'lbg_mat_corr': torch.corrcoef(
-                torch.stack([raw_gates.detach(), tau_maturation.detach()])
-            )[0, 1].item() if n_layers > 1 else 0.0,
+            'lbg_tau_min': min(gate_taus),
+            'lbg_tau_max': max(gate_taus),
         }
         
         return bridge_input, normalized_gates.unsqueeze(-1), gate_info

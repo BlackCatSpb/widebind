@@ -377,11 +377,12 @@ class WideBindStack(nn.Module):
                     _h_det = h.detach()
                     _health = self._layer_diagnostics[i]  # (6,)
                     _tau_i = mat_gate[i] if mat_gate is not None else torch.ones(1, device=h.device)
-                    # SpectrumGate: sigmoid(independent) * (1 + softmax(relative))
-                    _gated = self.layer_bridge_gate.gates[i](_health)  # (6,)
-                    _gate_i = _gated.mean() * _tau_i  # scalar * maturation
+                    # SpectrumGate with maturation-driven tau
+                    _mat_tau = self.layer_bridge_gate._effective_tau(_tau_i)
+                    _gated = self.layer_bridge_gate.gates[i](_health, tau_external=_mat_tau)
+                    _gate_i = _gated.mean() * _tau_i
                     _gate_i = torch.clamp(_gate_i, min=0.0, max=2.0)
-                    _h_det = _h_det * _gate_i.view(1, 1, 1)  # scale hidden state
+                    _h_det = _h_det * _gate_i.view(1, 1, 1)
                     _s_l = self.bridge.probe_layer(_h_det)
                 else:
                     _s_l = self.bridge.probe_layer(h.detach())
@@ -1063,9 +1064,11 @@ class WideBindStack(nn.Module):
                 _taus = []
                 for l in range(len(self.layers)):
                     if l in self._layer_diagnostics:
-                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l])
+                        _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
+                        _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
+                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
                         _gates.append(_gated.mean().item())
-                        _taus.append(self.layer_bridge_gate.gates[l].tau.item())
+                        _taus.append(_mat_tau.item())
                     else:
                         _gates.append(0.5)
                         _taus.append(1.0)
@@ -1134,7 +1137,9 @@ class WideBindStack(nn.Module):
                 _gates = []
                 for l in range(n_layers):
                     if l in self._layer_diagnostics:
-                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l])
+                        _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
+                        _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
+                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
                         _gates.append(_gated.mean().item())
                     else:
                         _gates.append(0.5)
