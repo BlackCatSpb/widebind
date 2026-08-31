@@ -437,3 +437,74 @@ step= 10615  loss=9264.0515  ce=7.9585  mod_mlp=0.326 mod_std=0.074 lr=3.03e-04 
   EVAL step=19572: val_loss=9.0439 val_ppl=8448.11
   [лог обрезан на step ~19635]
 ```
+
+---
+
+## Новый запуск: per-layer maturation + SpectrumGate (Colab T4, fp32)
+
+### Ключевые изменения (коммит `a735ac0`)
+
+- **Per-layer maturation gate**: deep layers (tau≈515) opening first (T_eff=8000), shallow layers (tau≈8) later (T_eff=16000). Monotonic → mathematically stable.
+- **Bridge readiness override REMOVED**: gate = pure time-ramp, no scalar readiness override.
+- **Global readiness**: `global_ready=True` when ALL layers M_l > 0.1 (step ~8000). Before that, LayerBridgeGate uses simple maturation gating only. After: full SpectrumGate with per-layer tau-driven diversity.
+- **SpectrumGate formula**: `gate = sigmoid(logits) * (1 + softmax(logits/tau))` — hybrid sigmoid-softmax with maturation-driven tau.
+
+### Конфигурация
+
+| Параметр | Значение |
+|---|---|
+| D / слои / G / bind_K | 2560 / 24 / 32 / 32 |
+| vocab / seq_len | 65536 / 256 |
+| lr / weight_decay | 0.0003 / 0.01 |
+| bridge_conn | 0.1 |
+| maturation_enabled | True |
+| matur_T0 / T_delay / delta | 8000 / 8000 / 4000 |
+
+### Траектория val (свежий прогон)
+
+```
+step=  233: val=14.4362  (mat=0.751, bridge_conn=0.0013)
+step=  466: val=10.9985  (mat=0.787, bridge_conn=0.0072) ← Saved best
+step=  699: val=10.9348  (mat=0.786, bridge_conn=0.0184) ← Saved best
+step=  932: val=10.8721  (mat=0.779, bridge_conn=0.0557) ← Saved best (текущий)
+```
+
+### Ключевые наблюдения
+
+- **bridge_conn живой**: fluctuates 0.001-0.059, не коллапсирует. На step 932: 0.056 (healthy).
+- **CE стабилен ~10.84-10.91** (после step 385). Спайк 26.7@330 → восстановился.
+- **Per-layer maturation**: mat=0.779[0.779,0.779] — всё ещё uniform на step 932 (старый код без per-layer tau ramp). Новый код (a735ac0) даст per-layer: L0=0.119, L23=0.500 на step 8000.
+- **mod_scale_mlp=0.626** (L0) — ниже baseline 0.668, MLP modulation началась.
+- **pm_norm: L5=0.906, L7=0.798** — private memory растёт.
+- **slots: 115/192** — concept slots заполняются (13 full layers).
+- **intent_w=0.482** — вырос с 0.05@step0.
+- **NaN/Inf: 0/0** — стабильно.
+
+### Per-layer maturation (новый код, a735ac0)
+
+```
+step=    0: L0=0.018 L12=0.049 L23=0.119  global_ready=False
+step= 4000: L0=0.047 L12=0.124 L23=0.269  global_ready=False
+step= 8000: L0=0.119 L12=0.278 L23=0.500  global_ready=True ← все > 0.1
+step=16000: L0=0.500 L12=0.740 L23=0.881  global_ready=True
+step=20000: L0=0.731 L12=0.885 L23=0.953  global_ready=True
+```
+
+Deep-first monotonic → стабильно. Skip connections в shallow слоях сохраняют gradient.
+
+### Чекпоинты
+
+| Файл | Step | Val | Описание |
+|---|---|---|---|
+| `checkpoints/best.pt` | 932 | 10.87 | Лучший текущий (старый код) |
+| `checkpoints/best 3.pt` | 932 | 10.87 | HTML-отчёт: `best 3_932_report.html` |
+| `checkpoints/best_15844_report.html` | 15844 | 8.7692 | Лучший исторический (предыдущий прогон) |
+
+### Следующие шаги
+
+1. Продолжить обучение с per-layer maturation (a735ac0) — ждать step ~8000 для global_ready
+2. Сравнить: per-layer vs uniform maturation на step 1000+
+3. Цель: `val ≈ 8.5` (лучший исторический: 8.7692@15844)
+```
+
+<!---
