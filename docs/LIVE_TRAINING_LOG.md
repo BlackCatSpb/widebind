@@ -466,18 +466,20 @@ step= 10615  loss=9264.0515  ce=7.9585  mod_mlp=0.326 mod_std=0.074 lr=3.03e-04 
 step=  233: val=14.4362  (mat=0.751, bridge_conn=0.0013)
 step=  466: val=10.9985  (mat=0.787, bridge_conn=0.0072) ← Saved best
 step=  699: val=10.9348  (mat=0.786, bridge_conn=0.0184) ← Saved best
-step=  932: val=10.8721  (mat=0.779, bridge_conn=0.0557) ← Saved best (текущий)
+step=  932: val=10.8721  (mat=0.779, bridge_conn=0.0557) ← Saved best
+step= 1165: val=10.9630  (mat=0.779, bridge_conn=0.0588) — minor regression
+step= 1398: val=10.7472  (mat=0.778, bridge_conn=0.0636) ← NEW BEST
 ```
 
 ### Ключевые наблюдения
 
-- **bridge_conn живой**: fluctuates 0.001-0.059, не коллапсирует. На step 932: 0.056 (healthy).
-- **CE стабилен ~10.84-10.91** (после step 385). Спайк 26.7@330 → восстановился.
-- **Per-layer maturation**: mat=0.779[0.779,0.779] — всё ещё uniform на step 932 (старый код без per-layer tau ramp). Новый код (a735ac0) даст per-layer: L0=0.119, L23=0.500 на step 8000.
-- **mod_scale_mlp=0.626** (L0) — ниже baseline 0.668, MLP modulation началась.
+- **bridge_conn стабилен**: 0.055→0.064 (step 932→1398). Не коллапсирует, healthy dynamic range.
+- **CE снижается**: 10.84→10.69 (step 932→1375). Модель учится.
+- **intent_w растёт**: 0.482→0.518 (step 935→1320). Bridge модуляция усиливается.
+- **mod_scale_mlp=0.626→0.622** (L0) — MLP modulation стабильна.
 - **pm_norm: L5=0.906, L7=0.798** — private memory растёт.
 - **slots: 115/192** — concept slots заполняются (13 full layers).
-- **intent_w=0.482** — вырос с 0.05@step0.
+- **Per-layer maturation**: mat=0.779[0.779,0.779] — uniform (старый код). Per-layer ramp (a735ac0) ещё не задеплоен.
 - **NaN/Inf: 0/0** — стабильно.
 
 ### Per-layer maturation (новый код, a735ac0)
@@ -496,14 +498,14 @@ Deep-first monotonic → стабильно. Skip connections в shallow сло�
 
 | Файл | Step | Val | Описание |
 |---|---|---|---|
-| `checkpoints/best.pt` | 932 | 10.87 | Лучший текущий (старый код) |
+| `checkpoints/best.pt` | 1398 | 10.75 | Лучший текущий (старый код) |
 | `checkpoints/best 3.pt` | 932 | 10.87 | HTML-отчёт: `best 3_932_report.html` |
 | `checkpoints/best_15844_report.html` | 15844 | 8.7692 | Лучший исторический (предыдущий прогон) |
 
 ### Следующие шаги
 
-1. Продолжить обучение с per-layer maturation (a735ac0) — ждать step ~8000 для global_ready
-2. Сравнить: per-layer vs uniform maturation на step 1000+
+1. Продолжить обучение — CE снижается, bridge стабилен. Ждать step ~8000+ для per-layer maturation effects.
+2. Задеплоить per-layer maturation (a735ac0) в следующем запуске — сравнивать uniform vs per-layer.
 3. Цель: `val ≈ 8.5` (лучший исторический: 8.7692@15844)
 ```
 
