@@ -106,7 +106,7 @@ class WideBindStack(nn.Module):
         self._tau_intent_dev = nn.Parameter(torch.zeros(cfg.n_layers))
         # ─── Streaming Memory Bank (hierarchical L1+L2) ───
         # After embedding, before first layer. Read at every token position.
-        # Write at sentence boundaries. NOT gated by maturation — always active.
+        # Write at sentence boundaries. Writes gated by maturation (like private_mem).
         self.memory_bank = StreamingMemoryBank(
             D=cfg.D,
             bridge_dim=getattr(cfg, 'mem_bridge_dim', getattr(cfg, 'bridge_dim', 256)),
@@ -114,6 +114,7 @@ class WideBindStack(nn.Module):
             l2_slots=getattr(cfg, 'mem_l2_slots', 16),
             l3_concepts=getattr(cfg, 'mem_l3_concepts', 8),
             l3_birth_threshold=getattr(cfg, 'mem_l3_birth_threshold', 0.7),
+            min_write_maturation=getattr(cfg, 'mem_min_write_mat', 0.3),
             cfg=cfg,
         ) if getattr(cfg, 'memory_bank', False) else None
         # c_ema: global state EMA rate = write_rate * tau_mid
@@ -240,11 +241,6 @@ class WideBindStack(nn.Module):
         # that require gradients (global_state is updated per layer below).
         global_state = global_state.clone()
 
-        # ─── Streaming Memory Bank: read from L1+L2 at each position ───
-        # Sits AFTER embedding, BEFORE first layer. NOT gated by maturation.
-        if self.memory_bank is not None and tokens is not None:
-            h = self.memory_bank(h, tokens, step=step)
-
         # ─── Intent Bridge: depth-flowing per-head intent stream ───
         # Per-layer list of (1,1,G,k_i): one k-dim intent per expert, flows
         # through layers within a step (depth) and recurs across steps (time).
@@ -316,6 +312,13 @@ class WideBindStack(nn.Module):
                 # destroy the per-layer gradient by setting all layers equal.
                 mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
                 _global_ready = self.maturation.global_ready
+
+        # ─── Streaming Memory Bank: read from L1+L2+L3 at each position ───
+        # Sits AFTER embedding, BEFORE first layer. Writes gated by maturation.
+        if self.memory_bank is not None and tokens is not None:
+            _mb_mat = mat_gate.mean().item() if mat_gate is not None else None
+            h = self.memory_bank(h, tokens, step=step, mat_gate=_mb_mat)
+
         if self.bridge is not None:
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):

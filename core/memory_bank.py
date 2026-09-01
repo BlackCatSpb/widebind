@@ -323,20 +323,23 @@ class StreamingMemoryBank(nn.Module):
     """Combined L1 + L2 + L3 memory bank for EVA.
 
     Integration points:
-    - forward(h, tokens, step): read from L1+L2+L3 at each position
+    - forward(h, tokens, step, mat_gate): read from L1+L2+L3 at each position
     - write_boundary(embedding): called at sentence boundaries
     - reset(): clear all memory (for new sequence)
 
-    NOT gated by maturation — always active.
+    Writes are gated by maturation (like private_mem).
+    Reads are always active.
     """
     def __init__(self, D: int, bridge_dim: int,
                  l1_slots: int = 3, l2_slots: int = 16,
                  l3_concepts: int = 8, l3_birth_threshold: float = 0.7,
+                 min_write_maturation: float = 0.3,
                  cfg=None):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.cfg = cfg
+        self._min_write_maturation = min_write_maturation
 
         # L1: rolling buffer (immediate, ~last 3 sentences)
         self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots)
@@ -366,16 +369,20 @@ class StreamingMemoryBank(nn.Module):
         self._sent_start = 0
 
     def forward(self, h: torch.Tensor, tokens: torch.Tensor,
-                step: int = None) -> torch.Tensor:
+                step: int = None, mat_gate: float = None) -> torch.Tensor:
         """Read from memory at each position.
 
         h: (B, L, D) — current hidden state (after embedding)
         tokens: (B, L) — token ids (for boundary detection)
         step: current training step (for logging)
+        mat_gate: float — maturation gate value (0-1), gates writes
         returns: (B, L, D) — memory-augmented hidden state
         """
         B, L, D = h.shape
         is_sep = (tokens == 2)  # SEP token = sentence boundary
+
+        # Determine if writes are allowed
+        _can_write = (mat_gate is None) or (mat_gate >= self._min_write_maturation)
 
         # Detect boundaries and write to all levels
         with torch.no_grad():
@@ -385,15 +392,17 @@ class StreamingMemoryBank(nn.Module):
                     if is_sep[b, t]:
                         summary = h[b, sent_start:t+1].mean(0)  # (D,)
 
-                        # Write to L1 (always)
-                        self.l1.write(summary)
+                        # Write to L1 (always when allowed)
+                        if _can_write:
+                            self.l1.write(summary)
 
-                        # Write to L2 (novelty-gated)
-                        wrote_l2 = self.l2.write(summary)
+                        # Write to L2 (novelty-gated, only when allowed)
+                        wrote_l2 = False
+                        if _can_write:
+                            wrote_l2 = self.l2.write(summary)
 
-                        # Write to L3 (concept clustering from L2 key)
-                        if wrote_l2:
-                            # Get the L2 key that was just written
+                        # Write to L3 (concept clustering from L2 key, only when allowed)
+                        if _can_write and wrote_l2:
                             last_slot = (self.l2._write_idx - 1) % self.l2.n_slots
                             l2_key = self.l2.keys[last_slot]  # (bridge_dim,)
                             conf = self.l2.slot_novelty[last_slot].item()

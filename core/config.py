@@ -297,6 +297,7 @@ class WideBindConfig:
     mem_l2_slots: int = 16          # L2 learned bank slots (short-term)
     mem_l3_concepts: int = 8        # L3 emergent concept slots (long-range)
     mem_l3_birth_threshold: float = 0.7  # cosine sim threshold for concept birth
+    mem_min_write_mat: float = 0.3  # min maturation before writes allowed (like private_mem)
     mem_bridge_dim: int = 256       # memory bank bridge dim (matches bridge_dim)
 
     # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
