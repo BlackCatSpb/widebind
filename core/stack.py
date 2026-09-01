@@ -313,12 +313,6 @@ class WideBindStack(nn.Module):
                 mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
                 _global_ready = self.maturation.global_ready
 
-        # ─── Streaming Memory Bank: read from L1+L2+L3 at each position ───
-        # Sits AFTER embedding, BEFORE first layer. Writes gated by maturation.
-        if self.memory_bank is not None and tokens is not None:
-            _mb_mat = mat_gate.mean().item() if mat_gate is not None else None
-            h = self.memory_bank(h, tokens, step=step, mat_gate=_mb_mat)
-
         if self.bridge is not None:
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):
@@ -417,6 +411,14 @@ class WideBindStack(nn.Module):
                     _s_l = self.bridge.probe_layer(h.detach())
                 self.bridge.record(_s_l)
                 self.bridge.update_stream(i, _s_l)
+
+            # ─── Streaming Memory Bank: per-layer read/write ───
+            # Only active on mature layers (mat_gate[i] >= threshold).
+            # Writes AND reads gated by per-layer maturation.
+            if self.memory_bank is not None and tokens is not None:
+                _mb_mat_i = mat_gate[i].item() if mat_gate is not None else 1.0
+                h = self.memory_bank(h, tokens, step=step, mat_gate=_mb_mat_i)
+
             if self.cfg.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint as _cp
                 _saved_pen = layer.mirror._cached_pred_error_norm

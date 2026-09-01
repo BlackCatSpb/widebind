@@ -421,6 +421,11 @@ class StreamingMemoryBank(nn.Module):
 
         # Injection with bounded scale
         scale = torch.tanh(self.log_scale)  # in (-1, 1)
+
+        # When maturation too low, bypass memory bank entirely (no-op)
+        if not _can_write:
+            return h
+
         return h + scale * fused
 
     def reset(self) -> None:
