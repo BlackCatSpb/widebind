@@ -85,10 +85,11 @@ WideBind ещё не продукт и не готовая система — э
 12. [Градиентная механика](#12-градиентная-механика)
 13. [Инференс-интерфейс](#13-инференс-интерфейс)
 14. [Мост намерений (Intent Bridge) — неограниченный контекст](#14-мост-намерений-intent-bridge--неограниченный-контекст)
-15. [Структура репозитория](#15-структура-репозитория)
-16. [Лицензия и статус](#16-лицензия-и-статус)
-17. [Механизмы созревания и замыкания Триады](#17-механизмы-созревания-и-замыкания-триады)
-18. [Текущий статус обучения](#18-текущий-статус-обучения)
+15. [Streaming Memory Bank — иерархическая память L1+L2+L3](#15-streaming-memory-bank--иерархическая-память-l1l2l3)
+16. [Структура репозитория](#16-структура-репозитория)
+17. [Лицензия и статус](#17-лицензия-и-статус)
+18. [Механизмы созревания и замыкания Триады](#18-механизмы-созревания-и-замыкания-триады)
+19. [Текущий статус обучения](#19-текущий-статус-обучения)
 
 ---
 
@@ -134,7 +135,7 @@ K×V с попарными оценками), здесь генерация лю
 | Параметр | **Mini** | **Большая (обучаемая)** | **Большая XL** |
 |---|---|---|---|
 | Назначение | ноутбучная, десктоп | эталонная, T4 | максимальная (24GB+) |
-| **Параметров** | ~45.3M | **≈146M** (BridgeGLU+intent_bridge+reasoning+коллектив+когерентность + in-core SemanticBridge; +~1.3M aux-head в обучении) | ~165.6M (16L) / ~330.4M (32L) |
+| **Параметров** | ~45.3M | **≈146.7M** (BridgeGLU+intent_bridge+reasoning+коллектив+когерентность + in-core SemanticBridge + memory bank L1/L2/L3; +~1.3M aux-head в обучении) | ~165.6M (16L) / ~330.4M (32L) |
 | D (hidden) | 896 | 2560 | 4096 |
 | n_layers | 24 (4–24 в тестах) | 24 | 16 (T4‑16GB) / 32 (24GB+) |
 | Слоёв на T4‑16GB | 24 | 24 | 16 |
@@ -151,11 +152,11 @@ K×V с попарными оценками), здесь генерация лю
 - **Большая (обучаемая)** — активный контур:
    `D=2560, G=32, n_layers=24, vocab=65536, bind_K=32` (см. канонический
    ноутбук `notebooks/colab.ipynb`), **точное число параметров
-   146,125,268 (146.13M)** при `intent_bridge=True, bridge_glu=True,
+   146,669,297 (146.67M)** при `intent_bridge=True, bridge_glu=True,
    explicit_reasoning=True, collective_read_out=True, variable_precision=True,
-   bridge_conn=0.1` — включая +K каналов когерентности спиралей (W_out хвост),
-   BridgeGLU (~0.92M) и **in-core SemanticBridge** (разделяемая per-layer probe
-   + proj, ≈2.0M, см. §5.11.2; параметры живут внутри модели); **итого ≈ 146.1M**
+   bridge_conn=0.1, memory_bank=True` — включая +K каналов когерентности спиралей (W_out хвост),
+   BridgeGLU (~0.92M), **in-core SemanticBridge** (разделяемая per-layer probe
+   + proj, ≈2.0M, см. §5.11.2; параметры живут внутри модели) и **Streaming Memory Bank** (L1+L2+L3, ≈0.54M, см. §15); **итого ≈ 146.7M**
    обучаемых параметров. Актуальный тренировочный контур
    (`notebooks/colab.ipynb`, Colab T4, fp32):
 
@@ -168,6 +169,7 @@ K×V с попарными оценками), здесь генерация лю
   | explicit_reasoning | True (reasoning_max_steps=8) |
   | reasoning_adaptive | True (пошаговые гейты, adaptive depth) |
   | reasoning_ramp_steps | 1000 (экспоненциальный вход: s = 1−exp(−t/1000)) |
+  | memory_bank | True (L1=3, L2=16, L3=8, bridge_dim=256) |
   | use_amp | False (fp32; AMP ломал фазу «кризиса согласования» на T4) |
 
 - **Большая XL** — референс большой версии: `D=4096, G=32, bind_K=64,
@@ -220,6 +222,8 @@ seq 256/B3. Обучение: AdamW+bf16 ≈ 25–35 GB VRAM (оптимизат
 [token ids]
      ↓
 [PartitionedEmbedding: sparse code → sigmoid-микс → basis ⊕ + RoPE]
+     ↓
+[Streaming Memory Bank: L1+L2+L3 read (if memory_bank=True)]
      ↓
   n_layers × WideBindBlock  (каждый со state: mem, mu, conv)
      ↓
@@ -466,7 +470,7 @@ L(n/3)..2n/3   → k=16  (средний)
   `conf = σ(−‖Δ‖)` — преимущество у редких и уверенных состояний;
 - **Интеллектуальный (когнитивный) гейт записи — единый показатель зрелости.**
   Запись в `_private_mem` управляется **одним** показателем зрелости слоя
-   `M_l(t) = max(time/τ-рамп, bridge_readiness)` (см. §17.1). Если `maturity is not
+   `M_l(t) = max(time/τ-рамп, bridge_readiness)` (см. §18.1). Если `maturity is not
   None`, запись открывается **только** когда `maturity ≥ cfg.matur_write_thr`
   (по умолчанию `0.3`):
   ```
@@ -481,7 +485,7 @@ L(n/3)..2n/3   → k=16  (средний)
   `step ≥ pm_write_delay` **ИЛИ** `std(mlp_mod) ≥ pm_coh_gate_std=0.02`.
 
 - **Единый контроллер созревания (MaturationController, замена костылей).**
-  См. §17.1. Все «wake-up» сигналы (live-модуляция BridgeGLU, запись в
+  См. §18.1. Все «wake-up» сигналы (live-модуляция BridgeGLU, запись в
   `_private_mem`, injection семантического моста, intent-шина) масштабируются
   **одной** настраиваемой зрелостью слоя `M_l(t) ∈ [0,1]` =
   `max(time_ramp, bridge_readiness)`. При `M_l≈0` ветви закрыты, НО замороженный
@@ -1062,7 +1066,106 @@ EMA `alpha_intent_l`. Глубокие слои (lf→1) получают бóл
 
 ---
 
-## 15. Структура репозитория
+## 15. Streaming Memory Bank — иерархическая память L1+L2+L3
+
+`cfg.memory_bank = True` включает **трёхуровневую стриминговую память**,
+сидящую ПОСЛЕ эмбеддинга и ПЕРЕД первым слоем. Память работает всегда
+(не гейтится maturation), maturation контролирует глубину обработки, а не
+доступ к памяти.
+
+### Архитектура
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │         HYBRID HEAD (sigmoid codes)      │
+                    │   sparse addressing → memory slots       │
+                    └──────────────┬──────────────────────────┘
+                                   │
+    ┌──────────────────────────────┼──────────────────────────────┐
+    │                              │                              │
+    ▼                              ▼                              ▼
+┌─────────┐                ┌──────────────┐              ┌──────────────┐
+│ L1 BUF  │                │   L2 BANK    │              │ L3 CONCEPTS  │
+│ rolling │   ◄──write──►  │ VSA-mediated │  ◄──cluster──│   emergent   │
+│ 3 sent  │                │  16 slots    │              │  8 slots     │
+└─────────┘                └──────────────┘              └──────────────┘
+    ▲                              ▲                              ▲
+    │                              │                              │
+    └──────────────────────────────┴──────────────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │    EMBEDDING (after)          │
+                    │    write at sentence boundary  │
+                    │    read at every token         │
+                    └─────────────────────────────┘
+```
+
+### Уровни памяти
+
+| Уровень | Назначение | Механизм | Слоты |
+|---|---|---|---|
+| **L1** | Immediate (последние 3 предложения) | Rolling buffer, sigmoid attention | 3 |
+| **L2** | Short-term (learned) | VSA-mediated, novelty gate | 16 |
+| **L3** | Long-range (emergent concepts) | Кластеризация L2 keys, concept birth | 8 |
+
+### Как работает
+
+1. **Write** — при boundary предложения (SEP token = 2):
+   - L1: round-robin запись sentence summary
+   - L2: novelty-gated запись (если novelty > 0.3)
+   - L3: кластеризация L2 key → concept birth/update (cosine sim > 0.7)
+
+2. **Read** — на каждом токене:
+   - L1: sigmoid attention по буферу
+   - L2: sigmoid attention по learned slots (age-based decay)
+   - L3: sigmoid attention по concept slots (медленный decay)
+   - Fusion: 4D → D gate (current + L1 + L2 + L3)
+
+3. **Reset** — при смене потока (новый stream)
+
+### Интеграция с существующими компонентами
+
+- **VSA горизонты = уровни памяти:** tau[0]=7.96→L1, tau[mid]≈50-100→L2, tau[-1]=505.92→L3
+- **Эксперты = слоты памяти:** активны с step 0, maturation контролирует глубину
+- **Memory bank ВНЕ maturation gate:** эксперты пишут в bank с первого шага
+- **Hybrid head для sparse addressing:** sigmoid codes = memory slot selectors
+- **Differentiable write:** градиент течёт через bridge GLU
+
+### Конфигурация
+
+```python
+cfg = WideBindConfig(
+    memory_bank=True,
+    mem_l1_slots=3,           # L1 rolling buffer slots
+    mem_l2_slots=16,          # L2 learned bank slots
+    mem_l3_concepts=8,        # L3 emergent concept slots
+    mem_l3_birth_threshold=0.7,  # cosine sim for concept birth
+    mem_bridge_dim=256,       # memory bank bridge dim
+)
+```
+
+### Overhead
+
+| Метрика | Без memory bank | С memory bank |
+|---|---|---|
+| Params | 146.1M | 146.6M (+0.37%) |
+| VRAM | ~5.9 GB | ~5.9 GB (minimal) |
+| Speed | ~43 tok/s | ~43 tok/s |
+
+### Diagnostics в логе
+
+```
+L1=258 L2=258 L3=1(1b) scale=-0.964
+```
+
+- `L1=N` — количество записей в L1 buffer
+- `L2=N` — количество записей в L2 bank
+- `L3=N(Wb)` — активных concepts (births)
+- `scale=S` — injection scale (tanh(log_scale))
+
+---
+
+## 16. Структура репозитория
 
 ```
 WideBind/
@@ -1089,6 +1192,7 @@ WideBind/
 │   ├── amp_optim.py            # AmpAdam (для старых кодек-голов)
 │   ├── reasoning.py            # ReasoningMemory + ReasoningGate +
 │   │                           #   ThinkingTokenHead (адаптивная глубина)
+│   ├── memory_bank.py          # StreamingMemoryBank: L1 buffer + L2 bank + L3 concepts
 │   └── model.py                # deprecated shim
 │
 ├── data/                       # подготовка данных для обучения
@@ -1137,9 +1241,11 @@ cfg = WideBindConfig(D=2560, n_layers=24, bind_K=32, vocab=65536,
                      mlp_groups=32, mlp_expand=4,
                      variable_precision=True, collective_read_out=True,
                      explicit_reasoning=True, use_amp=False,
-                     intent_bridge=True, bridge_glu=True)
+                     intent_bridge=True, bridge_glu=True,
+                     memory_bank=True,  # L1+L2+L3 streaming memory
+                     mem_l1_slots=3, mem_l2_slots=16, mem_l3_concepts=8)
 model = WideBindStack(cfg).to('cuda')
-print(model.param_count())   # 146,125,268 (146.13M; внутри модели ~2.0M in-core SemanticBridge + ~1.3M aux-головы обучения)
+print(model.param_count())   # 146,669,297 (146.67M; +0.54M memory bank)
 ```
 
 Полные конфиги — в ноутбуках `notebooks/*.ipynb`.
@@ -1164,7 +1270,7 @@ print(model.param_count())   # 146,125,268 (146.13M; внутри модели ~
 
 ---
 
-## 16. Лицензия и статус
+## 17. Лицензия и статус
 
 **Экспериментально.** Архитектура активно развивается; API/конфиги могут
 меняться; чекпоинты совместимы между версиями только при строгой
@@ -1179,7 +1285,7 @@ print(model.param_count())   # 146,125,268 (146.13M; внутри модели ~
 
 ---
 
-## 17. Механизмы созревания и замыкания Триады
+## 18. Механизмы созревания и замыкания Триады
 
 ### 17.1 MaturationController — единый «wake-up» гейт по компетентности моста
 
@@ -1278,7 +1384,7 @@ gating). После — полный SpectrumGate с per-layer tau-driven divers
   пассивного читателя в активного участника петли самокоррекции (Рассудок =
   субъект, а не судья).
 
-## 18. Текущий статус обучения
+## 19. Текущий статус обучения
 
 Актуальный контрольный контур — `notebooks/colab.ipynb` (Colab T4, fp32,
 `use_amp=False`). **Перезапуск с per-layer maturation** (коммит `a735ac0`):
@@ -1286,7 +1392,7 @@ deep-слои (tau≈515) открываются быстрее (T_eff=8000), sh
 медленнее (T_eff=16000). Monotonic → математически стабильно. Global readiness:
 `global_ready=True` когда ВСЕ слои M_l > 0.1 (step ~8000). До этого — simple
 maturation gating; после — full SpectrumGate с per-layer tau-driven diversity
-(§17.2).
+(§18.2).
 
 **Конфигурация (Большая, обучаемая):**
 
@@ -1294,9 +1400,11 @@ maturation gating; после — full SpectrumGate с per-layer tau-driven dive
 |---|---|
 | D / слои / G / bind_K | 2560 / 24 / 32 / 32 |
 | vocab / seq_len (обуч.) | 65536 / 128 |
-| Параметров | 146,125,292 (146.13M) |
-| bridge_glu, intent_bridge, explicit_reasoning, reasoning_adaptive, collective_read_out, variable_precision, bind_twist_gate, maturation_enabled, triad_reason | True |
+| Параметров | 146,669,297 (146.67M; +0.54M memory bank) |
+| bridge_glu, intent_bridge, explicit_reasoning, reasoning_adaptive, collective_read_out, variable_precision, bind_twist_gate, maturation_enabled, triad_reason, memory_bank | True |
 | bridge_conn | 0.1 (вес aux) |
+| mem_l1_slots / mem_l2_slots / mem_l3_concepts | 3 / 16 / 8 |
+| mem_l3_birth_threshold | 0.7 (cosine sim for concept birth) |
 | pm_write_delay | 0 (игнорируется при maturation_enabled) |
 | mask_eos | False |
 | use_amp | False (fp32) |
@@ -1319,7 +1427,7 @@ maturation gating; после — full SpectrumGate с per-layer tau-driven dive
 
 > ✅ **Per-layer maturation решила проблему bridge_conn collapse:** На старом коде (uniform maturation) bridge_conn коллапсировал до 0.001-0.08 в dynamic equilibrium. На новом коде bridge_conn стабилен 0.12→0.049 (step 4427→10019) — плавное снижение, мост постепенно становится компетентнее. Глубокие слои открываются быстрее, shallow сохраняют gradient → модель стабильнее.
 
-**Замыкание Триады (triad_reason, §17.2):** при генерации ствол ре-циркулируется,
+**Замыкание Триады (triad_reason, §18.2):** при генерации ствол ре-циркулируется,
 если уверенность головы `_conf < 0.5` (до `triad_max_passes=3`), консервативный
 бленд `h = 0.5·h + 0.5·h2`. Только inference, новых параметров нет.
 
