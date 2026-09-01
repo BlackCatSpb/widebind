@@ -624,3 +624,145 @@ step=10019: val=9.194   mat=0.495[0.221,0.736]  bridge_conn=0.049  intent_w=1.07
 Продолжить обучение к `val ≈ 8.5`. Per-layer maturation демонстрирует стабильность и лучшую производительность по сравнению с uniform maturation.
 
 <!---
+
+## HybridSigmoidSoftmaxHead + per-layer maturation (step 11247 → 13310)
+
+### Ключевые изменения (коммит `5826661`)
+
+- **HybridSigmoidSoftmaxHead**: `gate = sigmoid(zt) * (1 + softmax(zt/tau))`, tau = exp(log_temp) из модели. 0 новых параметров.
+- Hot-swap в `core/embedding.py`: `_su()` и `log_probs_for_target()` обновлены.
+- Entropy снижается: 10.5 → 0.58.
+
+### Конфигурация
+
+| Параметр | Значение |
+|---|---|
+| D / слои / G / bind_K | 2560 / 24 / 32 / 32 |
+| vocab / seq_len | 65536 / 128 |
+| bridge_conn | 0.1 (aux weight) |
+| bridge_dim | 256 |
+| Параметров модели | 146,125,292 |
+| bridge параметров | 2,034,948 |
+
+### Траектория val (hybrid head, step 11247 → 13310)
+
+```
+step=11247: val=9.194   mat=0.457[0.235,0.691]  bridge_conn=0.0162  intent_w=1.073
+step=11417: val=9.1289  mat=0.463[0.240,0.697]  bridge_conn=0.0169  intent_w=1.073  ← NEW BEST
+step=11650: val=9.0968  mat=0.476[0.250,0.708]  bridge_conn=0.0153  intent_w=1.072  ← NEW BEST
+step=11883: val=9.0657  mat=0.491[0.263,0.722]  bridge_conn=0.0162  intent_w=1.071  ← NEW BEST
+step=12116: val=9.0337  mat=0.504[0.274,0.733]  bridge_conn=0.0165  intent_w=1.070  ← NEW BEST
+step=12349: val=9.0025  mat=0.517[0.285,0.744]  bridge_conn=0.0144  intent_w=1.070  ← NEW BEST
+step=12582: val=8.9741  mat=0.529[0.296,0.754]  bridge_conn=0.0130  intent_w=1.069  ← NEW BEST
+step=12815: val=8.9480  mat=0.545[0.311,0.767]  bridge_conn=0.0153  intent_w=1.068  ← NEW BEST
+step=13048: val=8.9263  mat=0.558[0.323,0.776]  bridge_conn=0.0671  intent_w=1.169  ← NEW BEST (bridge_conn JUMP!)
+step=13281: val=8.9154  mat=0.570[0.335,0.786]  bridge_conn=0.0671  intent_w=1.168  ← NEW BEST
+```
+
+### Ключевые наблюдения
+
+1. **VAL < 9.0 ДОСТИГНУТО!** 8.9154@13281 — исторический рубеж.
+2. **bridge_conn JUMP**: На шаге ~12870 bridge_conn вырос с 0.014 до 0.067 (~4x). Одновременно intent_w вырос с 1.07 до 1.17. Модель **сама** перестроила кросс-слойную коммуникацию.
+3. **Per-layer maturation**: L0=0.338, L23=0.788. Monotonic. Deep-first.
+4. **CE**: 7.03-9.31 (минимумы снижаются: 7.03@12595).
+5. **gradalign**: 19.2 (стабильный).
+6. **mod_mlp**: 0.344 (здоров).
+7. **Скорость улучшения ускоряется**: 9.194→9.003 за 2000 шагов, затем 9.003→8.915 за 900 шагов.
+
+### Интерпретация bridge_conn jump
+
+Модель обнаружила, что per-layer maturation (L0=0.33, L23=0.79) делает bridge более ценным каналом. По мере созревания shallow слоёв bridge стал более эффективным для кросс-слойной коммуникации. Это **автономное адаптивное поведение** — модель нашла более эффективную стратегию без внешнего вмешательства.
+
+### Val trajectory (полная, hybrid head)
+
+9.194@10019 → 9.129@11417 → 9.097@11650 → 9.066@11883 → 9.034@12116 → 9.003@12349 → 8.974@12582 → 8.948@12815 → 8.926@13048 → 8.915@13281 → 8.891@13514 → 8.865@13747 → 8.842@13980 → 8.822@14213 → **8.804@14446**
+
+### Чекпоинты
+
+| Файл | Step | Val | Описание |
+|---|---|---|---|
+| `best 11.pt` | 13281 | 8.9154 | |
+| `best 12.pt` | 13514 | 8.8906 | |
+| `best 13.pt` | 13747 | 8.8651 | |
+| `best 14.pt` | 13980 | 8.8420 | |
+| `best 15.pt` | 14213 | 8.8223 | |
+| `best 16.pt` | 14446 | 8.8036 | |
+| `best 17.pt` | 14446 | 8.8036 | **Анализ** (HTML: `best 17_14446_report.html`) |
+| `best_15844_report.html` | 15844 | 8.7692 | Лучший исторический (old run) |
+
+### Цель
+
+Продолжить к `val ≈ 8.5`. bridge_conn и intent_w стабильны после jump.
+
+---
+
+### ⚠️ ГЛОБАЛЬНАЯ ПЕРЕСТРОЙКА (step ~14740)
+
+**CE explosion:** 8.09 → 81.72 → 77.20 → 79.54 → 83.20
+
+| Метрика | До (14685) | После (14905) | Дельта |
+|---|---|---|---|
+| CE | 8.09 | 83.20 | **x10.3** |
+| intent_w | 1.163 | 1.429 | +23% |
+| bridge_conn | 0.066 | 0.044 | -33% |
+| diversity | 11.99 | 3.16 | -74% |
+| gate_l1 | 0.570 | 0.368 | -35% |
+| balance | 0.008 | 0.045 | x5.6 |
+| ranking | 15152 | 4808 | -68% |
+| mod_mlp | 0.340 | 0.333 | -2% |
+| maturation | 0.648 | 0.660 | +2% |
+
+**Вердикт:** Фазовый переход. bridge_conn collapse → intent_w spike → CE explosion. gradalign стабилен (19.2-19.7) — градиенты целостны. Maturation продолжает расти (0.660).
+
+---
+
+### ⛔️ ПОЛНЫЙ КОЛЛАПС (step 14912)
+
+**val_loss = 82.2255** (было 8.804@14446)
+
+| Шаг | CE | bridge_conn | intent_w | diversity |
+|---|---|---|---|---|
+| 14685 | 8.09 | 0.066 | 1.163 | 11.99 |
+| 14740 | 81.72 | 0.012 | 1.336 | 4.58 |
+| 14795 | 77.20 | 0.042 | 1.428 | 2.57 |
+| 14850 | 79.54 | 0.044 | 1.429 | 2.71 |
+| 14905 | 83.20 | 0.044 | 1.429 | 3.16 |
+| **14912** | **82.23 (val)** | — | — | — |
+
+**Диагноз:** Полный коллапс. bridge_conn collapse → intent_w spike → CE explosion → val=82.2. Модель потеряла все представления.
+
+**Действия:**
+1. Ждать 500-1000 шагов — если CE не снижается, rollback к `best 17@14446` (val=8.804)
+2. Если CE начинает снижаться — модель перестраивается, ждать нового equilibria
+3. Если CE стабильно high — архитектурная проблема, нужен debug
+
+---
+
+### 🔍 КОРНЕВАЯ ПРИЧИНА: Restart Explosion (step 14446→14740)
+
+**Симптомы:**
+- val_loss=15.9@14446 (должно быть 8.80)
+- CE=32.59@14740 (было ~8)
+- intent_w=1.364 (+17%), diversity=2.34 (-80%), bridge_conn=0.064
+
+**Корневая причина:** Training restart с `best 17@14446`, но:
+
+| Что потерялось | Влияние |
+|---|---|
+| **Optimizer state (Adam)** | Fresh Adam → нет momentum continuity → LR скачки |
+| **Scheduler EMA baselines** | Fresh LR controller → `_val_ema=None`, `_tau_var=None` → нет mirror-adaptive LR |
+| **bridge_stream** | `persistent=False` → zero-init → bridge injection = шум первые шаги |
+| **_phase_ratio_ema/std** | Reset → [0.0]/[1.0] → phase-scaling неправильный |
+| **bridge_loss_init/ema** | Reset → readiness diagnostic = baseline |
+
+**Механизм взрыва:**
+1. Fresh Adam без momentum → gradients noisy
+2. Fresh scheduler → LR адаптация с None baselines → LR unstable
+3. bridge_stream zero → bridge injection = шум → intent_w spike
+4. CE explosion → FailureDetector не сработал (warmup=1000 steps с момента restart)
+5. val_loss = 34.04 → модель не может восстановиться
+
+**Рекомендация:** Не перезапускать с best 17@14446. Вместо этого:
+1. Дождаться окончания текущего прогона
+2. Исправить checkpoint save/load: восстанавливать optimizer/scheduler state
+3. Или: сохранять bridge_stream в checkpoint (persistent=True)

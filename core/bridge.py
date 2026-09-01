@@ -71,7 +71,7 @@ class SemanticBridge(nn.Module):
         # Persistent cross-layer stream: (n_layers, bridge_dim). EMA-updated,
         # not part of the autograd graph (detached when written).
         self.register_buffer(
-            "bridge_stream", torch.zeros(n_layers, bridge_dim), persistent=False
+            "bridge_stream", torch.zeros(n_layers, bridge_dim), persistent=True
         )
         self._preds: list[torch.Tensor] | None = None
 

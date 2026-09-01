@@ -265,11 +265,21 @@ def train(cfg=None, resume_path=None):
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
             print(f'  Unexpected keys (old arch): {len(unexpected)}')
-        # Fresh optimizer/scheduler (NO momentum restore) — avoids resume-OOM &
-        # Adam momentum runaway that caused the step-~1000 CE collapse.
+        # Restore optimizer/scheduler from checkpoint for stable resume.
         optimizer = _make_opt(cfg.lr)
+        if 'optimizer' in ckpt and ckpt['optimizer'] is not None and not args.no_save_optimizer:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                print('  Optimizer state restored (momentum preserved)')
+            except Exception as e:
+                print(f'  [warn] Could not restore optimizer state: {e} — using fresh Adam')
         scheduler = LRController(model, optimizer, cfg=cfg)
-        scheduler.set_step(ckpt['step'])
+        if 'scheduler' in ckpt and ckpt['scheduler'] is not None:
+            scheduler.load_state_dict(ckpt['scheduler'])
+            print(f'  Scheduler state restored (step={ckpt["step"]})')
+        else:
+            scheduler.set_step(ckpt['step'])
+            print(f'  Scheduler step set to {ckpt["step"]} (no saved state)')
         depth = DepthController(model, n_layers=cfg.n_layers, init_k=cfg.init_active_layers,
                                 unfreeze_inc=4, eval_interval=cfg.eval_interval)
         _saved_depth = ckpt.get('active_depth', None)
