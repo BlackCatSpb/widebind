@@ -292,14 +292,10 @@ class WideBindStack(nn.Module):
                 mat_gate = self.maturation.gate
                 _global_ready = self.maturation.global_ready
             else:
-                # Maturation gate: max(time_ramp, bridge_readiness)
-                # When bridge is more competent than time ramp allows, it accelerates.
-                _br = None
-                if self.bridge is not None:
-                    _brScalar = self.bridge.readiness()
-                    _br = _brScalar.expand(len(self.layers))
-                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach(),
-                                                      bridge_readiness=_br)
+                # Maturation gate: pure time ramp (deep-first).
+                # bridge_readiness is NOT used — it's a scalar that would
+                # destroy the per-layer gradient by setting all layers equal.
+                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
                 _global_ready = self.maturation.global_ready
         if self.bridge is not None:
             self.bridge.start_forward()

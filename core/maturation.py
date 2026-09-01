@@ -83,18 +83,17 @@ class MaturationController(nn.Module):
             denom = 1.0
         self.tau_norm.copy_(((log_tau - math.log(self.tau_min)) / denom).clamp(0.0, 1.0))
 
-    def step_gate(self, step, tau_dev=None, bridge_readiness=None):
-        """Maturation gate: max(time_ramp, bridge_readiness) — soft-max.
+    def step_gate(self, step, tau_dev=None):
+        """Maturation gate: per-layer time ramp.
 
         Deep layers (tau_norm≈1) open first (T_eff = T0).
         Shallow layers (tau_norm≈0) open later (T_eff = T0 + T_delay).
-        When bridge_readiness is provided, the gate takes the per-element
-        maximum of the time ramp and bridge competence signal.
+        Pure time ramp — no bridge_readiness override (scalar would destroy
+        the per-layer gradient by setting all layers to the same value).
 
         Args:
             step: current training step
             tau_dev: (n_layers,) deviation from base tau ladder (optional)
-            bridge_readiness: (n_layers,) bridge competence in [0,1] (optional)
 
         Returns:
             gate: (n_layers,) per-layer maturation values in [0, 1]
@@ -105,16 +104,8 @@ class MaturationController(nn.Module):
 
         # Per-layer effective T0: deep layers (tau_norm≈1) → T_eff = T0
         # shallow layers (tau_norm≈0) → T_eff = T0 + T_delay
-        gate_time = torch.sigmoid(
+        gate = torch.sigmoid(
             (t - (self.T0 + self.alpha * (1.0 - self.tau_norm) * self.T_delay)) / self.delta_t)
-
-        if bridge_readiness is not None:
-            # Soft-max: gate = max(time_ramp, bridge_readiness)
-            # When bridge is more competent than the time ramp allows,
-            # it accelerates maturation. When bridge is immature, time ramp dominates.
-            gate = torch.max(gate_time, bridge_readiness.clamp(0.0, 1.0))
-        else:
-            gate = gate_time
 
         self.gate.copy_(gate)
         return gate
