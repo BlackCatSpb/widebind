@@ -12,6 +12,7 @@ from .layer_bridge_gate import LayerBridgeGate
 from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCodedHead, CognitiveCodedHead
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
+from .memory_bank import StreamingMemoryBank
 
 class WideBindStack(nn.Module):
     """Stack of WideBindBlock layers with embedding and lm_head."""
@@ -103,6 +104,18 @@ class WideBindStack(nn.Module):
         # Мост контекста получает выделенный горизонт интеграции (отдельный от
         # памяти), чтобы работать на всех диапазонах τ системы.
         self._tau_intent_dev = nn.Parameter(torch.zeros(cfg.n_layers))
+        # ─── Streaming Memory Bank (hierarchical L1+L2) ───
+        # After embedding, before first layer. Read at every token position.
+        # Write at sentence boundaries. NOT gated by maturation — always active.
+        self.memory_bank = StreamingMemoryBank(
+            D=cfg.D,
+            bridge_dim=getattr(cfg, 'mem_bridge_dim', getattr(cfg, 'bridge_dim', 256)),
+            l1_slots=getattr(cfg, 'mem_l1_slots', 3),
+            l2_slots=getattr(cfg, 'mem_l2_slots', 16),
+            l3_concepts=getattr(cfg, 'mem_l3_concepts', 8),
+            l3_birth_threshold=getattr(cfg, 'mem_l3_birth_threshold', 0.7),
+            cfg=cfg,
+        ) if getattr(cfg, 'memory_bank', False) else None
         # c_ema: global state EMA rate = write_rate * tau_mid
         tau_s = self.layers[0]._tau_s
         tau_mid = math.sqrt(tau_s[0].item() * tau_s[-1].item())
@@ -130,7 +143,7 @@ class WideBindStack(nn.Module):
     def forward(self, h, state=None, global_state=None, pred_weight=None, adaptive=True,
                 context_mem=None, allow_write=None, step=None,
                 reasoning_buffer=None, reasoning_count=None, intent_state=None,
-                _triad_depth: int = 0):
+                tokens=None, _triad_depth: int = 0):
         """h: (B, L, D) — pre-embedded tokens
            state: per-layer memory states from previous forward (or None)
            global_state: cross-layer EMA self-model (or None, created fresh)
@@ -139,6 +152,7 @@ class WideBindStack(nn.Module):
            reasoning_buffer: (B, max_steps, D) tensor of previous reasoning steps
            (or None → use module attribute, legacy path); reasoning_count: scalar
            long tensor = valid rows (or None)
+           tokens: (B, L) — raw token ids for memory bank boundary detection (or None)
            Returns (h, state, global_state, (reasoning_buffer, reasoning_count)).
         """
         if state is None:
@@ -225,6 +239,11 @@ class WideBindStack(nn.Module):
         # Copy before in-place updates: aot_export forbids mutating graph inputs
         # that require gradients (global_state is updated per layer below).
         global_state = global_state.clone()
+
+        # ─── Streaming Memory Bank: read from L1+L2 at each position ───
+        # Sits AFTER embedding, BEFORE first layer. NOT gated by maturation.
+        if self.memory_bank is not None and tokens is not None:
+            h = self.memory_bank(h, tokens, step=step)
 
         # ─── Intent Bridge: depth-flowing per-head intent stream ───
         # Per-layer list of (1,1,G,k_i): one k-dim intent per expert, flows

@@ -291,6 +291,14 @@ class WideBindConfig:
 
     # bridge_lr_mult: REMOVED — bridge uses base LR with LayerBridgeGate routing
 
+    # ─── Streaming Memory Bank (hierarchical L1+L2+L3) ───
+    memory_bank: bool = False       # enable streaming memory bank
+    mem_l1_slots: int = 3           # L1 rolling buffer slots (immediate)
+    mem_l2_slots: int = 16          # L2 learned bank slots (short-term)
+    mem_l3_concepts: int = 8        # L3 emergent concept slots (long-range)
+    mem_l3_birth_threshold: float = 0.7  # cosine sim threshold for concept birth
+    mem_bridge_dim: int = 256       # memory bank bridge dim (matches bridge_dim)
+
     # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
     # Все точки комбинации смыслов используют нормированное сигмоид-среднее
     # (выпуклая комбинация, сумма весов = 1) вместо softmax-конкуренции.

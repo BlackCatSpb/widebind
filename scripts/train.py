@@ -349,7 +349,7 @@ def train(cfg=None, resume_path=None):
             # в”Ђв”Ђв”Ђ Forward (with optional AMP) в”Ђв”Ђв”Ђ
             with autocast('cuda', enabled=use_amp):
                 h = model.embed_tokens(x)
-            out, state, gs, _ = model(h, state, global_state=gs, step=step)
+            out, state, gs, _ = model(h, state, global_state=gs, step=step, tokens=x)
             model.observe_output(out)  # salience of THIS step -> next step's intent
             ce_loss, aux_dict = model.compute_losses(out, y, h_emb=h)
 
@@ -554,7 +554,7 @@ def evaluate(model, streams, cfg, device):
             break
         x, y = x.to(device), y.to(device)
         h = model.embed_tokens(x)
-        out, state, _, _ = model(h, state)
+        out, state, _, _ = model(h, state, tokens=x)
         loss = model.compute_loss(out, y, h_emb=h)
         total_loss += loss.item()
         total_steps += 1
