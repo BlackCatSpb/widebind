@@ -1068,6 +1068,7 @@ class WideBindStack(nn.Module):
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
         # ─── Layer Bridge Gate: log per-layer gate weights (SpectrumGate) ───
+        _lbg_aux = {}
         if self.layer_bridge_gate is not None and self._layer_diagnostics:
             with torch.no_grad():
                 _gates = []
@@ -1096,11 +1097,13 @@ class WideBindStack(nn.Module):
                 self._cached_losses['lbg_max'] = _gates_t.max().item()
                 self._cached_losses['lbg_tau'] = sum(_taus) / len(_taus)
                 self._cached_losses['lbg_global_ready'] = 1.0 if _gr else 0.0
-                aux_dict['layer_gate_mean'] = _gates_t.mean().item()
-                aux_dict['layer_gate_std'] = _gates_t.std().item()
-                aux_dict['layer_gate_min'] = _gates_t.min().item()
-                aux_dict['layer_gate_max'] = _gates_t.max().item()
-                aux_dict['lbg_global_ready'] = 1.0 if _gr else 0.0
+                _lbg_aux = {
+                    'layer_gate_mean': _gates_t.mean().item(),
+                    'layer_gate_std': _gates_t.std().item(),
+                    'layer_gate_min': _gates_t.min().item(),
+                    'layer_gate_max': _gates_t.max().item(),
+                    'lbg_global_ready': 1.0 if _gr else 0.0,
+                }
             self._layer_diagnostics = {}  # reset for next step
         pred_w_loss = 0.0
         n_pred_w = 0
@@ -1118,6 +1121,7 @@ class WideBindStack(nn.Module):
         # double-weighting bug (weights were baked here AND reapplied in the
         # training loop).
         aux_dict = {}
+        aux_dict.update(_lbg_aux)
         if pred_w_loss != 0:
             aux_dict['pred_w'] = pred_w_loss
         if pred_loss != 0:
