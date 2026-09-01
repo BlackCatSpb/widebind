@@ -475,9 +475,12 @@ class GroupedCognitiveMirror(nn.Module):
         #     crutch по std модуляции (исходное поведение). pm_write_delay<=0 тогда
         #     означает «только по когерентности» (без шагового пола).
         _write_ok = _write
+        _write_scale = torch.tensor(1.0, device=hp.device)
         if _write_ok:
             if maturity is not None:
-                _write_ok = bool(maturity >= self._matur_write_thr)
+                # Smooth scaling: sigmoid transition around threshold
+                _write_scale = torch.sigmoid((maturity - self._matur_write_thr) * 10.0)
+                _write_ok = bool(_write_scale > 0.01)
             else:
                 self._pm_step += 1
                 coherent = bool(self._pm_coh.item())
@@ -500,7 +503,7 @@ class GroupedCognitiveMirror(nn.Module):
                 pm_scale = self._private_mem.norm(dim=-1).mean().clamp(min=1e-8)
                 warmup_rate = torch.sigmoid(3.0 - pm_scale)  # ~1.0 when pm~0, ~0.0 when pm>3
                 pm_decay = 0.999 - 0.009 * warmup_rate  # [0.990, 0.999] — faster decay when memory is empty
-                self._private_mem.mul_(pm_decay).add_(weighted_hp, alpha=1.0 - pm_decay)
+                self._private_mem.mul_(pm_decay).add_(weighted_hp * _write_scale, alpha=1.0 - pm_decay)
                 self._private_mem.clamp_(-10.0, 10.0)
         
         # ─── Fast signals (hi half of K-space) ───

@@ -11,19 +11,13 @@
 
 ## Текущее состояние (последнее обновление)
 
-- **Step:** 14740 (Colab запущен, restart с 14446)
-- **Val:** 15.94@14446 (restart eval), 34.04@14679, **COLLAPSE**
-- **Голова:** HybridSigmoidSoftmaxHead
-- **Per-layer maturation:** L0=0.422, L23=0.842
-- **bridge_conn:** 0.064 (частично восстановился с 0.012)
-- **intent_w:** 1.364 (ВЫРОС +17%)
-- **CE:** 32.59 (взрыв с ~8 до ~33)
-- **diversity:** 2.34 (-80%)
-- **gate_l1:** 0.396 (-31%)
-- **gradalign:** 20.2 (стабильный)
-- **mod_mlp:** sigmoid=0.336
-- **КОРНЕВАЯ ПРИЧИНА:** Optimizer/scheduler НЕ восстановлены из checkpoint. Fresh Adam + fresh LR baselines → CE explosion.
-- **Что потерялось:** bridge_stream (persistent=False), scheduler EMA baselines, optimizer momentum, _phase_ratio_ema/std
+- **Step:** 15844 (Colab запущен)
+- **Val:** 8.7556@15844 — **ТЕКУЩИЙ BEST** (было 8.7787)
+- **Per-layer maturation:** L0=0.490, L23=0.875, mean=0.707
+- **bridge_conn:** ~0.068 (стабильный)
+- **NaN:** 0, Inf: 0
+- **ФИКС РАБОТАЕТ:** Модель стабильно улучшается после restart.
+- **Val trajectory:** 8.915→8.891→8.865→8.842→8.822→8.804→8.795→8.787→8.779→8.770→8.763→**8.756**
 
 ## Ключевые решения
 

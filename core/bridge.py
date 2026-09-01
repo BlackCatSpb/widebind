@@ -151,6 +151,7 @@ class SemanticBridge(nn.Module):
         tgt = self.emb_proj(emb)                              # (B, L-1, bridge_dim)
         total = torch.zeros((), device=tgt.device, dtype=tgt.dtype)
         n = 0
+        layer_means = []
         for s_l in self._preds:
             pred = s_l[:, :-1]                               # align to positions 0..L-2
             if pred.shape[1] != tgt.shape[1]:
@@ -159,9 +160,17 @@ class SemanticBridge(nn.Module):
                 tgt_ = tgt[:, :m]
             else:
                 tgt_ = tgt
-            total = total + (1.0 - F.cosine_similarity(pred, tgt_, dim=-1).mean())
+            total = total + (1.0 - F.cosine_similarity(pred, tgt_, dim=-1, eps=1e-8).mean())
             n += 1
+            layer_means.append(pred.mean(dim=(0, 1)))       # (bridge_dim,)
         loss_val = total / max(n, 1)
+        # Inter-layer diversity: penalize collapsed probes (all layers same prediction)
+        if len(layer_means) >= 2:
+            stacked = F.normalize(torch.stack(layer_means), dim=-1)  # (n_layers, bridge_dim)
+            sim = stacked @ stacked.T                                # (n_layers, n_layers)
+            mask = ~torch.eye(len(layer_means), dtype=torch.bool, device=sim.device)
+            diversity_penalty = sim[mask].mean()                     # mean off-diagonal similarity
+            loss_val = loss_val + 0.1 * diversity_penalty
         # EMA косинус-лосса + baseline случайного режима для readiness().
         # Под no_grad: буферы вне графа, градиент по лоссу (probe/stream_proj)
         # сохраняется — он течёт через возвращаемый loss_val.

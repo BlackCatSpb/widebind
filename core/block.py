@@ -459,12 +459,11 @@ class WideBindBlock(nn.Module):
         # ─── Variable Precision Memory ───
         if self.variable_precision:
             # fp32-якорь: softmax в exact_memory переполняется в fp16 под AMP.
-            # Гейт встроен тензорной маской (не python-if): статический граф.
+            # Per-element soft gate: precision modulation (без глобального порога).
             with torch.autocast(device_type=h.device.type, enabled=False):
                 precision = self.precision_gate(h.float())
-                gate = (precision.mean() > self.precision_threshold).to(h.dtype)
                 exact = self.exact_memory(h.float())
-                h = h + (precision * exact * gate).to(h.dtype)
+                h = h + (precision * exact).to(h.dtype)
             if self.training:
                 self._precision_mean = precision.mean()
 

@@ -327,6 +327,8 @@ def train(cfg=None, resume_path=None):
                 offset = 0
                 state = None  # reset state on stream switch (document boundary)
                 gs = None
+                if model.bridge is not None:
+                    model.bridge.bridge_stream.zero_()  # reset bridge memory at document boundary
                 if model.explicit_reasoning:
                     model.reset_reasoning()  # new document: new chain
             

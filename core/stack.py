@@ -292,10 +292,14 @@ class WideBindStack(nn.Module):
                 mat_gate = self.maturation.gate
                 _global_ready = self.maturation.global_ready
             else:
-                # Pure time-ramp per-layer gate (no scalar readiness override).
-                # Deep layers (large tau) open first, shallow layers later.
-                # Monotonic → mathematically stable (skip connections preserve gradient).
-                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach())
+                # Maturation gate: max(time_ramp, bridge_readiness)
+                # When bridge is more competent than time ramp allows, it accelerates.
+                _br = None
+                if self.bridge is not None:
+                    _brScalar = self.bridge.readiness()
+                    _br = _brScalar.expand(len(self.layers))
+                mat_gate = self.maturation.step_gate(step, self._tau_l_dev.detach(),
+                                                      bridge_readiness=_br)
                 _global_ready = self.maturation.global_ready
         if self.bridge is not None:
             self.bridge.start_forward()
@@ -930,7 +934,6 @@ class WideBindStack(nn.Module):
                     target_m2v = target / (1.0 + torch.exp(-(tau_l_t.log() - tau_mid_t.log())))
                     w_m2v_loss = w_m2v_loss + (wm.mean().detach() - target_m2v).pow(2)
                     n_m2v = n_m2v + 1
-                    n_m2v = n_m2v + 1
             if n_m2v > 0:
                 w_m2v_loss = w_m2v_loss / n_m2v
         # Intent Bridge: own tau-ladder regularization (gives _tau_intent_dev a gradient)
@@ -1093,6 +1096,11 @@ class WideBindStack(nn.Module):
                 self._cached_losses['lbg_max'] = _gates_t.max().item()
                 self._cached_losses['lbg_tau'] = sum(_taus) / len(_taus)
                 self._cached_losses['lbg_global_ready'] = 1.0 if _gr else 0.0
+                aux_dict['layer_gate_mean'] = _gates_t.mean().item()
+                aux_dict['layer_gate_std'] = _gates_t.std().item()
+                aux_dict['layer_gate_min'] = _gates_t.min().item()
+                aux_dict['layer_gate_max'] = _gates_t.max().item()
+                aux_dict['lbg_global_ready'] = 1.0 if _gr else 0.0
             self._layer_diagnostics = {}  # reset for next step
         pred_w_loss = 0.0
         n_pred_w = 0
@@ -1146,31 +1154,6 @@ class WideBindStack(nn.Module):
             aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
             aux_dict['ls_reg'] = log_scale_reg
-        # ─── Layer Bridge Gate: log per-layer gate weights (SpectrumGate) ───
-        if self.layer_bridge_gate is not None and self._layer_diagnostics:
-            with torch.no_grad():
-                _gates = []
-                _gr = False
-                if getattr(self, 'maturation', None) is not None:
-                    _gr = self.maturation.global_ready
-                for l in range(n_layers):
-                    if l in self._layer_diagnostics:
-                        _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
-                        if _gr:
-                            _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
-                            _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
-                            _gates.append(_gated.mean().item())
-                        else:
-                            _gates.append(_mat.item())
-                    else:
-                        _gates.append(0.5)
-                _gates_t = torch.tensor(_gates)
-                aux_dict['layer_gate_mean'] = _gates_t.mean().item()
-                aux_dict['layer_gate_std'] = _gates_t.std().item()
-                aux_dict['layer_gate_min'] = _gates_t.min().item()
-                aux_dict['layer_gate_max'] = _gates_t.max().item()
-                aux_dict['lbg_global_ready'] = 1.0 if _gr else 0.0
-            self._layer_diagnostics = {}  # reset for next step
         # ─── Semantic Bridge aux loss (per-layer next-token embedding prediction) ───
         # Each layer's probe is self-supervised to predict the next token's
         # embedding (cosine). Dense, well-distributed gradient at every depth;
