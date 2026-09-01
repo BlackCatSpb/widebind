@@ -202,3 +202,254 @@
 Каждый коммит — это шаг к новой парадигме. Не трансформер, а что-то большее.
 
 ---
+
+## Полное описание архитектуры EVA
+
+### Обзор
+
+EVA (Единая Вычислительная Архитектура) — многосистемная архитектура, комбинирующая когнитивные науки с deep learning. Каждый компонент решает конкретную задачу и связан с другими через tau-иерархию.
+
+**Текущие параметры:** 146.67M (D=2560, n_layers=24, G=32, vocab=65536)
+
+### Компоненты архитектуры
+
+#### 1. GroupedCognitiveMirror (32 эксперта на слой)
+**Файл:** `core/mirror.py`
+
+**Что делает:** Каждый слой содержит 32 эксперта-зеркала. Каждый эксперт работает в своём d=80 подпространстве (D=2560/G=80). Эксперты маршрутизируют вход через precision gate, вычисляют 4 сигнала коррекции (temp, pred, smooth, sym) и дают полный градиент pred_error.
+
+**Зачем:**
+- Разбиение на экспертов = sparse computation (как MoE, но с когнитивной маршрутизацией)
+- Per-expert K-space (k=32) позволяет каждому эксперту работать в своём контексте
+- Meta-gate учится доверять/игнорировать каждого эксперта
+
+**Зависимости:**
+- **Maturation** — запись в private_mem открывается при mat_gate[i] >= 0.3
+- **BridgeGLU** — MLP gate modulated by bridge semantic delta
+- **PrecisionGate** — маршрутизация по pred_error
+- **Bridge** — semantic delta для BridgeGLU
+
+**Ключевые параметры:**
+- `G=32` — количество экспертов
+- `k=32` — размерность K-space
+- `private_mem=True` — cross-expert private memory bank
+- `expert_asymmetry=True` — разные alpha, log_scale, W_proj для каждого эксперта
+
+---
+
+#### 2. SemanticBridge (Кросс-слойный семантический мост)
+**Файл:** `core/bridge.py`
+
+**Что делает:** Shared probe head emits semantic vector s_l = probe(h_l) на каждом слое. Векторы формируют кросс-слойный поток:
+- **DEPTH:** bottom-up (свежие от нижних слоёв) + top-down (carried от верхних)
+- **TIME:** persistent bridge_stream (EMA) переносится через forward calls
+- **SELF-SUPERVISED:** probe обучается предсказывать next-token embedding (cosine loss)
+
+**Зачем:**
+- Связывает слои семантически (не просто skip connections)
+- Даёт плотный градиент на каждом уровне глубины
+- Позволяет нижним слоям "видеть" контекст верхних
+
+**Зависимости:**
+- **Maturation** — bridge injection gated by mat_gate[i]
+- **LayerBridgeGate** — per-layer spectrum gate для bridge routing
+- **BridgeGLU** — bridge delta модулирует MLP gate
+- **IntentBridge** — parallel semantic stream
+
+**Ключевые параметры:**
+- `bridge_conn=0.1` — aux loss weight
+- `bridge_dim=256` — semantic vector width
+- `bridge_depth=True` — cross-layer injection
+
+---
+
+#### 3. MaturationController (Единый контроллер созревания)
+**Файл:** `core/maturation.py`
+
+**Что делает:** Per-layer maturity M_l(t) in [0,1], гейтирующий ВСЕ wake-up сигналы:
+- Bridge injection
+- Private memory write
+- Intent bus
+- LayerBridgeGate
+
+**Формула:** `M_l(t) = sigmoid((t - (T0 + alpha*tau_norm_l*T_delay)) / delta_t)`
+
+**Зачем:**
+- Deep-first созревание: глубокие слои (большой tau) открываются первыми
+- Предотвращает catastrophic interference
+- Bridge readiness: компетентность bridge определяет готовность
+
+**Зависимости:**
+- **Bridge** — readiness от cosine loss bridge probe
+- **VSA tau ladder** — tau_norm для определения порядка открытия
+- **Все компоненты** — maturation гейтирует их активность
+
+**Ключевые параметры:**
+- `matur_T0=8000` — начало ramp
+- `matur_T_delay=8000` — задержка deepest layers
+- `matur_delta=4000` — ширина ramp
+- `matur_r0=0.3` — readiness sigmoid center
+
+---
+
+#### 4. StreamingMemoryBank (Иерархическая память L1→L2→L3)
+**Файл:** `core/memory_bank.py`
+
+**Что делает:** Три уровня памяти:
+- **L1 (immediate):** rolling buffer of last K sentence embeddings (без обучения)
+- **L2 (short-term):** learned bank with N slots, novelty-based write gating
+- **L3 (emergent concepts):** clusters L2 keys by cosine similarity, concept birth/update
+
+**Зачем:**
+- L1: имmediate контекст (последние предложения)
+- L2: краткосрочная память (выученные ассоциации)
+- L3: долгосрочная паметь (эмерджентные концепты)
+
+**Зависимости:**
+- **Maturation** — записи gated by mat_gate[i] >= 0.3
+- **Per-layer** — memory bank вызывается внутри цикла слоёв
+
+**Ключевые параметры:**
+- `mem_l1_slots=3` — L1 buffer size
+- `mem_l2_slots=16` — L2 bank size
+- `mem_l3_concepts=8` — L3 concept slots
+- `mem_min_write_mat=0.3` — min maturation для записей
+
+---
+
+#### 5. ThinkingTokenHead (Адаптивное мышление)
+**Файл:** `core/reasoning.py`
+
+**Что делает:** Chain-of-thought reasoning с adaptive depth. Thinking tokens генерируются динамически, gate определяет когда остановиться.
+
+**Зачем:**
+- Модель может "думать" дольше на сложных задачах
+- Adaptive depth: не все токены требуют одинаковой глубины
+- Self-supervised: reasoning gate обучается предсказывать.stop
+
+**Зависимости:**
+- **Maturation** — reasoning gate может быть gated maturation
+- **Bridge** — reasoning context влияет на bridge
+
+**Ключевые параметры:**
+- `reasoning_max_steps=8` — max reasoning depth
+- `reasoning_gate_stop_threshold=0.5` — stop threshold
+
+---
+
+#### 6. HybridHead (Гибридная голова)
+**Файл:** `core/embedding.py`
+
+**Что делает:** `output = sigmoid(x) * (1 + softmax(x))` — выпуклая комбинация sigmoid и softmax.
+
+**Зачем:**
+- Sigmoid сохраняет лакуну (потенциал несовпавшего)
+- Softmax добавляет нормализованную конкуренцию
+- "Демократия с лидером": softmax = лидер, sigmoid = народ
+
+**Зависимости:**
+- **Bind** — выход head связан с embedding через tie_weights
+
+---
+
+#### 7. IntentBridge (Мост намерения)
+**Файл:** `core/stack.py` (внутри forward)
+
+**Что делает:** Per-head intent stream (G×K_max), flows through depth (per-layer) and time (EMA). Experts "подхватывают" восходящий сигнал.
+
+**Зачем:**
+- Связывает "намерение" модели с её конкретными действиями
+- Глубокие слои видят intent от мелких
+- Cross-layer bus: network-wide gist
+
+**Зависимости:**
+- **Maturation** — intent bus gated by mat_gate[i]
+- **Bridge** — parallel semantic stream
+
+---
+
+#### 8. LayerBridgeGate + SpectrumGate
+**Файл:** `core/layer_bridge_gate.py`
+
+**Что делает:** Per-layer intelligent gate для bridge routing. SpectrumGate = `sigmoid(logits) * (1 + softmax(logits/tau))`.
+
+**Зачем:**
+- Независимая активация по признакам (sigmoid)
+- Относительный акцент среди признаков (softmax)
+- tau связывает с maturation (self-regulation)
+
+**Зависимости:**
+- **Maturation** — tau из maturation gate
+- **Bridge** — gate управляет bridge injection
+- **Diagnostics** — per-layer health metrics
+
+---
+
+### Поток данных (forward pass)
+
+```
+tokens → PartitionedEmbedding → [RoPE] → h
+    ↓
+Memory Bank (per-layer, maturation-gated)
+    ↓
+Intent Bridge (per-layer, maturation-gated)
+    ↓
+[Layer 0] SemanticBridge.inject_layer(0, h)
+    ↓
+GroupedCognitiveMirror (32 experts, PrecisionGate)
+    ↓
+BridgeGLU (semantic delta → MLP gate)
+    ↓
+MLP (SwiGLU, maturation-gated)
+    ↓
+LayerBridgeGate → SpectrumGate
+    ↓
+[Layer 1..23] (repeat)
+    ↓
+SigmoidCodedHead → logits
+    ↓
+compute_loss (CE + aux losses)
+```
+
+### Tau-иерархия (связи между компонентами)
+
+```
+VSA tau ladder (τ_min=8..τ_max=515)
+    ↓
+Maturation tau_norm (normalize tau to [0,1])
+    ↓
+Maturation gate M_l(t) per layer
+    ↓
+┌─────────────────────────────────────────┐
+│ Bridge injection (gated by M_l)        │
+│ Private memory write (gated by M_l)    │
+│ Intent bus (gated by M_l)              │
+│ LayerBridgeGate (tau = M_l)            │
+│ BridgeGLU (modulated by bridge delta)  │
+│ Memory Bank (gated by M_l per-layer)   │
+└─────────────────────────────────────────┘
+```
+
+### Aux losses (вспомогательные функции потерь)
+
+| Loss | Weight | Purpose |
+|------|--------|---------|
+| CE | 1.0 | Main language modeling |
+| bridge_conn | 0.1 | Bridge next-token prediction |
+| ranking | 0.01 | Expert gate ordering |
+| diversity | 0.001 | Decorrelate expert outputs |
+| balance | 0.026 | Load balancing across experts |
+| gate_repulse | 0.3 | Push gate variance up |
+| alpha_novelty | 0.05 | Push per-expert alpha apart |
+| reinforce | 0.001 | Align gate with usefulness |
+| gradalign | 0.0 | Align MLP gate with CE gradient |
+
+### Современное состояние
+
+- **Step:** 466 (Colab запущен)
+- **Val:** 11.0132@466
+- **Memory Bank:** активен, maturation-gated (L1=0 при mat<0.3)
+- **Bridge:** stable, bridge_conn ~0.1
+- **Maturation:** deep-first работает (L23 opens first)
+
+---
