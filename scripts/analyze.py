@@ -240,7 +240,7 @@ def _grouped_param_stats(model):
 REF_STEP = 1398
 W_STD_REF = 0.0705
 DECAY_RATE = 1.6e-6
-EMPTY_SLOT_LAYERS = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
+EMPTY_SLOT_LAYERS = set()  # dynamic: populated from model at runtime
 SIG = {'PASS': 'PASS ', 'WATCH': 'WATCH', 'WAKE': 'WAKE '}
 
 
@@ -316,12 +316,13 @@ def run_wake(model, ckpt):
                                                           key=lambda t: -t[1])[:3]],
                  f'concept-birth (режим Б): mean {bmean:.4f} (спит если ~0)')
 
-    births = [i for i in EMPTY_SLOT_LAYERS if i in slot_occ and slot_occ[i] > 0]
+    empty_layers = {i for i, o in slot_occ.items() if o == 0}
+    births = [i for i in empty_layers if i in slot_occ and slot_occ[i] > 0]
     full = [i for i, o in slot_occ.items() if o >= 8]
     report.append(f'  slots occupied: {sum(slot_occ.values())}/192, full layers: {len(full)}, '
-                  f'births in empty: {births}')
+                  f'empty layers: {sorted(empty_layers)}, births in empty: {births}')
     _verdict(report, 'WAKE' if births else 'PASS', [],
-             f'slot births in empty layers L10-23: {births or "none"}')
+             f'slot births in empty layers: {births or "none"}')
     if temp_vals:
         t_mean = sum(temp_vals) / len(temp_vals)
         report.append(f'  _temp mean={t_mean:.3f}')
