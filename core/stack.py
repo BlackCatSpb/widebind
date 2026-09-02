@@ -1129,8 +1129,9 @@ class WideBindStack(nn.Module):
         if self.memory_bank is not None:
             try:
                 _mbd = self.memory_bank.get_diagnostics()
-                self._cached_losses['mb_l1_merges'] = _mbd['l1_merges']
-                self._cached_losses['mb_l2_merges'] = _mbd['l2_merges']
+                self._cached_losses['mb_l1_overwrites'] = _mbd['l1_overwrites']
+                self._cached_losses['mb_l2_overwrites'] = _mbd['l2_overwrites']
+                self._cached_losses['mb_l2_consumed'] = _mbd['l2_consumed']
                 self._cached_losses['mb_l3_births'] = _mbd['l3_n_births']
                 self._cached_losses['mb_l3_updates'] = _mbd['l3_n_updates']
                 self._cached_losses['mb_scale'] = _mbd['mem_scale']

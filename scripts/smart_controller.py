@@ -14,7 +14,7 @@ SmartController сам подбирает параметры генерации 
 Режимы: exploit / explore / confused / reason / recover-rep / recover-collapse.
 Используется из scripts/generate.py (флаг --smart) и scripts/smart_infer.py.
 """
-import os, sys, math, inspect, torch
+import os, sys, math, torch
 import torch.nn.functional as F
 from core import WideBindStack
 
@@ -58,6 +58,7 @@ class SmartController:
         self.temp_lo += bias
         self.temp_hi += bias
         self.trust_thr = min(max(0.25 + self.tau_norm * 0.5, 0.1), 0.95)
+        self.alarm_window_base = self.alarm_window
 
     def _compute_tau(self, model):
         """Per-layer VSA long-timescale tau_l (stack.py:219) -> темпоральный профиль.
@@ -196,9 +197,11 @@ class SmartController:
 
 @torch.no_grad()
 def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
-                   set_reason=True, no_trunc=False):
+                   set_reason=True, no_trunc=False, allow_write=None,
+                   context_mem=None, reset_reasoning=False):
     """Генерация под управлением SmartController. set_reason=True -> переключает
-    model.reasoning_scale_override перетокеново (по решению контроллера)."""
+    model.reasoning_scale_override перетокеново (по решению контроллера).
+    allow_write=True -> разрешает записи в memory bank. context_mem -> внешний контекст."""
     from scripts.generate import load_russian_tokenizer
     controller.no_trunc = no_trunc
     model.eval()
@@ -211,28 +214,25 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
     state = None
     rb = None
     head = model.lm_head
-    tb = getattr(head, 'token_bias', None)   # per-token learned prior (Protected)
-    try:
-        h_emb_ok = 'h_emb' in inspect.signature(head.forward).parameters
-    except Exception:
-        h_emb_ok = False
+    tb = getattr(head, 'token_bias', None)
 
     out_ids = list(ids)
     n = len(model.layers)
     for step in range(max_new_tokens):
         ctx = tokens[-L:].unsqueeze(0)
         h = model.embed_tokens(ctx)
+        if reset_reasoning:
+            model.reset_reasoning()
+            rb = None
         out, state, _, rb = model(h, state, adaptive=False,
-                                  context_mem=None, allow_write=None, step=step,
+                                  context_mem=context_mem, allow_write=allow_write,
+                                  step=step,
                                   reasoning_buffer=rb[0] if rb is not None else None,
-                                  reasoning_count=rb[1] if rb is not None else None)
-        if h_emb_ok:
-            logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
-        else:
-            logits = head(out[:, -1:, :])[0, 0]
+                                  reasoning_count=rb[1] if rb is not None else None,
+                                  tokens=ctx)
+        model.observe_output(out)
+        logits = head(out[:, -1:, :])[0, 0]
         if not torch.isfinite(logits).all():
-            # model diverged to NaN/Inf (hot output regime); break recurrent
-            # blow-up by resetting state/memory and using flat logits.
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
             state = None
             rb = None
@@ -266,8 +266,10 @@ def smart_generate(model, prompt, controller, max_new_tokens=64, rep_window=8,
             logits = (logits - tb) + alpha * tb   # адаптивный bias_alpha
         nt = controller.sample(logits, temp, top_p, top_k, rep_pen)
         controller.recent.append(nt)
-        if len(controller.recent) > controller.rep_window + controller.rep_ngram:
-            controller.recent.pop(0)
+        max_recent = max(controller.rep_window + controller.rep_ngram,
+                         controller.alarm_window)
+        if len(controller.recent) > max_recent:
+            controller.recent = controller.recent[-max_recent:]
         out_ids.append(nt)
         tokens = torch.cat([tokens, torch.tensor([nt], dtype=torch.long, device=device)])
     return det(out_ids), controller.decisions

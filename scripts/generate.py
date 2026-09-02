@@ -3,7 +3,7 @@ WideBind text generation.
 Uses HuggingFace tokenizer from the training data directory.
 """
 
-import os, sys, math, torch, json, inspect
+import os, sys, math, torch, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch.nn.functional as F
 from tokenizers import Tokenizer
@@ -197,13 +197,9 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
     
     mind_log = []
     
-    recent = set()
+    recent = []
     head = model.lm_head
-    tb = head.token_bias.data
-    try:
-        h_emb_ok = 'h_emb' in inspect.signature(head.forward).parameters
-    except (TypeError, ValueError):
-        h_emb_ok = False
+    tb = getattr(head, 'token_bias', None)
     for step in range(max_new_tokens):
         ctx = tokens[-L:].unsqueeze(0)
         
@@ -215,7 +211,8 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
                                   context_mem=context_mem, allow_write=allow_write,
                                   step=step,
                                   reasoning_buffer=rb[0] if rb is not None else None,
-                                  reasoning_count=rb[1] if rb is not None else None)
+                                  reasoning_count=rb[1] if rb is not None else None,
+                                  tokens=ctx)
         model.observe_output(out)  # salience of THIS step -> next step's intent
         
         if show_mind and step % 10 == 0:
@@ -227,11 +224,8 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
                       f'w_help={info.get("w_help",0):.4f} '
                       f'trust_diag={info.get("trust_diag_mean",0):.4f}')
         
-        if h_emb_ok:
-            logits = head(out[:, -1:, :], h[:, -1:, :])[0, 0]
-        else:
-            logits = head(out[:, -1:, :])[0, 0]
-        if bias_alpha != 1.0:
+        logits = head(out[:, -1:, :])[0, 0]
+        if tb is not None and bias_alpha != 1.0:
             logits = (logits - tb) + bias_alpha * tb
         if not torch.isfinite(logits).all():
             # model diverged to NaN/Inf (hot output regime); reset recurrent
@@ -251,7 +245,9 @@ def generate(model, prompt, max_new_tokens=128, temperature=1.0, top_k=50,
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, 1)
         
-        recent.add(next_token.item())
+        recent.append(next_token.item())
+        if len(recent) > rep_window:
+            recent.pop(0)
         tokens = torch.cat([tokens, next_token], dim=0)
     
     if show_mind and mind_log:
