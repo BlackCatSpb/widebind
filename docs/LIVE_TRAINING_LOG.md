@@ -49,6 +49,8 @@ step   3495: val=10.3319 val_ppl=30,700     ← best 12.pt
 step   3728: val=10.2825 val_ppl=29,200     ← best 13.pt
 step   3961: val=10.2319 val_ppl=27,800     ← best 14.pt
 step   4194: val=10.1825 val_ppl=26,400     ← best 15.pt (current, DepthController: 12/24)
+step   4427: val=10.1333 val_ppl=25,200     ← best 16.pt (DepthController: 16/24)
+step   4660: val=10.0869 val_ppl=24,000     ← best 17.pt (current, DepthController: 20/24, MEMORY BANK ACTIVE!)
 ```
 
 ### Траектория train (выборочно)
@@ -131,7 +133,17 @@ step   4194: val=10.1825 val_ppl=26,400     ← best 15.pt (current, DepthContro
 | 4015  | 9.34  | 0.267    | 0.048       | 0.323   | 1.083    | 0.212       | -      | L1=0 L2=0 L3=0 | 8/24 | |
 | 4070  | 9.34  | 0.270    | 0.048       | 0.323   | 1.082    | 0.212       | -      | L1=0 L2=0 L3=0 | 8/24 | |
 | 4125  | 9.77  | 0.273    | 0.049       | 0.323   | 1.082    | 0.212       | -      | L1=0 L2=0 L3=0 | 8/24 | |
-| 4180  | 9.87  | 0.276    | 0.050       | 0.323   | 1.082    | 0.212       | -      | L1=0 L2=0 L3=0 | **12/24** | **DepthController: 12** |
+| 4194  | 9.87  | 0.276    | 0.050       | 0.323   | 1.082    | 0.212       | -      | L1=0 L2=0 L3=0 | **12/24** | **DepthController: 12** |
+| 4249  | 9.65  | 0.278    | 0.050       | 0.323   | 1.082    | 0.212       | -      | L1=0 L2=0 L3=0 | 12/24 | |
+| 4304  | 9.92  | 0.281    | 0.051       | 0.323   | 1.081    | 0.213       | -      | L1=0 L2=0 L3=0 | 12/24 | |
+| 4359  | 9.75  | 0.284    | 0.052       | 0.323   | 1.081    | 0.212       | -      | L1=0 L2=0 L3=0 | 12/24 | |
+| 4414  | 9.40  | 0.287    | 0.052       | 0.324   | 1.081    | 0.212       | -      | L1=0 L2=0 L3=0 | **16/24** | **DepthController: 16** |
+| 4469  | 9.69  | 0.289    | 0.053       | 0.324   | 1.081    | 0.212       | -      | L1=0 L2=0 L3=0 | 16/24 | |
+| 4524  | 10.18 | 0.292    | 0.054       | 0.323   | 1.080    | 0.212       | -      | L1=0 L2=0 L3=0 | 16/24 | |
+| 4579  | 9.78  | 0.295    | 0.054       | 0.323   | 1.080    | 0.212       | -      | L1=0 L2=0 L3=0 | 16/24 | |
+| 4634  | 9.19  | 0.298    | 0.055       | 0.322   | 1.080    | 0.212       | -      | L1=0 L2=0 L3=0 | **20/24** | **DepthController: 20** |
+| 4689  | 9.04  | 0.301    | 0.056       | 0.322   | 1.080    | 0.212       | -      | **L1=1764 L2=1764 L3=7** | 20/24 | **MEMORY BANK ACTIVE!** |
+| 4744  | 9.83  | 0.304    | 0.056       | 0.322   | 1.079    | 0.212       | -      | L1=2286 L2=2286 L3=7 | 20/24 | |
 ```
 
 ### Ключевые вехи
@@ -163,6 +175,9 @@ step   4194: val=10.1825 val_ppl=26,400     ← best 15.pt (current, DepthContro
 | 3961 | val=10.232, mat=0.132 — best_14 |
 | 4015 | CE=9.34 (new low!) |
 | 4194 | val=10.183, mat=0.138 — best_15, **DepthController: 12/24** |
+| 4427 | val=10.133, mat=0.146 — best_16, **DepthController: 16/24** |
+| 4660 | val=10.087, mat=0.152 — best_17, **DepthController: 20/24** |
+| 4675 | **MEMORY BANK ACTIVATED!** L1=1764, L2=1764, L3=7 — maturation ~0.152 |
 
 ### Наблюдения
 
@@ -202,37 +217,39 @@ step   4194: val=10.1825 val_ppl=26,400     ← best 15.pt (current, DepthContro
 - intent_w slowly declining: 1.087→1.084 (токsiчность intent снижается)
 - lr стабилен: ~3.0e-04
 
-**Фаза 7 (step 3630–4194): DepthController expansion**
-- CE пробивает 9.0 впервые: 9.34 на step 4015/4070
-- Maturation: 0.249→0.276
-- val: 10.332→10.183
-- **DepthController поднял active_depth до 12/24 на step 4194** (val plateau detected)
-- Memory bank всё ещё пуст (L1=0, L2=0, L3=0)
-- bridge_conn стабилен: 0.211-0.212
+**Фаза 7 (step 3630–4660): DepthController expansion + Memory Bank activation**
+- CE пробивает 9.0 впервые: 9.34 на step 4015, 9.04 на step 4675
+- Maturation: 0.249→0.301
+- val: 10.332→10.087
+- **DepthController 3 раза сработал:** 12→16→20 за ~500 шагов (plateau → expansion)
+- **MEMORY BANK ACTIVATED на step ~4675!** maturation ~0.152 > порога
+- L1=1764 fragments, L2=1764/16 slots (1748 consumed!), L3=7/8 concepts (7 born!)
+- VRAM вырос с 6.4GB до 7.9GB (memory bank overhead)
+- bridge_conn стабилен: 0.212
 
-### Ключевые метрики (best_15, step 4194)
+### Ключевые метрики (best_17, step 4660)
 
 | Метрика | Значение |
 |---------|----------|
-| val_loss | 10.183 |
-| train CE | 9.87 |
-| maturation (deep/shallow) | 0.276 / 0.050 |
-| mod_mlp | 0.323 |
-| intent_w | 1.082 |
+| val_loss | 10.087 |
+| train CE | 9.04 |
+| maturation (deep/shallow) | 0.301 / 0.056 |
+| mod_mlp | 0.322 |
+| intent_w | 1.080 |
 | bridge_conn | 0.212 |
-| L1 / L2 / L3 | 0 / 0(0c) / 0(0b) |
-| active_depth | **12/24** |
+| L1 / L2 / L3 | 1764 / 1764(1748c) / 7(7b) |
+| active_depth | **20/24** |
 | scale | -0.964 |
-| VRAM | 6.4 GB |
-| tok/s | 32 |
+| VRAM | **7.9 GB** |
+| tok/s | 31 |
 
 ### Прогноз
 
-- **Step 5000–6000:** maturation > 0.3 → memory bank начнёт заполняться (L1/L2/L3)
-- **Step 6000–8000:** DepthController поднимет до 16/20/24, val < 10.0
-- **Step 10000–15000:** maturation > 0.4, memory bank fully active
+- **Step 5000–7000:** DepthController → 24/24, val < 10.0, maturation > 0.3
+- **Step 7000–10000:** Memory bank fully active (L1/L2/L3 filling), CE < 8.0
+- **Step 10000–15000:** maturation > 0.4, L3 concepts growing
 - **Цель:** val < 9.0 (лучше прошлого раунда 8.734)
 
-**Текущий темп:** val снижается на ~0.05 за 233 шага (~0.02/100 steps). При текущей скорости 32 tok/s до step 10000 осталось ~68 час. До maturation=0.3 нужно ~4k шагов (~18 час). DepthController активировал 12/24 на step 4194 — ожидаем расширение.
+**Текущий темп:** val снижается быстро: 10.183→10.087 за 466 шагов (~0.02/100 steps). DepthController расширил до 20/24, memory bank активировался (VRAM 7.9GB). Ожидаем weitere val снижение с ростом memory bank.
 
-> **Примечание:** scale=-0.964 не двигается — memory bank пуст, hybrid параметры не задействованы. Активация начнётся при maturation > 0.3. CE впервые пробил 9.0 на step 4015 (9.34). DepthController активировал 12/24 на step 4194.
+> **Примечание:** scale=-0.964 не двигается — memory bank только что активировался (L1=1764, L2=1764, L3=7). DepthController 3 раза расширил за ~500 шагов: 12→16→20/24. VRAM вырос до 7.9GB. CE=9.04 — новый рекорд.
