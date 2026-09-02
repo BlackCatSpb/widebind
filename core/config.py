@@ -301,6 +301,7 @@ class WideBindConfig:
     mem_bridge_dim: int = 256       # memory bank bridge dim (matches bridge_dim)
     mem_l1_consolidate_sim: float = 0.85  # L1: cosine sim threshold for merge (vs overwrite)
     mem_l2_consolidate_sim: float = 0.80  # L2: cosine sim threshold for merge (vs overwrite)
+    concept_birth_novelty_threshold: float = 0.15  # birth only if d_min > threshold (best_sim < 1-threshold)
 
     # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
     # Все точки комбинации смыслов используют нормированное сигмоид-среднее

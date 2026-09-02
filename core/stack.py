@@ -1275,6 +1275,9 @@ class WideBindStack(nn.Module):
             'act': float(sum(l.collective.U_s.mean().item() for l in cols) / len(cols)),
             'occ': float(sum((l.collective.U_s > 0.01).float().mean().item() for l in cols) / len(cols)),
             'last_write_step': max(l.collective._last_write_step for l in cols),
+            'births_allowed': int(sum(l.collective._births_allowed for l in cols)),
+            'births_skipped_novelty': int(sum(l.collective._births_skipped_novelty for l in cols)),
+            'novelty_threshold': cols[0].collective._novelty_threshold,
         }
         return out
     

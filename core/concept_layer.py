@@ -28,6 +28,7 @@ class CollectiveConceptLayer(nn.Module):
         seed: int = 0,
         cfg=None,
         softmax_free=None,
+        novelty_threshold: float = 0.15,
     ):
         super().__init__()
         self.cfg = cfg
@@ -42,6 +43,9 @@ class CollectiveConceptLayer(nn.Module):
         self._contra_gain = float(contra_gain)
         self._birth_gap = float(birth_gap)
         self._maturity_thresh = float(maturity_thresh)
+        self._novelty_threshold = float(novelty_threshold)
+        self._births_skipped_novelty = 0
+        self._births_allowed = 0
         # Рождение концепта (горизонт событий, режим Б): sigmoid(-1)~0.27,
         # растёт если проекция потенциала помогает CE.
         self._birth_log_scale = nn.Parameter(torch.tensor(-1.0))
@@ -150,8 +154,15 @@ class CollectiveConceptLayer(nn.Module):
         if can_birth:
             birth_thresh = conf.quantile(0.25).clamp(min=0.01)
             empty = torch.nonzero(self.N_s == 0)
-            novel = (d_min > self._birth_gap * 0.2) & (conf >= birth_thresh)
+            # Novelty gate: birth only if max dist to existing concepts > threshold
+            # (i.e., best cosine similarity < 1 - threshold)
+            novel = (d_min > self._novelty_threshold) & (conf >= birth_thresh)
+            # Track skipped births for diagnostics
+            birth_candidates = (conf >= birth_thresh)
+            if birth_candidates.any() and not novel.any():
+                self._births_skipped_novelty += birth_candidates.sum().item()
             if novel.any():
+                self._births_allowed += novel.sum().item()
                 write_event |= novel
                 if empty.numel() > 0:
                     idx = empty[0].item()
@@ -254,3 +265,15 @@ class CollectiveConceptLayer(nn.Module):
     def birth_gate_mean(self):
         """Средний вес рождения концепта (проекция горизонта событий). 0 = спит."""
         return self._cached_birth_gate
+
+    @torch.no_grad()
+    def get_diagnostics(self):
+        """Return concept layer diagnostics."""
+        return {
+            'births_allowed': self._births_allowed,
+            'births_skipped_novelty': self._births_skipped_novelty,
+            'novelty_threshold': self._novelty_threshold,
+            'mature': self._mature.item(),
+            'n_slots_used': int((self.N_s > 0).sum().item()),
+            'n_slots_total': self.S,
+        }

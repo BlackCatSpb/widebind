@@ -195,6 +195,7 @@ class WideBindBlock(nn.Module):
                 seed=7 * (layer_idx + 1),
                 cfg=cfg,
                 softmax_free=getattr(cfg, 'softmax_free', True),
+                novelty_threshold=getattr(cfg, 'concept_birth_novelty_threshold', 0.15),
             )
     
     def forward(self, h, state=None, global_state=None,
