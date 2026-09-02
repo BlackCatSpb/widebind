@@ -135,7 +135,7 @@ K×V с попарными оценками), здесь генерация лю
 | Параметр | **Mini** | **Большая (обучаемая)** | **Большая XL** |
 |---|---|---|---|
 | Назначение | ноутбучная, десктоп | эталонная, T4 | максимальная (24GB+) |
-| **Параметров** | ~45.3M | **≈191.4M** (BridgeGLU+intent_bridge+reasoning+коллектив+когерентность + in-core SemanticBridge + memory bank L1/L2/L3; +~1.3M aux-head в обучении) | ~165.6M (16L) / ~330.4M (32L) |
+| **Параметров** | ~45.3M | **≈191.4M** (BridgeGLU+intent_bridge+reasoning+коллектив+когерентность + in-core SemanticBridge + memory bank L1/L2/L3) | ~165.6M (16L) / ~330.4M (32L) |
 | D (hidden) | 896 | 2560 | 4096 |
 | n_layers | 24 (4–24 в тестах) | 24 | 16 (T4‑16GB) / 32 (24GB+) |
 | Слоёв на T4‑16GB | 24 | 24 | 16 |
@@ -152,11 +152,11 @@ K×V с попарными оценками), здесь генерация лю
 - **Большая (обучаемая)** — активный контур:
    `D=2560, G=32, n_layers=24, vocab=65536, bind_K=32` (см. канонический
    ноутбук `notebooks/colab.ipynb`), **точное число параметров
-   146,669,297 (146.67M)** при `intent_bridge=True, bridge_glu=True,
+   191,372,273 (191.37M)** при `intent_bridge=True, bridge_glu=True,
    explicit_reasoning=True, collective_read_out=True, variable_precision=True,
    bridge_conn=0.1, memory_bank=True` — включая +K каналов когерентности спиралей (W_out хвост),
    BridgeGLU (~0.92M), **in-core SemanticBridge** (разделяемая per-layer probe
-   + proj, ≈2.0M, см. §5.11.2; параметры живут внутри модели) и **Streaming Memory Bank** (L1+L2+L3, ≈0.54M, см. §15); **итого ≈ 146.7M**
+   + proj, ≈2.0M, см. §5.11.2; параметры живут внутри модели) и **Streaming Memory Bank** (L1+L2+L3, ≈0.54M, см. §15); **итого ≈ 191.4M**
    обучаемых параметров. Актуальный тренировочный контур
    (`notebooks/colab.ipynb`, Colab T4, fp32):
 
@@ -1150,9 +1150,9 @@ cfg = WideBindConfig(
 
 | Метрика | Без memory bank | С memory bank |
 |---|---|---|
-| Params | 146.1M | 146.6M (+0.37%) |
-| VRAM | ~5.9 GB | ~5.9 GB (minimal) |
-| Speed | ~43 tok/s | ~43 tok/s |
+| Params | ~190.8M | ~191.4M (+0.3%) |
+| VRAM | ~7.0 GB | ~7.5 GB |
+| Speed | ~34 tok/s | ~32 tok/s |
 
 ### Diagnostics в логе
 
@@ -1247,7 +1247,7 @@ cfg = WideBindConfig(D=2560, n_layers=24, bind_K=32, vocab=65536,
                      memory_bank=True,  # L1+L2+L3 streaming memory
                      mem_l1_slots=3, mem_l2_slots=16, mem_l3_concepts=8)
 model = WideBindStack(cfg).to('cuda')
-print(model.param_count())   # 146,669,297 (146.67M; +0.54M memory bank)
+print(model.param_count())   # 191,372,273 (191.37M)
 ```
 
 Полные конфиги — в ноутбуках `notebooks/*.ipynb`.
@@ -1350,6 +1350,14 @@ gate = sigmoid(logits) * (1 + softmax(logits / tau))
 - **tau** — параметр гибрида: `tau → ∞` = softmax доминирует (diversity),
   `tau → 0` = sigmoid доминирует (precision).
 
+**Hybrid attention везде (коммит `a043ce3`):** гибридный gate распространён на
+все компоненты: `_memory_attention()`, cascade mixing, manifold beam read.
+Ключевой принцип: **точность в многобразии без потери многообразия** — sigmoid
+поддерживает покрытие manifold (все слои активны), softmax добавляет
+дифференцируемый фокус на важных слоях. Результат — равномерное
+распределение градиента по всем 24 слоям (gate variance min=0.008,
+W_std dev worst = +0.00038).
+
 **Self-regulation через maturation:**
 
 ```
@@ -1365,8 +1373,8 @@ effective_tau = tau_max * (1 - maturation) + tau_min * maturation
 LayerBridgeGate возвращает **uniform weights** (простое per-layer maturation
 gating). После — полный SpectrumGate с per-layer tau-driven diversity.
 
-Результат (обучение step 0→1631): bridge_conn стабилен 0.097 (vs 0.056 на
-старом коде), val 10.84→10.69, gradalign 19→23.
+Результат (fresh start 3, step 0→2097): val 11.07→10.64, CE(random) 68→25,
+maturation 0.055→0.088, все слои равномерно активны.
 
 ### 17.3 Triad: Рассудок как участник (замыкание Триады)
 
@@ -1389,12 +1397,16 @@ gating). После — полный SpectrumGate с per-layer tau-driven divers
 ## 19. Текущий статус обучения
 
 Актуальный контрольный контур — `notebooks/colab.ipynb` (Colab T4, fp32,
-`use_amp=False`). **Перезапуск с per-layer maturation** (коммит `a735ac0`):
-deep-слои (tau≈515) открываются быстрее (T_eff=8000), shallow-слои (tau≈8)
-медленнее (T_eff=16000). Monotonic → математически стабильно. Global readiness:
-`global_ready=True` когда ВСЕ слои M_l > 0.1 (step ~8000). До этого — simple
-maturation gating; после — full SpectrumGate с per-layer tau-driven diversity
-(§18.2).
+`use_amp=False`). **Fresh start 3** — новый запуск с нуля после унификации
+hybrid attention (sigmoid × softmax) во всех компонентах.
+
+**Ключевые изменения архитектуры:**
+- **Hybrid attention везде** — `_memory_attention()`, cascade mixing, manifold beam read: `gate = sigmoid(scores) * (1 + softmax(scores/tau))`
+- `log_temp` → `log_tau` (единое имя параметров в memory_bank.py)
+- L2 keys: `F.normalize() + sigmoid(key_log_scale)`
+- L2/L3 vals: `sigmoid(val_log_scale)`
+- Consumed tracking в L2 ring buffer
+- `analyze.py`: tokens param, torch.quantile subsampling, 72 unexpected keys handling, HTML report fixes
 
 **Конфигурация (Большая, обучаемая):**
 
@@ -1413,28 +1425,37 @@ maturation gating; после — full SpectrumGate с per-layer tau-driven dive
 | use_amp | False (fp32) |
 | maturation: T0 / T_delay / delta | 8000 / 8000 / 4000 |
 
-**Последний чекпоинт (`checkpoints/best.pt`):**
+**Последний чекпоинт (`checkpoints/best 4.pt`):**
 
 | Метрика | Значение |
 |---|---|
-| **val_loss** | **9.18** (step 9786) |
-| **val_ppl** | **9.71e+03** |
-| **CE** | 8.88 |
-| **Per-layer maturation** | 0.371 [0.173, 0.603] |
-| **L2 consumed** | 8782 (L3 кластеризует L2) |
-| **L3 births** | 4331 |
-| **Скорость** | ~23 tok/s |
-| **VRAM** | 11.1 GB |
+| **val_loss** | **10.644** (step 2097) |
+| **val_ppl** | **41,900** |
+| **CE(random)** | 25.42 |
+| **Maturation** | 0.088 |
+| **Slots** | 74/192 |
+| **Readiness** | 0.916 |
+| **Скорость** | ~32 tok/s |
+| **VRAM** | 7.5 GB |
 
-Траектория val (per-layer maturation, step 4427→10019):
-10.001 (4427) → 9.908 (4893) → 9.813 (5359) → 9.722 (5825) → 9.645 (6291) → 9.565 (6757) → 9.480 (7223) → 9.398 (7689) → 9.319 (8155) → *disruption #1 (8388=10.09)* → **9.265 (8621) → 9.247 (8854)** → *disruption #2 (9087=10.53)* → **9.221 (9320) → 9.212 (9553) → 9.204 (9786) → 9.194 (10019, текущий best)**.
+**Траектория val (fresh start 3, step 0→2097):**
+11.068 (233) → 11.012 (466) → 10.950 (699) → 10.894 (932) → 10.839 (1165) → 10.784 (1398) → 10.733 (1631) → **10.644 (2097, текущий best)**
 
-> ✅ **Per-layer maturation решила проблему bridge_conn collapse:** На старом коде (uniform maturation) bridge_conn коллапсировал до 0.001-0.08 в dynamic equilibrium. На новом коде bridge_conn стабилен 0.12→0.049 (step 4427→10019) — плавное снижение, мост постепенно становится компетентнее. Глубокие слои открываются быстрее, shallow сохраняют gradient → модель стабильнее.
+**Ключевые метрики по чекпоинтам:**
 
-**Замыкание Триады (triad_reason, §18.2):** при генерации ствол ре-циркулируется,
-если уверенность головы `_conf < 0.5` (до `triad_max_passes=3`), консервативный
-бленд `h = 0.5·h + 0.5·h2`. Только inference, новых параметров нет.
+| Checkpoint | Step | val_loss | CE(random) | maturation | slots |
+|---|---|---|---|---|---|
+| best_2 | 1165 | 10.839 | 68.32 | 0.071 | 64/192 |
+| best_3 | 1631 | 10.733 | 47.64 | 0.079 | 72/192 |
+| best_4 | 2097 | 10.644 | 25.42 | 0.088 | 74/192 |
 
-**Цель:** выйти к историческому рубежу `val ≈ 8.5` при сохранении устойчивого CE.
+**Наблюдения:**
+- CE(random) снижается ускоряющими темпами (68→47→25) — голова учится различать токены
+- Maturation растёт линейно (~0.000015/шаг) — до порога 0.3 нужно ~20k шагов
+- Слои обучаются равномерно — hybrid attention распределяет градиент
+- VRAM 7.5GB / 15GB — запас есть, но при полной активации (24 слоя + memory bank) будет впритык
+- Memory bank пуст — maturation ещё не достиг порога (ожидаемо, по дизайну)
+
+**Цель:** выйти к `val < 10.0` к step 3500-4000, `val < 9.0` к step 15000.
 
 *Замечания, вопросы и PR — приветствуются.*
