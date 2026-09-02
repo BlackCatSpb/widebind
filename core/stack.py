@@ -1244,16 +1244,12 @@ class WideBindStack(nn.Module):
                     p.register_hook(lambda grad, b=boost: grad * b)
                     n_applied += 1
             # Mirror cognitive gates — hybrid_gate (sigmoid+softmax) and mod_scale_mem.
-            # The hybrid_gate.log_tau controls the softmax temperature; boost it
-            # so deep gates can specialize faster.
-            gate_boost = boost * 3.0  # 3x extra for gate specialization
-            for p in (layer.mirror.hybrid_gate.log_tau, layer.mirror.mod_scale_mem):
-                if p.requires_grad:
-                    p.register_hook(lambda grad, b=gate_boost: grad * b)
-                    n_applied += 1
+            # No artificial boost: hybrid_gate learns at the same rate as other
+            # mirror parameters through normal backprop. Specialization is controlled
+            # by tau (softmax temperature), not gradient amplification.
         print(f'[mlp-boost] deep-MLP gradient x{math.exp(exp):.2f}/layer '
               f'(L0=1.0 .. L{len(self.layers)-1}={math.exp(exp*(len(self.layers)-1)):.1f}), '
-              f'hybrid_gate+mem extra x3 boost, {n_applied} params hooked')
+              f'{n_applied} params hooked')
 
 
     @torch.no_grad()
