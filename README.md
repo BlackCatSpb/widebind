@@ -1,6 +1,6 @@
 # WideBind — языковая модель без transformer
 
-**Векторная память (VSA) + Cognitive Mirror + GroupedMLP. D=2560, ~146M
+**Векторная память (VSA) + Cognitive Mirror + GroupedMLP. D=2560, ~191M
 параметров, 24 слоя. Без attention, без softmax-матриц, без KV-cache.**
 
 Память — это вектор (VSA-суперпозиция), а не матрица. Информация
@@ -12,7 +12,7 @@
   ┌───────────────────────────────────────────────────────────────┐
   │                     WideBind / EVA                            │
   │   VSA-память · Bind-скрещивание · Cognitive Mirror            │
-  │   D=2560 · ~146M params · 24 layers                           │
+  │   D=2560 · ~191M params · 24 layers                           │
   │   нет attention · нет softmax-матриц · без KV-cache           │
   └───────────────────────────────────────────────────────────────┘
 ```
@@ -135,7 +135,7 @@ K×V с попарными оценками), здесь генерация лю
 | Параметр | **Mini** | **Большая (обучаемая)** | **Большая XL** |
 |---|---|---|---|
 | Назначение | ноутбучная, десктоп | эталонная, T4 | максимальная (24GB+) |
-| **Параметров** | ~45.3M | **≈146.7M** (BridgeGLU+intent_bridge+reasoning+коллектив+когерентность + in-core SemanticBridge + memory bank L1/L2/L3; +~1.3M aux-head в обучении) | ~165.6M (16L) / ~330.4M (32L) |
+| **Параметров** | ~45.3M | **≈191.4M** (BridgeGLU+intent_bridge+reasoning+коллектив+когерентность + in-core SemanticBridge + memory bank L1/L2/L3; +~1.3M aux-head в обучении) | ~165.6M (16L) / ~330.4M (32L) |
 | D (hidden) | 896 | 2560 | 4096 |
 | n_layers | 24 (4–24 в тестах) | 24 | 16 (T4‑16GB) / 32 (24GB+) |
 | Слоёв на T4‑16GB | 24 | 24 | 16 |
@@ -143,7 +143,7 @@ K×V с попарными оценками), здесь генерация лю
 | bind_K (буферное K) | 32 | 32 | 64 |
 | vocab | 65536 | 65536 | 65536 |
 | seq_len (обучение) | 128–256 | 256 | 512 |
-| VRAM (обучение) | ~2 GB (MX550) | ~9–11 GB (T4) | 16–24 GB |
+| VRAM (обучение) | ~2 GB (MX550) | ~11 GB (T4/L4) | 16–24 GB |
 | VRAM (инференс) | ~0.5 GB | ~1–1.5 GB | ~2–3 GB |
 
 - **Mini** — десктопная версия `D=896, G=8`; отдельный репозиторий,
@@ -1104,16 +1104,17 @@ EMA `alpha_intent_l`. Глубокие слои (lf→1) получают бóл
 
 | Уровень | Назначение | Механизм | Слоты |
 |---|---|---|---|
-| **L1** | Immediate (последние 3 предложения) | Rolling buffer, sigmoid attention | 3 |
-| **L2** | Short-term (learned) | VSA-mediated, novelty gate | 16 |
+| **L1** | Immediate (последние 3 предложения) | Rolling buffer, overwrite oldest | 3 |
+| **L2** | Short-term (learned) | Ring buffer, overwrite oldest/consumed | 16 |
 | **L3** | Long-range (emergent concepts) | Кластеризация L2 keys, concept birth | 8 |
 
 ### Как работает
 
 1. **Write** — при boundary предложения (SEP token = 2):
-   - L1: round-robin запись sentence summary
-   - L2: novelty-gated запись (если novelty > 0.3)
+   - L1: overwrite oldest slot (быстро, O(1))
+   - L2: overwrite oldest or consumed slot (быстро, O(1))
    - L3: кластеризация L2 key → concept birth/update (cosine sim > 0.7)
+   - **L3 consumed tracking:** после concept birth/update L2 слот помечается как "consumed"
 
 2. **Read** — на каждом токене:
    - L1: sigmoid attention по буферу
@@ -1141,6 +1142,7 @@ cfg = WideBindConfig(
     mem_l3_concepts=8,        # L3 emergent concept slots
     mem_l3_birth_threshold=0.7,  # cosine sim for concept birth
     mem_bridge_dim=256,       # memory bank bridge dim
+    concept_birth_novelty_threshold=0.15,  # skip births if too similar
 )
 ```
 
@@ -1400,11 +1402,12 @@ maturation gating; после — full SpectrumGate с per-layer tau-driven dive
 |---|---|
 | D / слои / G / bind_K | 2560 / 24 / 32 / 32 |
 | vocab / seq_len (обуч.) | 65536 / 128 |
-| Параметров | 146,669,297 (146.67M; +0.54M memory bank) |
+| Параметров | 191,372,273 (191.37M) |
 | bridge_glu, intent_bridge, explicit_reasoning, reasoning_adaptive, collective_read_out, variable_precision, bind_twist_gate, maturation_enabled, triad_reason, memory_bank | True |
 | bridge_conn | 0.1 (вес aux) |
 | mem_l1_slots / mem_l2_slots / mem_l3_concepts | 3 / 16 / 8 |
 | mem_l3_birth_threshold | 0.7 (cosine sim for concept birth) |
+| concept_birth_novelty_threshold | 0.15 (skip births if too similar) |
 | pm_write_delay | 0 (игнорируется при maturation_enabled) |
 | mask_eos | False |
 | use_amp | False (fp32) |
@@ -1414,13 +1417,14 @@ maturation gating; после — full SpectrumGate с per-layer tau-driven dive
 
 | Метрика | Значение |
 |---|---|
-| **Лучший current run** | **10019** (val 9.194, per-layer maturation, отчёт `best 5_10019_report.html`). |
-| Лучший исторический | 15844 (val 8.7692, uniform maturation, отчёт `best_15844_report.html`). |
-| Per-layer maturation | L0=0.221, L23=0.736 (monotonic deep-first). |
-| `bridge_conn` (raw) | 0.049 (стабилен, нет коллапса). |
-| `intent_w` | 1.07 (bridge модуляция усиливается). |
-| Концепты | slots 120/192, full layers 15. |
-| Скорость / VRAM | ~28 tok/s на T4 / ~9.8 GB |
+| **val_loss** | **9.18** (step 9786) |
+| **val_ppl** | **9.71e+03** |
+| **CE** | 8.88 |
+| **Per-layer maturation** | 0.371 [0.173, 0.603] |
+| **L2 consumed** | 8782 (L3 кластеризует L2) |
+| **L3 births** | 4331 |
+| **Скорость** | ~23 tok/s |
+| **VRAM** | 11.1 GB |
 
 Траектория val (per-layer maturation, step 4427→10019):
 10.001 (4427) → 9.908 (4893) → 9.813 (5359) → 9.722 (5825) → 9.645 (6291) → 9.565 (6757) → 9.480 (7223) → 9.398 (7689) → 9.319 (8155) → *disruption #1 (8388=10.09)* → **9.265 (8621) → 9.247 (8854)** → *disruption #2 (9087=10.53)* → **9.221 (9320) → 9.212 (9553) → 9.204 (9786) → 9.194 (10019, текущий best)**.
