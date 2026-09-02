@@ -12,11 +12,12 @@ Architecture:
     - Selective: novelty-based write gating
     - Simple ring buffer: overwrite oldest (or consumed slot from L3)
     - Differentiable: gradients flow through write/read
+    - Keys normalized via F.normalize (sigmoid-weighted)
 
   L3 (concepts): emergent from L2 slot clustering
     - Cluster L2 keys by cosine similarity
     - Concept birth: when cluster confidence > threshold
-    - Concept update: running mean of cluster members
+    - Concept update: running mean of cluster members (sigmoid-weighted)
     - Read: attention over concepts (higher-level abstractions)
     - Long-range memory (tau ~ 500+)
     - CONSUMES L2 slots: when concept born, source L2 slot marked for overwrite
@@ -128,6 +129,9 @@ class L2Bank(nn.Module):
     Simple ring buffer: overwrite oldest or consumed slot.
     Fast, no cosine similarity checks.
     Consumed slots (from L3 concept birth) are prioritized for overwrite.
+    
+    Keys normalized via F.normalize + tau-based scaling (hybrid approach).
+    Values scaled via tau-based sigmoid (preserves magnitude info).
     """
     def __init__(self, D: int, bridge_dim: int, n_slots: int = 16):
         super().__init__()
@@ -151,6 +155,12 @@ class L2Bank(nn.Module):
         )
 
         self.log_temp = nn.Parameter(torch.tensor(1.0))
+        
+        # Tau-based scaling for keys/vals (hybrid approach)
+        # Keys: F.normalize + sigmoid(tau) for stable cosine similarity
+        # Vals: sigmoid(tau) for bounded magnitude preservation
+        self.key_log_scale = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
+        self.val_log_scale = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
 
         self.register_buffer('slot_age', torch.zeros(n_slots), persistent=True)
         self.register_buffer('slot_novelty', torch.ones(n_slots), persistent=True)
@@ -171,8 +181,14 @@ class L2Bank(nn.Module):
         n_filled = min(self._write_idx, self.n_slots)
 
         with torch.no_grad():
-            new_key = self.W_k(embedding.detach())
-            new_val = self.W_v(embedding.detach())
+            # Hybrid normalization: F.normalize + tau-based scaling
+            # Keys: normalized for stable cosine similarity in L3
+            raw_key = self.W_k(embedding.detach())
+            new_key = F.normalize(raw_key, dim=-1) * torch.sigmoid(self.key_log_scale)
+            
+            # Vals: tau-scaled to preserve magnitude info while staying bounded
+            raw_val = self.W_v(embedding.detach())
+            new_val = raw_val * torch.sigmoid(self.val_log_scale)
 
         if n_filled < self.n_slots:
             # Fill empty slot
@@ -237,6 +253,8 @@ class L2Bank(nn.Module):
             'fill_rate': min(self._write_idx, self.n_slots) / self.n_slots,
             'novelty_mean': self.slot_novelty.mean().item(),
             'consumed_count': int(self.slot_consumed.sum().item()),
+            'key_scale': torch.sigmoid(self.key_log_scale).item(),
+            'val_scale': torch.sigmoid(self.val_log_scale).item(),
         }
 
     def reset(self) -> None:
@@ -268,6 +286,8 @@ class L3Concepts(nn.Module):
 
     CONSUMES L2 slots: when concept is born/updated, the source L2 slot
     is marked as consumed (for cleanup in L2).
+    
+    Values normalized via F.normalize + tau-based scaling (hybrid approach).
     """
     def __init__(self, D: int, bridge_dim: int, n_concepts: int = 8,
                  birth_threshold: float = 0.7, update_momentum: float = 0.1):
@@ -288,6 +308,10 @@ class L3Concepts(nn.Module):
 
         # Temperature
         self.log_temp = nn.Parameter(torch.tensor(1.0))
+        
+        # Tau-based scaling for concept values (hybrid approach)
+        # Vals: F.normalize + sigmoid(tau) for stable representation
+        self.val_log_scale = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
 
         # Tracking
         self.register_buffer('concept_age', torch.zeros(n_concepts), persistent=True)
@@ -321,8 +345,9 @@ class L3Concepts(nn.Module):
             alpha = self._update_momentum
             self.concept_keys.data[best_idx] = F.normalize(
                 self.concept_keys.data[best_idx] * (1 - alpha) + l2_key * alpha, dim=-1)
-            self.concept_vals.data[best_idx] = (
-                self.concept_vals.data[best_idx] * (1 - alpha) + l2_key * alpha)
+            # Hybrid normalization for concept_vals: F.normalize + tau-based scaling
+            raw_val = self.concept_vals.data[best_idx] * (1 - alpha) + l2_key * alpha
+            self.concept_vals.data[best_idx] = F.normalize(raw_val, dim=-1) * torch.sigmoid(self.val_log_scale)
             self.concept_count.data[best_idx] += 1
             self.concept_confidence.data[best_idx] = (
                 self.concept_confidence.data[best_idx] * 0.9 + best_sim * 0.1)
@@ -343,7 +368,8 @@ class L3Concepts(nn.Module):
 
         # Birth or overwrite
         self.concept_keys.data[idx] = F.normalize(l2_key.unsqueeze(0), dim=-1).squeeze(0)
-        self.concept_vals.data[idx] = l2_key.clone()
+        # Hybrid normalization for concept_vals: F.normalize + tau-based scaling
+        self.concept_vals.data[idx] = F.normalize(l2_key.unsqueeze(0), dim=-1).squeeze(0) * torch.sigmoid(self.val_log_scale)
         self.concept_age.data[idx] = 0.0
         self.concept_count.data[idx] = 1
         self.concept_confidence.data[idx] = confidence
@@ -385,6 +411,7 @@ class L3Concepts(nn.Module):
             'n_updates': self._n_updates,
             'n_active': self.get_active_concepts(),
             'confidence_mean': self.concept_confidence.mean().item(),
+            'val_scale': torch.sigmoid(self.val_log_scale).item(),
         }
 
     def reset(self) -> None:
