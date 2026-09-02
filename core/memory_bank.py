@@ -48,17 +48,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _memory_attention(q: torch.Tensor, k: torch.Tensor, temp: torch.Tensor,
+                      bridge_dim: int, softmax_free: bool = True,
+                      age_decay: torch.Tensor = None) -> torch.Tensor:
+    """Compute attention weights for memory bank read.
+    
+    Supports both sigmoid (softmax-free) and softmax attention modes.
+    
+    Args:
+        q: (B, L, bridge_dim) — query
+        k: (n_slots, bridge_dim) — keys
+        temp: scalar tensor — temperature
+        bridge_dim: int — dimension for scaling
+        softmax_free: bool — if True, use sigmoid; if False, use softmax
+        age_decay: (n_slots,) optional — age-based decay for slots
+    
+    Returns:
+        attn: (B, L, n_slots) — attention weights (sums to 1 per position)
+    """
+    # Dot product attention
+    scores = (q @ k.T) / math.sqrt(bridge_dim) * temp  # (B, L, n_slots)
+    
+    if softmax_free:
+        # Sigmoid attention (softmax-free, independent per slot)
+        attn = torch.sigmoid(scores)
+    else:
+        # Softmax attention (competitive, sums to 1)
+        attn = F.softmax(scores, dim=-1)
+    
+    # Apply age decay if provided
+    if age_decay is not None:
+        attn = attn * age_decay.unsqueeze(0).unsqueeze(0)
+    
+    # Normalize to sum to 1 (for sigmoid mode; softmax already sums to 1)
+    attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    attn = attn / attn_sum
+    
+    return attn
+
+
 class L1Buffer(nn.Module):
     """Rolling buffer of last K sentence embeddings.
 
     Simple ring buffer: overwrite oldest slot.
     Fast, no cosine similarity checks.
+    Keys normalized via F.normalize for consistent attention with L2/L3.
     """
-    def __init__(self, D: int, bridge_dim: int, n_slots: int = 3):
+    def __init__(self, D: int, bridge_dim: int, n_slots: int = 3,
+                 softmax_free: bool = True):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.n_slots = n_slots
+        self._softmax_free = softmax_free
 
         # Project stored embeddings to bridge space (for keys)
         self.proj = nn.Linear(D, bridge_dim)
@@ -101,11 +143,13 @@ class L1Buffer(nn.Module):
         """
         B, L, _ = query.shape
         q = self.q_proj(query)  # (B, L, bridge_dim)
-        k = self.proj(self.buf)  # (n_slots, bridge_dim)
+        k = F.normalize(self.proj(self.buf), dim=-1)  # (n_slots, bridge_dim) — normalized!
         v = self.out_proj(self.buf)  # (n_slots, D)
 
         temp = torch.exp(self.log_temp).clamp(min=0.1, max=10.0)
-        attn = torch.sigmoid((q @ k.T) / math.sqrt(self.bridge_dim) * temp)  # (B, L, n_slots)
+        age_decay = torch.exp(-0.01 * self.buf_age)  # age-based decay
+        attn = _memory_attention(q, k, temp, self.bridge_dim, 
+                                 self._softmax_free, age_decay)  # (B, L, n_slots)
 
         read = (attn @ v)  # (B, L, D)
         return read
@@ -133,11 +177,13 @@ class L2Bank(nn.Module):
     Keys normalized via F.normalize + tau-based scaling (hybrid approach).
     Values scaled via tau-based sigmoid (preserves magnitude info).
     """
-    def __init__(self, D: int, bridge_dim: int, n_slots: int = 16):
+    def __init__(self, D: int, bridge_dim: int, n_slots: int = 16,
+                 softmax_free: bool = True):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.n_slots = n_slots
+        self._softmax_free = softmax_free
 
         self.W_k = nn.Linear(D, bridge_dim)
         self.W_v = nn.Linear(D, bridge_dim)
@@ -235,13 +281,9 @@ class L2Bank(nn.Module):
         v = self.vals  # (n_slots, bridge_dim)
 
         temp = torch.exp(self.log_temp).clamp(min=0.1, max=10.0)
-        attn = torch.sigmoid((q @ k.T) / math.sqrt(self.bridge_dim) * temp)
-
         age_decay = torch.exp(-0.01 * self.slot_age)
-        attn = attn * age_decay.unsqueeze(0).unsqueeze(0)
-
-        attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-        attn = attn / attn_sum
+        attn = _memory_attention(q, k, temp, self.bridge_dim,
+                                 self._softmax_free, age_decay)  # (B, L, n_slots)
 
         read = attn @ v  # (B, L, bridge_dim)
         return self.W_o(read)  # (B, L, D)
@@ -290,13 +332,15 @@ class L3Concepts(nn.Module):
     Values normalized via F.normalize + tau-based scaling (hybrid approach).
     """
     def __init__(self, D: int, bridge_dim: int, n_concepts: int = 8,
-                 birth_threshold: float = 0.7, update_momentum: float = 0.1):
+                 birth_threshold: float = 0.7, update_momentum: float = 0.1,
+                 softmax_free: bool = True):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.n_concepts = n_concepts
         self._birth_threshold = birth_threshold
         self._update_momentum = update_momentum
+        self._softmax_free = softmax_free
 
         # Concept keys/values (learnable)
         self.concept_keys = nn.Parameter(torch.randn(n_concepts, bridge_dim) * 0.02)
@@ -321,13 +365,18 @@ class L3Concepts(nn.Module):
         self._n_updates = 0
 
     @torch.no_grad()
-    def write(self, l2_key: torch.Tensor, confidence: float = 0.5) -> bool:
+    def write(self, l2_key: torch.Tensor, l2_val: torch.Tensor = None, confidence: float = 0.5) -> bool:
         """Try to write L2 key into a concept slot.
 
         l2_key: (bridge_dim,) — the L2 key that was written
+        l2_val: (bridge_dim,) — the L2 value that was written (optional, defaults to l2_key)
         confidence: float — novelty confidence from L2 gate
         returns: True if wrote (updated or birthed)
         """
+        # Use l2_val if provided, otherwise fallback to l2_key (backward compat)
+        if l2_val is None:
+            l2_val = l2_key
+            
         # Normalize for cosine similarity
         key_n = F.normalize(l2_key.unsqueeze(0), dim=-1)  # (1, bridge_dim)
         concept_n = F.normalize(self.concept_keys.data, dim=-1)  # (n_concepts, bridge_dim)
@@ -346,7 +395,7 @@ class L3Concepts(nn.Module):
             self.concept_keys.data[best_idx] = F.normalize(
                 self.concept_keys.data[best_idx] * (1 - alpha) + l2_key * alpha, dim=-1)
             # Hybrid normalization for concept_vals: F.normalize + tau-based scaling
-            raw_val = self.concept_vals.data[best_idx] * (1 - alpha) + l2_key * alpha
+            raw_val = self.concept_vals.data[best_idx] * (1 - alpha) + l2_val * alpha
             self.concept_vals.data[best_idx] = F.normalize(raw_val, dim=-1) * torch.sigmoid(self.val_log_scale)
             self.concept_count.data[best_idx] += 1
             self.concept_confidence.data[best_idx] = (
@@ -368,8 +417,8 @@ class L3Concepts(nn.Module):
 
         # Birth or overwrite
         self.concept_keys.data[idx] = F.normalize(l2_key.unsqueeze(0), dim=-1).squeeze(0)
-        # Hybrid normalization for concept_vals: F.normalize + tau-based scaling
-        self.concept_vals.data[idx] = F.normalize(l2_key.unsqueeze(0), dim=-1).squeeze(0) * torch.sigmoid(self.val_log_scale)
+        # Hybrid normalization for concept_vals: use l2_val (not l2_key!)
+        self.concept_vals.data[idx] = F.normalize(l2_val.unsqueeze(0), dim=-1).squeeze(0) * torch.sigmoid(self.val_log_scale)
         self.concept_age.data[idx] = 0.0
         self.concept_count.data[idx] = 1
         self.concept_confidence.data[idx] = confidence
@@ -388,15 +437,9 @@ class L3Concepts(nn.Module):
         v = self.concept_vals  # (n_concepts, bridge_dim)
 
         temp = torch.exp(self.log_temp).clamp(min=0.1, max=10.0)
-        attn = torch.sigmoid((q @ k.T) / math.sqrt(self.bridge_dim) * temp)  # (B, L, n_concepts)
-
-        # Age-based decay
         age_decay = torch.exp(-0.005 * self.concept_age)  # slower decay than L2 (concepts are long-range)
-        attn = attn * age_decay.unsqueeze(0).unsqueeze(0)
-
-        # Normalize
-        attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-        attn = attn / attn_sum
+        attn = _memory_attention(q, k, temp, self.bridge_dim,
+                                 self._softmax_free, age_decay)  # (B, L, n_concepts)
 
         read = attn @ v  # (B, L, bridge_dim)
         return self.out_proj(read)  # (B, L, D)
@@ -441,22 +484,24 @@ class StreamingMemoryBank(nn.Module):
                  l1_slots: int = 3, l2_slots: int = 16,
                  l3_concepts: int = 8, l3_birth_threshold: float = 0.7,
                  min_write_maturation: float = 0.3,
+                 softmax_free: bool = True,
                  cfg=None):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.cfg = cfg
         self._min_write_maturation = min_write_maturation
+        self._softmax_free = softmax_free
 
         # L1: rolling buffer (immediate, ~last K diverse sentences)
-        self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots)
+        self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots, softmax_free=softmax_free)
 
         # L2: learned bank (short-term, ~N diverse slots)
-        self.l2 = L2Bank(D, bridge_dim, n_slots=l2_slots)
+        self.l2 = L2Bank(D, bridge_dim, n_slots=l2_slots, softmax_free=softmax_free)
 
         # L3: emergent concepts (long-range, ~8 concepts from L2 clustering)
         self.l3 = L3Concepts(D, bridge_dim, n_concepts=l3_concepts,
-                             birth_threshold=l3_birth_threshold)
+                             birth_threshold=l3_birth_threshold, softmax_free=softmax_free)
 
         # Fusion gate: combine L1 + L2 + L3 + current state
         self.fusion = nn.Sequential(
@@ -508,12 +553,13 @@ class StreamingMemoryBank(nn.Module):
                         if _can_write:
                             l2_slot = self.l2.write(summary)
 
-                        # Write to L3 (concept clustering from L2 key)
+                        # Write to L3 (concept clustering from L2 key+val)
                         # If L3 writes (birth/update), mark L2 slot as consumed
                         if _can_write and l2_slot >= 0:
                             l2_key = self.l2.keys[l2_slot]  # (bridge_dim,)
+                            l2_val = self.l2.vals[l2_slot]  # (bridge_dim,) — pass val too!
                             conf = self.l2.slot_novelty[l2_slot].item()
-                            wrote_l3 = self.l3.write(l2_key, confidence=conf)
+                            wrote_l3 = self.l3.write(l2_key, l2_val=l2_val, confidence=conf)
                             if wrote_l3:
                                 # L3 consumed this L2 slot — mark for overwrite
                                 self.l2.mark_consumed(l2_slot)
@@ -559,9 +605,12 @@ class StreamingMemoryBank(nn.Module):
             'l2_fill': l2s['fill_rate'],
             'l2_novelty_mean': l2s['novelty_mean'],
             'l2_age_mean': self.l2.slot_age.mean().item(),
+            'l2_key_scale': l2s['key_scale'],
+            'l2_val_scale': l2s['val_scale'],
             'l3_n_concepts': l3s['n_active'],
             'l3_n_births': l3s['n_births'],
             'l3_n_updates': l3s['n_updates'],
             'l3_confidence_mean': l3s['confidence_mean'],
+            'l3_val_scale': l3s['val_scale'],
             'mem_scale': torch.tanh(self.log_scale).item(),
         }
