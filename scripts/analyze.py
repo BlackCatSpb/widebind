@@ -151,9 +151,14 @@ def run_static(ckpt, cfg, model, missing, unexpected, tok=None):
           f'max={all_vals.max().item():.6f}')
     q = torch.tensor([0.01, 0.1, 0.5, 0.9, 0.99])
     try:
-        quants = torch.quantile(all_vals, q)
+        if all_vals.numel() > 10_000_000:
+            # Subsample for large tensors to avoid torch.quantile crash
+            indices = torch.randperm(all_vals.numel())[:10_000_000]
+            quants = torch.quantile(all_vals[indices], q)
+        else:
+            quants = torch.quantile(all_vals, q)
         print('  quantiles: ' + '  '.join(f'Q{qi * 100:3.0f}={qv:.6f}'
-                                          for qi, qv in zip(q.tolist(), quants.tolist())))
+                                           for qi, qv in zip(q.tolist(), quants.tolist())))
     except Exception:
         pass
     print(f'  NaN: {int(torch.isnan(all_vals).sum())}  Inf: {int(torch.isinf(all_vals).sum())}')
@@ -399,7 +404,7 @@ def run_live(model, cfg, batch=1, seq=128, gradinfo=True):
     model.train()
     x = torch.randint(0, cfg.vocab, (batch, seq), device=device)
     h = model.embed_tokens(x)
-    h_out, _, _, _ = model(h)
+    h_out, _, _, _ = model(h, tokens=x)
 
     sec('LIVE (forward на случайном входе)')
     print(f'INPUT/OUTPUT:  in_norm={h.norm(dim=-1).mean().item():.3f}  '
