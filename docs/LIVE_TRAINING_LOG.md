@@ -255,23 +255,35 @@ step  1155: loss=14678.31 ce=10.76  mat=0.071  scale=-0.964  tok/s=32
 step  1165: val=10.8391 val_ppl=51,000   ← best.pt
 step  1210: loss=14479.18 ce=10.78  mat=0.072  scale=-0.964  tok/s=31
 step  1265: loss=13859.47 ce=10.78  mat=0.073  scale=-0.964  tok/s=32
+step  1320: loss=12626.77 ce=10.67  mat=0.074  scale=-0.964  tok/s=32
+step  1375: loss=10543.69 ce=10.66  mat=0.075  scale=-0.964  tok/s=32
+step  1398: val=10.7844 val_ppl=48,300   ← best.pt
+step  1430: loss=10021.23 ce=10.63  mat=0.076  scale=-0.964  tok/s=31
+step  1485: loss=10847.06 ce=10.66  mat=0.077  scale=-0.964  tok/s=32
+step  1540: loss=12128.01 ce=10.70  mat=0.078  scale=-0.964  tok/s=32
+step  1595: loss=10395.58 ce=10.74  mat=0.079  scale=-0.964  tok/s=32
+step  1631: val=10.7329 val_ppl=45,800   ← best.pt
+step  1650: loss=10018.17 ce=10.72  mat=0.080  scale=-0.964  tok/s=31
+step  1705: loss=10416.61 ce=10.65  mat=0.081  scale=-0.964  tok/s=32
 ```
 
 ### Наблюдения
 
 1. **CE spike на step 55** (23→36) — аномалия при lr warmup, восстановился к step 220
-2. **Maturation растёт медленно:** 0.055→0.073 за 1265 шагов. До порога 0.3 нужно ~20k шагов
+2. **Maturation растёт медленно:** 0.055→0.081 за 1705 шагов. До порога 0.3 нужно ~20k шагов
 3. **scale=-0.964 не двигается** — memory bank пуст, hybrid параметры не задействованы, градиент не течёт
 4. **L1/L2/L3 пусты** — maturation ещё не достиг порогов (ожидаемо)
 5. **VRAM 6.4GB** — T4 с запасом
 6. **tok/s 31-40** — стабильно
-7. **Total loss растёт** (12k→15k) — aux losses увеличиваются, CE снижается. Тревожно: aux может начать доминировать над CE
-8. **intent_w saturating** ~0.78 — максимальный вклад intent
-9. **val_loss** 11.07→10.84 — стабильное снижение
+7. **Total loss стабилизировался** (10k-12k) — aux losses выровнялись после step 1300
+8. **intent_w saturating** ~0.87-0.93 — максимальный вклад intent
+9. **val_loss** 11.07→10.73 — стабильное снижение, CE=10.65 к step 1705
+10. **Полный анализ best_2 (step 1165):** MLP W_std=0.0707 ✅, gate max=0.667 ✅, NaN=0 ✅, mat=0.071, L1/L2/L3 пусты
 
 ### Прогноз
 
-- **Step 2000-3000:** maturation начнёт расти быстрее
-- **Step 5000-8000:** maturation > 0.1, L1/L2 начнут заполняться
-- **Step 10000-15000:** maturation > 0.3, memory bank активируется, hybrid scale начнёт обучаться
-- **Цель:** val < 10.0 к step 5000, val < 9.0 к step 15000
+- **Step 2000-3000:** maturation ~0.09-0.12
+- **Step 5000-8000:** maturation > 0.15, L1/L2 начнут заполняться
+- **Step 10000-15000:** maturation > 0.25, memory bank активируется
+- **Step 15000-20000:** maturation > 0.3, hybrid scale начнёт обучаться
+- **Цель:** val < 10.0 к step 3000, val < 9.0 к step 15000
