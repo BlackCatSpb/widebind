@@ -199,6 +199,9 @@ class L2Bank(nn.Module):
 
         self.q_proj = nn.Linear(D, bridge_dim)
 
+        # LayerNorm for vals to prevent magnitude explosion
+        self.val_norm = nn.LayerNorm(bridge_dim)
+
         self.keys = nn.Parameter(torch.randn(n_slots, bridge_dim) * 0.02)
         self.vals = nn.Parameter(torch.randn(n_slots, bridge_dim) * 0.02)
 
@@ -240,7 +243,7 @@ class L2Bank(nn.Module):
             raw_key = self.W_k(embedding.detach())
             new_key = F.normalize(raw_key, dim=-1) * torch.sigmoid(self.key_log_scale)
             
-            # Vals: tau-scaled to preserve magnitude info while staying bounded
+            # Vals: tau-scaled (val_norm applied at read time for stability)
             raw_val = self.W_v(embedding.detach())
             new_val = raw_val * torch.sigmoid(self.val_log_scale)
 
@@ -286,7 +289,7 @@ class L2Bank(nn.Module):
         B, L, _ = query.shape
         q = self.q_proj(query)  # (B, L, bridge_dim)
         k = self.keys  # (n_slots, bridge_dim)
-        v = self.vals  # (n_slots, bridge_dim)
+        v = self.val_norm(self.vals)  # (n_slots, bridge_dim) — normalized for stability
 
         temp = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
         age_decay = torch.exp(-0.01 * self.slot_age)
@@ -565,7 +568,7 @@ class StreamingMemoryBank(nn.Module):
                         # If L3 writes (birth/update), mark L2 slot as consumed
                         if _can_write and l2_slot >= 0:
                             l2_key = self.l2.keys[l2_slot]  # (bridge_dim,)
-                            l2_val = self.l2.vals[l2_slot]  # (bridge_dim,) — pass val too!
+                            l2_val = self.l2.val_norm(self.l2.vals[l2_slot])  # (bridge_dim,) — normalized
                             conf = self.l2.slot_novelty[l2_slot].item()
                             wrote_l3 = self.l3.write(l2_key, l2_val=l2_val, confidence=conf)
                             if wrote_l3:
