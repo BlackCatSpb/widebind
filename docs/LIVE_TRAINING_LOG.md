@@ -243,16 +243,31 @@ step   605: loss=10450.48 ce=10.97  mat=0.063  scale=-0.964  tok/s=32
 step   660: loss=10899.25 ce=10.92  mat=0.064  scale=-0.964  tok/s=33
 step   699: val=10.9498 val_ppl=56,900   ← best.pt
 step   715: loss=12180.94 ce=10.84  mat=0.064  scale=-0.964  tok/s=31
+step   770: loss=13038.94 ce=10.82  mat=0.065  scale=-0.964  tok/s=31
+step   825: loss=13530.45 ce=10.88  mat=0.066  scale=-0.964  tok/s=32
+step   880: loss=12099.60 ce=10.87  mat=0.067  scale=-0.964  tok/s=32
+step   932: val=10.8937 val_ppl=53,800   ← best.pt
+step   935: loss=13294.66 ce=10.73  mat=0.068  scale=-0.964  tok/s=31
+step   990: loss=13995.67 ce=10.79  mat=0.069  scale=-0.964  tok/s=31
+step  1045: loss=14211.06 ce=10.73  mat=0.070  scale=-0.964  tok/s=32
+step  1100: loss=15153.06 ce=10.80  mat=0.070  scale=-0.964  tok/s=32
+step  1155: loss=14678.31 ce=10.76  mat=0.071  scale=-0.964  tok/s=32
+step  1165: val=10.8391 val_ppl=51,000   ← best.pt
+step  1210: loss=14479.18 ce=10.78  mat=0.072  scale=-0.964  tok/s=31
+step  1265: loss=13859.47 ce=10.78  mat=0.073  scale=-0.964  tok/s=32
 ```
 
 ### Наблюдения
 
 1. **CE spike на step 55** (23→36) — аномалия при lr warmup, восстановился к step 220
-2. **Maturation растёт медленно:** 0.055→0.064 за 715 шагов. До порога 0.3 нужно ~20k шагов
+2. **Maturation растёт медленно:** 0.055→0.073 за 1265 шагов. До порога 0.3 нужно ~20k шагов
 3. **scale=-0.964 не двигается** — memory bank пуст, hybrid параметры не задействованы, градиент не течёт
 4. **L1/L2/L3 пусты** — maturation ещё не достиг порогов (ожидаемо)
 5. **VRAM 6.4GB** — T4 с запасом
 6. **tok/s 31-40** — стабильно
+7. **Total loss растёт** (12k→15k) — aux losses увеличиваются, CE снижается. Тревожно: aux может начать доминировать над CE
+8. **intent_w saturating** ~0.78 — максимальный вклад intent
+9. **val_loss** 11.07→10.84 — стабильное снижение
 
 ### Прогноз
 
