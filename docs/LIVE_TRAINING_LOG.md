@@ -262,7 +262,7 @@ step  1430: loss=10021.23 ce=10.63  mat=0.076  scale=-0.964  tok/s=31
 step  1485: loss=10847.06 ce=10.66  mat=0.077  scale=-0.964  tok/s=32
 step  1540: loss=12128.01 ce=10.70  mat=0.078  scale=-0.964  tok/s=32
 step  1595: loss=10395.58 ce=10.74  mat=0.079  scale=-0.964  tok/s=32
-step  1631: val=10.7329 val_ppl=45,800   ← best.pt
+step  1631: val=10.7329 val_ppl=45,800   ← best_3.pt (current best)
 step  1650: loss=10018.17 ce=10.72  mat=0.080  scale=-0.964  tok/s=31
 step  1705: loss=10416.61 ce=10.65  mat=0.081  scale=-0.964  tok/s=32
 ```
@@ -278,7 +278,8 @@ step  1705: loss=10416.61 ce=10.65  mat=0.081  scale=-0.964  tok/s=32
 7. **Total loss стабилизировался** (10k-12k) — aux losses выровнялись после step 1300
 8. **intent_w saturating** ~0.87-0.93 — максимальный вклад intent
 9. **val_loss** 11.07→10.73 — стабильное снижение, CE=10.65 к step 1705
-10. **Полный анализ best_2 (step 1165):** MLP W_std=0.0707 ✅, gate max=0.667 ✅, NaN=0 ✅, mat=0.071, L1/L2/L3 пусты
+10. **Полный анализ best_2 (step 1165):** MLP W_std=0.0707, gate max=0.667, NaN=0, mat=0.071, L1/L2/L3 пусты, CE(random)=68.32
+11. **Полный анализ best_3 (step 1631):** MLP W_std=0.0707, gate max=0.667, NaN=0, mat=0.079, L1/L2/L3 пусты, CE(random)=47.64 (-30%), slots 72/192
 
 ### Прогноз
 
