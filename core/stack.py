@@ -1243,21 +1243,17 @@ class WideBindStack(nn.Module):
                 if p.requires_grad:
                     p.register_hook(lambda grad, b=boost: grad * b)
                     n_applied += 1
-            # Mirror cognitive gates — THE actual MLP/memory modulation scale that
-            # was "asleep" (mod_scale_mlp stuck at init ~0.667). These are SEPARATE
-            # params from mlp.mlp_gate_b and must be boosted so deep gates can
-            # open/close instead of only decaying.
-            # EXTRA: sigmoid derivative <= 0.25, so mod_scale_mlp gradient is
-            # 4x smaller than it should be. Apply额外 boost (gate_boost) to
-            # overcome this bottleneck and allow the gate to move from init.
-            gate_boost = boost * 5.0  # 5x extra for sigmoid bottleneck
-            for p in (layer.mirror.mod_scale_mlp, layer.mirror.mod_scale_mem):
+            # Mirror cognitive gates — hybrid_gate (sigmoid+softmax) and mod_scale_mem.
+            # The hybrid_gate.log_tau controls the softmax temperature; boost it
+            # so deep gates can specialize faster.
+            gate_boost = boost * 3.0  # 3x extra for gate specialization
+            for p in (layer.mirror.hybrid_gate.log_tau, layer.mirror.mod_scale_mem):
                 if p.requires_grad:
                     p.register_hook(lambda grad, b=gate_boost: grad * b)
                     n_applied += 1
         print(f'[mlp-boost] deep-MLP gradient x{math.exp(exp):.2f}/layer '
               f'(L0=1.0 .. L{len(self.layers)-1}={math.exp(exp*(len(self.layers)-1)):.1f}), '
-              f'mod_scale_mlp extra x5 sigmoid boost, {n_applied} params hooked')
+              f'hybrid_gate+mem extra x3 boost, {n_applied} params hooked')
 
 
     @torch.no_grad()

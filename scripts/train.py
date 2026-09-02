@@ -252,15 +252,16 @@ def train(cfg=None, resume_path=None):
                 nzero += 1
             print(f'  reset_skip_alpha: zeroed log_skip_alpha in {nzero} mirror layers (SMF L0-fix)')
         # Fix for "MLP asleep": reopen the cognitive gate on resume. The REAL gate
-        # is mirror.mod_scale_mlp (sigmoid -> MLP scale), which checkpoints freeze
-        # near init log(2)~0.69 (sigmoid 0.667 = "asleep"). Reopen it (and the
-        # internal mlp.mlp_gate_b) so the deep-MLP gradient boost can move it.
+        # is mirror.hybrid_gate (sigmoid+softmax) replacing frozen mod_scale_mlp.
+        # On resume set hybrid_gate tau so the gate starts clearly open.
         if getattr(cfg, 'mlp_gate_b_init', 0.0) > 0:
             for layer in model.layers:
                 layer.mlp.mlp_gate_b.data.fill_(cfg.mlp_gate_b_init)
-                layer.mirror.mod_scale_mlp.data.fill_(cfg.mlp_mod_scale_reopen)
+                # Initialize hybrid gate tau (sigmoid+softmax temperature)
+                tau_val = getattr(cfg, 'mlp_hybrid_gate_tau', 1.0)
+                layer.mirror.hybrid_gate.log_tau.data.fill_(math.log(tau_val))
             print(f'  reopened cognitive gate: mlp_gate_b -> {cfg.mlp_gate_b_init}, '
-                  f'mod_scale_mlp -> {cfg.mlp_mod_scale_reopen:.3f} (sigmoid {math.exp(cfg.mlp_mod_scale_reopen)/(1+math.exp(cfg.mlp_mod_scale_reopen)):.3f})')
+                  f'hybrid_gate tau -> {tau_val:.3f}')
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:

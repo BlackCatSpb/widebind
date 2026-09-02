@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .vsa_utils import fib_sigmoid_init, dct_basis
+from .adaptive_gate import AdaptiveGate
 
 class BridgeGLU(nn.Module):
     """GLU-style gating tooling that lives INSIDE the mirror/bridge.
@@ -275,6 +276,10 @@ class GroupedCognitiveMirror(nn.Module):
         # Per-expert масштабы модуляции (learned log-scale)
         self.mod_scale_mlp = nn.Parameter(torch.full((G,), math.log(2.0)))
         self.mod_scale_mem = nn.Parameter(torch.full((G,), math.log(2.0)))
+        # Hybrid gate: sigmoid+softmax replaces frozen mod_scale_mlp baseline.
+        # base = sigmoid(usefulness_logits) * (1 + softmax(usefulness_logits/tau))
+        # per-expert, input-dependent, no hardcoded 0.750.
+        self.hybrid_gate = AdaptiveGate(G, tau_init=1.0)
         # BridgeGLU: GLU gating tooling inside the mirror (experimental; replaces
         # the mod_scale_mlp scale with a live gate when enabled).
         self.bridge_glu_net = BridgeGLU(self.G, self.k) if bridge_glu else None
@@ -596,7 +601,10 @@ class GroupedCognitiveMirror(nn.Module):
         # Per-expert modulation strengths (gated by self-assessment)
         if self.bridge_glu_net is not None:
             glu = self.bridge_glu_net(delta)                       # (B, L, G) — BridgeGLU: live semantic gate, in (0,1)
-            base = torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # frozen stable baseline ~0.667 (per-expert, input-independent)
+            # Hybrid gate: sigmoid+softmax replaces frozen mod_scale_mlp baseline.
+            # base = sigmoid(usefulness_logits) * (1 + softmax(usefulness_logits/tau))
+            # per-expert, input-dependent, no hardcoded 0.750.
+            base = self.hybrid_gate(usefulness_logits)             # (B, L, G)
             # Live semantic modulation ANCHORED to the stable baseline (multiplicative,
             # centre-zero): mlp_mod = base * (1 + beta*(2*glu - 1)). At init glu~0.25 ->
             # factor ~0.875 -> mlp_mod ≈ 0.58*usefulness; as glu learns to centre (→0.5)
@@ -606,9 +614,9 @@ class GroupedCognitiveMirror(nn.Module):
                 # Maturation gate: live modulation is SCALED by layer maturity, so
                 # untrained experts cannot perturb the trunk at step 0 (rho(J_l) ~ 1).
                 live = live * maturity
-            mlp_mod = usefulness * base * (1.0 + self.bridge_glu_beta * live)
+            mlp_mod = base * (1.0 + self.bridge_glu_beta * live)
         else:
-            mlp_mod = usefulness * torch.sigmoid(self.mod_scale_mlp).view(1, 1, G)  # (B, L, G)
+            mlp_mod = self.hybrid_gate(usefulness_logits)         # (B, L, G)
         mem_mod = usefulness * torch.sigmoid(self.mod_scale_mem).view(1, 1, G)
         self._last_mlp_mod = mlp_mod.detach()                      # for diagnostics (gate spread / aliveness)
 
