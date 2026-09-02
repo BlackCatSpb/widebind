@@ -1235,13 +1235,17 @@ class WideBindStack(nn.Module):
             # was "asleep" (mod_scale_mlp stuck at init ~0.667). These are SEPARATE
             # params from mlp.mlp_gate_b and must be boosted so deep gates can
             # open/close instead of only decaying.
+            # EXTRA: sigmoid derivative <= 0.25, so mod_scale_mlp gradient is
+            # 4x smaller than it should be. Apply额外 boost (gate_boost) to
+            # overcome this bottleneck and allow the gate to move from init.
+            gate_boost = boost * 5.0  # 5x extra for sigmoid bottleneck
             for p in (layer.mirror.mod_scale_mlp, layer.mirror.mod_scale_mem):
                 if p.requires_grad:
-                    p.register_hook(lambda grad, b=boost: grad * b)
+                    p.register_hook(lambda grad, b=gate_boost: grad * b)
                     n_applied += 1
         print(f'[mlp-boost] deep-MLP gradient x{math.exp(exp):.2f}/layer '
               f'(L0=1.0 .. L{len(self.layers)-1}={math.exp(exp*(len(self.layers)-1)):.1f}), '
-              f'{n_applied} params hooked')
+              f'mod_scale_mlp extra x5 sigmoid boost, {n_applied} params hooked')
 
 
     @torch.no_grad()

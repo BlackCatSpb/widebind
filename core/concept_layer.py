@@ -108,7 +108,13 @@ class CollectiveConceptLayer(nn.Module):
         zeros_ev = torch.zeros(B, L, dtype=torch.bool, device=hp.device)
         if not allow_write:
             return zeros_ev, zeros_ev.long()
-        if self._mature.item() < 0.5:
+
+        # Разделяем зрелость: для РОЖДЕНИЯ достаточно начальной стадии (0.1),
+        # для ОБНОВЛЕНИЯ существующих слотов нужна полная зрелость (0.5).
+        mat = self._mature.item()
+        can_refine = mat >= 0.5
+        can_birth = mat >= 0.1
+        if not can_refine and not can_birth:
             return zeros_ev, zeros_ev.long()
 
         B, L, G, k = hp.shape
@@ -120,42 +126,43 @@ class CollectiveConceptLayer(nn.Module):
         best_sim = sim.max(dim=-1).values
         d_min = 1.0 - best_sim
         conf = torch.sigmoid(-pen)
-        # Адаптивный порог: для обновления существующих слотов — медиана,
-        # для рождения новых — нижний квартиль (более либеральный).
-        # Глубокие слои с высоким pen получают лояльный порог рождения.
-        refine_thresh = conf.median().clamp(min=0.01)
-        birth_thresh = conf.quantile(0.25).clamp(min=0.01)
-
         write_event = torch.zeros(B, L, dtype=torch.bool, device=hp.device)
         did_write = False
-        for s in range(self.S):
-            mask = (best == s) & (conf >= refine_thresh)
-            if mask.any():
-                write_event |= mask
-                upd = F.normalize(shared[mask].mean(dim=0), dim=-1)
-                if self.N_s[s].item() < 10:
-                    self.M.data[s] = upd
-                else:
-                    alpha = 0.01
-                    self.M.data[s] = F.normalize(
-                        self.M[s] * (1 - alpha) + upd * alpha, dim=-1)
-                self.N_s[s] += mask.sum().item()
-                did_write = True
 
-        empty = torch.nonzero(self.N_s == 0)
-        novel = (d_min > self._birth_gap * 0.2) & (conf >= birth_thresh)
-        if novel.any():
-            write_event |= novel
-            if empty.numel() > 0:
-                idx = empty[0].item()
-                self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
-                self.N_s[idx] += 1
-            else:
-                evict = int(torch.argmin(self.U_s).item())
-                self.M.data[evict] = F.normalize(shared[novel].mean(dim=0), dim=-1)
-                self.N_s[evict] = 1
-                self.U_s[evict] = 0.0
-            did_write = True
+        # Обновление существующих слотов — только при полной зрелости
+        if can_refine:
+            refine_thresh = conf.median().clamp(min=0.01)
+            for s in range(self.S):
+                mask = (best == s) & (conf >= refine_thresh)
+                if mask.any():
+                    write_event |= mask
+                    upd = F.normalize(shared[mask].mean(dim=0), dim=-1)
+                    if self.N_s[s].item() < 10:
+                        self.M.data[s] = upd
+                    else:
+                        alpha = 0.01
+                        self.M.data[s] = F.normalize(
+                            self.M[s] * (1 - alpha) + upd * alpha, dim=-1)
+                    self.N_s[s] += mask.sum().item()
+                    did_write = True
+
+        # Рождение новых концептов — при начальной зрелости (can_birth)
+        if can_birth:
+            birth_thresh = conf.quantile(0.25).clamp(min=0.01)
+            empty = torch.nonzero(self.N_s == 0)
+            novel = (d_min > self._birth_gap * 0.2) & (conf >= birth_thresh)
+            if novel.any():
+                write_event |= novel
+                if empty.numel() > 0:
+                    idx = empty[0].item()
+                    self.M.data[idx] = F.normalize(shared[novel].mean(dim=0), dim=-1)
+                    self.N_s[idx] += 1
+                else:
+                    evict = int(torch.argmin(self.U_s).item())
+                    self.M.data[evict] = F.normalize(shared[novel].mean(dim=0), dim=-1)
+                    self.N_s[evict] = 1
+                    self.U_s[evict] = 0.0
+                did_write = True
 
         if did_write:
             self._last_write_step = int(self._step.item())
