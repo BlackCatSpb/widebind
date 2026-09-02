@@ -1211,6 +1211,7 @@ def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=No
         live = {'ce_random': float('nan'), 'pred': float('nan'), 'tau_l_dev': float('nan'),
                 'gate_l1': float('nan'), 'usef': float('nan'), 'rows': [], 'signals': [],
                 'mirror': [], 'grad_info': None}
+    live_available = live.get('rows') or live.get('signals') or live.get('mirror')
 
     badge = lambda flag: (f'<span class="bdg b-{flag}">{flag}</span>'
                           if flag in ('PASS', 'WATCH', 'WAKE') else flag)
@@ -1243,10 +1244,18 @@ td:first-child,th:first-child{text-align:left}
         ('MLP W_std', f'{wake["wstd"]:.4f}'), ('dev', f'{wake["dev_mean"]:+.4f}'),
         ('mod_mlp σ', f'{wake["g_mlp"]:.3f}'), ('mod_mem σ', f'{wake["g_mem"]:.3f}'),
         ('slots', f'{wake["slots"]}/192'), ('full L', str(wake["full"])),
-        ('births', str(wake["births"])), ('CE(rand)', f'{live["ce_random"]:.3f}'),
-        ('pred', f'{live["pred"]:.3f}'), ('gate_l1', f'{live["gate_l1"]:.5f}'),
-        ('tau_l_dev', f'{live["tau_l_dev"]:.4f}'),
+        ('births', str(wake["births"])),
     ]
+    if live_available:
+        cards.append(('CE(rand)', f'{live["ce_random"]:.3f}'))
+        cards.append(('pred', f'{live["pred"]:.3f}'))
+        cards.append(('gate_l1', f'{live["gate_l1"]:.5f}'))
+        cards.append(('tau_l_dev', f'{live["tau_l_dev"]:.4f}'))
+    else:
+        cards.append(('CE(rand)', '—'))
+        cards.append(('pred', '—'))
+        cards.append(('gate_l1', '—'))
+        cards.append(('tau_l_dev', '—'))
     if wake.get('mat') is not None:
         m = wake['mat']
         cards.append(('mat gate', f'{m["gmax"]:.3f}'))
@@ -1310,46 +1319,55 @@ td:first-child,th:first-child{text-align:left}
                   f'(gate opens deeper layers later via tau-geometry)</div>')
 
     ch.append('<h2>LIVE — per-layer dissection</h2>')
-    ch.append('<table><tr><th>L</th><th>||hp||</th><th>predMSE</th><th>|mirror|</th>'
-              '<th>gate</th><th>gate_var</th><th>|1-a|</th><th>ls_expM</th><th>ls_std</th>'
-              '<th>skip</th><th>w_delta</th></tr>')
-    for r in live['rows']:
-        ch.append('<tr><td>' + str(r['layer']) + '</td><td>' + f"{r['hp']:.3f}" +
-                  '</td><td>' + f"{r['predMSE']:.3f}" + '</td><td>' + f"{r['mirror']:.3f}" +
-                  '</td><td>' + f"{r['gate']:.4f}" + '</td><td>' + f"{r['gate_var']:.4f}" +
-                  '</td><td>' + f"{r['a1']:.4f}" + '</td><td>' + f"{r['ls_expM']:.2f}" +
-                  '</td><td>' + f"{r['ls_std']:.4f}" + '</td><td>' + f"{r['skip']:.3f}" +
-                  '</td><td>' + f"{r['w_delta']:.5f}" + '</td></tr>')
-    ch.append('</table>')
+    if live['rows']:
+        ch.append('<table><tr><th>L</th><th>||hp||</th><th>predMSE</th><th>|mirror|</th>'
+                  '<th>gate</th><th>gate_var</th><th>|1-a|</th><th>ls_expM</th><th>ls_std</th>'
+                  '<th>skip</th><th>w_delta</th></tr>')
+        for r in live['rows']:
+            ch.append('<tr><td>' + str(r['layer']) + '</td><td>' + f"{r['hp']:.3f}" +
+                      '</td><td>' + f"{r['predMSE']:.3f}" + '</td><td>' + f"{r['mirror']:.3f}" +
+                      '</td><td>' + f"{r['gate']:.4f}" + '</td><td>' + f"{r['gate_var']:.4f}" +
+                      '</td><td>' + f"{r['a1']:.4f}" + '</td><td>' + f"{r['ls_expM']:.2f}" +
+                      '</td><td>' + f"{r['ls_std']:.4f}" + '</td><td>' + f"{r['skip']:.3f}" +
+                      '</td><td>' + f"{r['w_delta']:.5f}" + '</td></tr>')
+        ch.append('</table>')
+    else:
+        ch.append('<div class="dim">live пропущен (--no-live) — данные не собраны</div>')
 
     ch.append('<h2>SIGNALS (softmax share)</h2>')
-    for s in live['signals']:
-        ch.append(f'<div class="dim">L{s["layer"]}: ' +
-                  ' '.join(f'{n}={v:.3f}' for n, v in zip(s['names'], s['share'])) + '</div>')
-        for n, v in zip(s['names'], s['share']):
-            w = v * 100
-            ch.append(f'<div class="bar"><i style="width:{w:.1f}%"></i>'
-                      f'<span>{n} {v:.3f}</span></div>')
+    if live['signals']:
+        for s in live['signals']:
+            ch.append(f'<div class="dim">L{s["layer"]}: ' +
+                      ' '.join(f'{n}={v:.3f}' for n, v in zip(s['names'], s['share'])) + '</div>')
+            for n, v in zip(s['names'], s['share']):
+                w = v * 100
+                ch.append(f'<div class="bar"><i style="width:{w:.1f}%"></i>'
+                          f'<span>{n} {v:.3f}</span></div>')
+    else:
+        ch.append('<div class="dim">live пропущен (--no-live) — данные не собраны</div>')
 
     ch.append('<h2>MIRROR PARAMS (L0 / mid / last)</h2>')
-    ch.append('<table><tr><th>L</th><th>α_diag</th><th>log_scale</th><th>tanh_bias</th>'
-              '<th>b_gate</th><th>gate_bias</th><th>mod_mlp σ</th><th>mod_mem σ</th>'
-              '<th>gate_ema</th><th>w_sal σ</th><th>w_intent σ</th><th>w_help σ</th>'
-              '<th>w_contra</th><th>pm_norm</th></tr>')
-    for r in live['mirror']:
-        ch.append('<tr><td>' + str(r['layer']) + '</td><td>' +
-                  f"{r['alpha_diag'][0]:.3f}" + '</td><td>' + f"{r['log_scale'][0]:.2f}" +
-                  '</td><td>' + f"{r['tanh_bias'][0]:.3f}" + '</td><td>' +
-                  f"{r['b_gate']:.3f}" + '</td><td>' + f"{r['gate_bias']:.3f}" +
-                  '</td><td>' + f"{r['mod_mlp']:.3f}" + '</td><td>' +
-                  f"{r['mod_mem']:.3f}" + '</td><td>' + f"{r['gate_ema']:.3f}" + '</td><td>' +
-                  (f"{r.get('w_help', 0):.3f}" if r.get('w_help') is not None else '—') +
-                  '</td><td>' + (f"{r.get('w_contra', 0):.4f}" if r.get('w_contra') is not None else '—') +
-                  '</td><td>' + (f"{r.get('pm_norm', 0):.3f}" if r.get('pm_norm') is not None else '—') +
-                  '</td><td>' + (f"{r.get('w_sal', 0):.4f}" if r.get('w_sal') is not None else '—') +
-                  '</td><td>' + (f"{r.get('w_intent', 0):.4f}" if r.get('w_intent') is not None else '—') +
-                  '</td></tr>')
-    ch.append('</table>')
+    if live['mirror']:
+        ch.append('<table><tr><th>L</th><th>α_diag</th><th>log_scale</th><th>tanh_bias</th>'
+                  '<th>b_gate</th><th>gate_bias</th><th>mod_mlp σ</th><th>mod_mem σ</th>'
+                  '<th>gate_ema</th><th>w_sal σ</th><th>w_intent σ</th><th>w_help σ</th>'
+                  '<th>w_contra</th><th>pm_norm</th></tr>')
+        for r in live['mirror']:
+            ch.append('<tr><td>' + str(r['layer']) + '</td><td>' +
+                      f"{r['alpha_diag'][0]:.3f}" + '</td><td>' + f"{r['log_scale'][0]:.2f}" +
+                      '</td><td>' + f"{r['tanh_bias'][0]:.3f}" + '</td><td>' +
+                      f"{r['b_gate']:.3f}" + '</td><td>' + f"{r['gate_bias']:.3f}" +
+                      '</td><td>' + f"{r['mod_mlp']:.3f}" + '</td><td>' +
+                      f"{r['mod_mem']:.3f}" + '</td><td>' + f"{r['gate_ema']:.3f}" + '</td><td>' +
+                      (f"{r.get('w_help', 0):.3f}" if r.get('w_help') is not None else '—') +
+                      '</td><td>' + (f"{r.get('w_contra', 0):.4f}" if r.get('w_contra') is not None else '—') +
+                      '</td><td>' + (f"{r.get('pm_norm', 0):.3f}" if r.get('pm_norm') is not None else '—') +
+                      '</td><td>' + (f"{r.get('w_sal', 0):.4f}" if r.get('w_sal') is not None else '—') +
+                      '</td><td>' + (f"{r.get('w_intent', 0):.4f}" if r.get('w_intent') is not None else '—') +
+                      '</td></tr>')
+        ch.append('</table>')
+    else:
+        ch.append('<div class="dim">live пропущен (--no-live) — данные не собраны</div>')
 
     if metacog is not None:
         ch.append('<h2>META-COGNITION (ВСЕ буферы)</h2>')
@@ -1410,8 +1428,10 @@ td:first-child,th:first-child{text-align:left}
                       f'||hp||max {anomaly["dhp"]:+.3f} | predMSEmax {anomaly["dpe"]:+.1f} '
                       f'| gate_min {anomaly["dgate"]:+.4f} | '
                       f'births {anomaly["births"]}</div>')
+    elif not live_available:
+        ch.append('<div class="dim">live пропущен (--no-live) — трекер недоступен</div>')
     else:
-        ch.append('<div class="dim">live пропущен — трекер недоступен</div>')
+        ch.append('<div class="dim">нет данных</div>')
 
     ch.append('<h2>GRAD INFO</h2>')
     gi = live.get('grad_info') if live else None
