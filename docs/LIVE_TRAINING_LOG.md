@@ -209,3 +209,54 @@ Step  | L1 entries | L2 entries | L2 consumed | L3 births | L3 capacity
 - **Цель:** val < 8.5 (лучше прошлого раунда 8.734)
 
 **Текущий темп:** val снижается на ~0.001 за 100 шагов. При текущей скорости 23 tok/s до step 15000 осталось ~21 час.
+
+---
+
+## Новый запуск (Colab T4, hybrid attention, fresh start 3)
+
+> **2026-09-02:** Новый запуск с нуля после унификации hybrid attention.
+
+### Изменения相对于 предыдущего запуска:
+- **Hybrid attention** везде: `_memory_attention()`, cascade mixing, manifold beam read
+- `log_temp` → `log_tau` (единое имя параметров)
+- L2 keys: `F.normalize() + sigmoid(key_log_scale)`
+- L2/L3 vals: `sigmoid(val_log_scale)`
+- `analyze.py` исправлен (tokens param, quantile crash, unexpected keys)
+
+### Траектория val
+
+```
+step     0: loss=9172.12  ce=23.67  mat=0.055  scale=-0.964  tok/s=22
+step    55: loss=11169.33 ce=36.32  mat=0.056  scale=-0.964  tok/s=40 (spike, warmup)
+step   110: loss=10847.88 ce=31.56  mat=0.056  scale=-0.964  tok/s=40
+step   165: loss=10527.15 ce=28.85  mat=0.057  scale=-0.964  tok/s=40
+step   220: loss=10583.49 ce=11.05  mat=0.058  scale=-0.964  tok/s=40
+step   233: val=11.0681 val_ppl=64,100
+step   275: loss=11532.91 ce=11.03  mat=0.058  scale=-0.964  tok/s=32
+step   330: loss=11291.37 ce=11.03  mat=0.059  scale=-0.964  tok/s=33
+step   385: loss=11739.30 ce=10.99  mat=0.060  scale=-0.964  tok/s=34
+step   440: loss=10691.61 ce=10.99  mat=0.061  scale=-0.964  tok/s=34
+step   466: val=11.0115 val_ppl=60,600
+step   495: loss=10897.84 ce=10.97  mat=0.061  scale=-0.964  tok/s=31
+step   550: loss=10551.71 ce=10.96  mat=0.062  scale=-0.964  tok/s=32
+step   605: loss=10450.48 ce=10.97  mat=0.063  scale=-0.964  tok/s=32
+step   660: loss=10899.25 ce=10.92  mat=0.064  scale=-0.964  tok/s=33
+step   699: val=10.9498 val_ppl=56,900   ← best.pt
+step   715: loss=12180.94 ce=10.84  mat=0.064  scale=-0.964  tok/s=31
+```
+
+### Наблюдения
+
+1. **CE spike на step 55** (23→36) — аномалия при lr warmup, восстановился к step 220
+2. **Maturation растёт медленно:** 0.055→0.064 за 715 шагов. До порога 0.3 нужно ~20k шагов
+3. **scale=-0.964 не двигается** — memory bank пуст, hybrid параметры не задействованы, градиент не течёт
+4. **L1/L2/L3 пусты** — maturation ещё не достиг порогов (ожидаемо)
+5. **VRAM 6.4GB** — T4 с запасом
+6. **tok/s 31-40** — стабильно
+
+### Прогноз
+
+- **Step 2000-3000:** maturation начнёт расти быстрее
+- **Step 5000-8000:** maturation > 0.1, L1/L2 начнут заполняться
+- **Step 10000-15000:** maturation > 0.3, memory bank активируется, hybrid scale начнёт обучаться
+- **Цель:** val < 10.0 к step 5000, val < 9.0 к step 15000
