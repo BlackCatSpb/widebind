@@ -115,6 +115,8 @@ class WideBindStack(nn.Module):
             l3_concepts=getattr(cfg, 'mem_l3_concepts', 8),
             l3_birth_threshold=getattr(cfg, 'mem_l3_birth_threshold', 0.7),
             min_write_maturation=getattr(cfg, 'mem_min_write_mat', 0.3),
+            l1_consolidate_sim=getattr(cfg, 'mem_l1_consolidate_sim', 0.85),
+            l2_consolidate_sim=getattr(cfg, 'mem_l2_consolidate_sim', 0.80),
             cfg=cfg,
         ) if getattr(cfg, 'memory_bank', False) else None
         # c_ema: global state EMA rate = write_rate * tau_mid
@@ -1125,6 +1127,17 @@ class WideBindStack(nn.Module):
                     'lbg_global_ready': 1.0 if _gr else 0.0,
                 }
             self._layer_diagnostics = {}  # reset for next step
+        # ─── Memory Bank diagnostics (consolidation stats) ───
+        if self.memory_bank is not None:
+            try:
+                _mbd = self.memory_bank.get_diagnostics()
+                self._cached_losses['mb_l1_merges'] = _mbd['l1_merges']
+                self._cached_losses['mb_l2_merges'] = _mbd['l2_merges']
+                self._cached_losses['mb_l3_births'] = _mbd['l3_n_births']
+                self._cached_losses['mb_l3_updates'] = _mbd['l3_n_updates']
+                self._cached_losses['mb_scale'] = _mbd['mem_scale']
+            except Exception:
+                pass
         pred_w_loss = 0.0
         n_pred_w = 0
         head = getattr(self, 'lm_head', None)
