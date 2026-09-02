@@ -55,7 +55,9 @@ step   4893: val=10.0403 val_ppl=22,900     ← best 18.pt (DepthController: 24/
 step   5126: val=9.9930  val_ppl=21,900     ← best 19.pt (val < 10.0!)
 step   5359: val=9.9475  val_ppl=20,900     ← best 20.pt
 step   5592: val=9.8990  val_ppl=19,900     ← best 21.pt
-step   5825: val=9.8504  val_ppl=19,000     ← best 22.pt (current)
+step   5825: val=9.8504  val_ppl=19,000     ← best 22.pt
+step   8621: val=9.350   val_ppl=11,500     ← best 23.pt (hybrid gate replacing frozen mod_scale_mlp)
+step   9087: val=9.279   val_ppl=10,700     ← best 24.pt (current)
 ```
 
 ### Траектория train (выборочно)
@@ -275,11 +277,43 @@ step   5825: val=9.8504  val_ppl=19,000     ← best 22.pt (current)
 
 ### Прогноз
 
-- **Step 6000–8000:** val < 9.5, maturation > 0.4, L3 concepts growing
-- **Step 8000–12000:** CE < 8.0, memory bank fully saturated
-- **Step 15000–20000:** maturation > 0.5, val < 9.0
+- **Step 10000–15000:** val < 9.0, hybrid gate stabilizing, mirror divergency increasing
+- **Step 15000–20000:** maturation > 0.4, L3 concepts growing, specialized mirrors
+- **Step 20000–30000:** CE < 7.0, val < 8.5, memory bank fully saturated
 - **Цель:** val < 9.0 (лучше прошлого раунда 8.734)
 
-**Текущий темп:** val снижается стабильно: 10.087→9.850 за ~1165 шагов (~0.02/100 steps). Memory bank активно заполняется (L3: 7→177 concepts за ~1000 шагов). DepthController=24/24, VRAM=8.3GB.
+**Текущий темп:** val снижается стабильно: 9.850→9.279 за ~3260 шагов (~0.017/100 steps). Hybrid gate (sigmoid+softmax) заморозил frozen mod_scale_mlp. Mirror divergency началась: gate_var L20 вырос 0.088→0.106. L2 vals нормализуются (std 416→282). maturation: 0.365→0.337. DepthController=24/24, VRAM=14.4GB.
 
-> **Примечание:** scale=-0.964 не двигается. Memory bank взрывается: L1=43158, L2=43158 (42982 consumed), L3=8 concepts (177 born). DepthController=24/24. intent_w spike до 1.39 на step ~5115. val=9.85 — первый раз < 10.0.
+> **Примечание:** Hybrid gate.replace frozen mod_scale_mlp (commit 0c95cf5). sigmoid(mod_scale_mlp)=0.750 для всех экспертов. Bridge gate: log_gain=0.975-0.993. Private memory norm растёт: L10 pm_norm 0.104→0.311. Memory bank: L1=37908, L2=37908(19932c), L3=8(10041b).
+
+### Фаза 9 (step 8621–9087): Hybrid gate activation
+
+- Hybrid gate (sigmoid+softmax) замораживает frozen mod_scale_mlp, gateway=0.750
+- mod_std: 0.086→0.083→0.081→0.082→0.083 (очистка от шума 10k шагов с одинаковым gate)
+- diversity: 115→80 (нормально — эксперты специализируются, фокусируются)
+- gate_var L20: 0.088→0.106 (per-expert divergency началась)
+- val: 9.350→9.279 (-0.071 за 466 шагов)
+- maturation: 0.313→0.337 (медленно растёт)
+- pm_norm L10: 0.207→0.311 (private memory включается)
+- L2 vals std: 416→282 (нормализация стабилизирует)
+- VRAM: 14.4/15.0 GB (24/24 слоёв активны + memory bank)
+
+### Ключевые метрики (best_24, step 9087)
+
+| Метрика | Значение |
+|---------|----------|
+| val_loss | 9.279 |
+| train CE | 8.775 |
+| maturation (deep/shallow) | 0.337 / 0.150 |
+| mod_mlp (LIVE) | 0.511 |
+| mod_std (LIVE) | 0.082 |
+| intent_w | 1.572 |
+| bridge_conn | 0.183 |
+| L1 / L2 / L3 | 37908 / 37908(19932c) / 8(10041b) |
+| active_depth | **24/24** |
+| scale | -0.964 |
+| VRAM | **14.4 GB** |
+| hybrid_gate.log_tau | 0.0 (tau=1.0) |
+| diversity | 80.1 |
+| gate_var L20 | 0.106 |
+| pm_norm L10 | 0.311 |

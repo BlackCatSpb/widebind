@@ -1,36 +1,69 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys; sys.path.insert(0, '.')
 import torch, math
+from core.config import WideBindConfig
 
-ck = torch.load('checkpoints/best 4.pt', map_location='cpu', weights_only=False)
-print('=== BEST 4 CHECKPOINT ===')
-print('keys:', list(ck.keys()))
-if 'step' in ck: print('step:', ck['step'])
-if 'val_loss' in ck: print('val_loss:', ck['val_loss'])
-if 'best_val_loss' in ck: print('best_val_loss:', ck['best_val_loss'])
-if 'cfg' in ck: print('cfg:', ck['cfg'])
-if 'active_depth' in ck: print('active_depth:', ck['active_depth'])
-sd = ck.get('model', ck.get('state_dict', {}))
-if not sd:
-    print('No model weights found')
-else:
-    params = sum(v.numel() for v in sd.values())
-    print('params:', params)
-    for k,v in sd.items():
-        if 'maturation' in k.lower() or 'mat_gate' in k.lower() or k.endswith('.mat'):
-            print(f'  {k}: shape={list(v.shape)} val={v.mean().item():.4f} [{v.min().item():.4f}, {v.max().item():.4f}]')
-    for k,v in sd.items():
-        if 'bridge' in k.lower():
-            print(f'  {k}: shape={list(v.shape)} mean={v.mean().item():.6f}')
-    for k,v in sd.items():
-        if 'concept' in k.lower():
-            print(f'  {k}: shape={list(v.shape)} mean={v.mean().item():.6f}')
-    for k,v in sd.items():
-        if 'head' in k.lower():
-            print(f'  {k}: shape={list(v.shape)} mean={v.mean().item():.6f}')
-    for k,v in sd.items():
-        if 'mirror' in k.lower():
-            print(f'  {k}: shape={list(v.shape)} mean={v.mean().item():.6f}')
-    nan_count = sum(1 for v in sd.values() if torch.isnan(v).any())
-    inf_count = sum(1 for v in sd.values() if torch.isinf(v).any())
-    print(f'NaN tensors: {nan_count}, Inf tensors: {inf_count}')
+ckpt = torch.load(r'C:\Users\black\OneDrive\Desktop\best.pt', map_location='cpu', weights_only=False)
+sd = ckpt['model']
+
+cfg = ckpt.get('cfg')
+print('Config from checkpoint:')
+print(f'  D={cfg.D}, n_layers={cfg.n_layers}, vocab={cfg.vocab}')
+print(f'  memory_bank={cfg.memory_bank}')
+print(f'  bridge_conn={cfg.bridge_conn}, bridge_dim={cfg.bridge_dim}')
+print(f'  maturation_enabled={cfg.maturation_enabled}')
+
+# Check all params for NaN/Inf
+nan_count = 0
+inf_count = 0
+for k, v in sd.items():
+    if v.isnan().any():
+        nan_count += 1
+        print(f'  NaN: {k}')
+    if v.isinf().any():
+        inf_count += 1
+        print(f'  Inf: {k}')
+print(f'\nTotal NaN: {nan_count}, Inf: {inf_count}')
+
+# Check expert gate norms per layer
+print('\nExpert gate norms per layer:')
+for i in range(24):
+    k = f'layers.{i}.mirror.W_gate'
+    if k in sd:
+        w = sd[k]
+        print(f'  layer {i}: norm={w.norm():.4f} std={w.std():.6f}')
+
+# Check maturation
+log_tau = sd.get('maturation._log_tau')
+if log_tau is not None:
+    print(f'\nmaturation._log_tau: {log_tau}')
+tau_l = sd.get('tau_l_dev')
+if tau_l is not None:
+    print(f'tau_l_dev: {tau_l}')
+
+print(f'active_depth: {ckpt.get("active_depth")}')
+
+# Check that all non-memory-bank params match a fresh model
+print('\n--- Comparing with fresh model ---')
+fresh_cfg = WideBindConfig(D=cfg.D, n_layers=cfg.n_layers, vocab=cfg.vocab,
+    mlp_groups=cfg.mlp_groups, bind_K=cfg.bind_K, bridge_conn=cfg.bridge_conn,
+    bridge_dim=cfg.bridge_dim, maturation_enabled=cfg.maturation_enabled,
+    memory_bank=False)
+from core.stack import WideBindStack
+fresh = WideBindStack(fresh_cfg)
+fresh_sd = fresh.state_dict()
+
+# Compare shapes
+mismatch = 0
+for k in fresh_sd:
+    if k in sd:
+        if fresh_sd[k].shape != sd[k].shape:
+            print(f'  SHAPE MISMATCH: {k}: fresh={fresh_sd[k].shape} ckpt={sd[k].shape}')
+            mismatch += 1
+    else:
+        print(f'  MISSING in ckpt: {k}')
+        mismatch += 1
+for k in sd:
+    if k not in fresh_sd and 'memory_bank' not in k:
+        print(f'  EXTRA in ckpt (non-MB): {k}')
+        mismatch += 1
+print(f'Total mismatches: {mismatch}')
