@@ -115,8 +115,6 @@ class WideBindStack(nn.Module):
             l3_concepts=getattr(cfg, 'mem_l3_concepts', 8),
             l3_birth_threshold=getattr(cfg, 'mem_l3_birth_threshold', 0.7),
             min_write_maturation=getattr(cfg, 'mem_min_write_mat', 0.3),
-            l1_consolidate_sim=getattr(cfg, 'mem_l1_consolidate_sim', 0.85),
-            l2_consolidate_sim=getattr(cfg, 'mem_l2_consolidate_sim', 0.80),
             cfg=cfg,
         ) if getattr(cfg, 'memory_bank', False) else None
         # c_ema: global state EMA rate = write_rate * tau_mid

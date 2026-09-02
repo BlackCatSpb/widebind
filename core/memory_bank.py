@@ -2,7 +2,7 @@
 
 Architecture:
   L1 (immediate): rolling buffer of last K sentence embeddings
-    - Consolidation: merge similar entries instead of round-robin overwrite
+    - Simple ring buffer: overwrite oldest
     - No learning, just storage + attention read
     - Always active, no maturation gating
 
@@ -10,7 +10,7 @@ Architecture:
     - Write: at sentence boundaries (SEP token = 2)
     - Read: attention over slots at each token
     - Selective: novelty-based write gating
-    - Consolidation: merge similar keys via EMA when bank is full
+    - Simple ring buffer: overwrite oldest (or consumed slot from L3)
     - Differentiable: gradients flow through write/read
 
   L3 (concepts): emergent from L2 slot clustering
@@ -19,6 +19,7 @@ Architecture:
     - Concept update: running mean of cluster members
     - Read: attention over concepts (higher-level abstractions)
     - Long-range memory (tau ~ 500+)
+    - CONSUMES L2 slots: when concept born, source L2 slot marked for overwrite
 
 Integration:
   - Sits AFTER embedding, BEFORE first layer
@@ -26,6 +27,11 @@ Integration:
   - Read at every token position
   - NOT gated by maturation (always active)
   - Maturation controls depth of processing, not memory access
+
+Flow:
+  L1.write(summary)  -> overwrite oldest (fast)
+  L2.write(summary)  -> overwrite oldest or consumed (fast)
+  L3.write(l2_key)   -> if birth/update, mark L2 slot as consumed
 
 Design principles from EVA:
   - Softmax-free (sigmoid attention) — regime B
@@ -42,23 +48,16 @@ import torch.nn.functional as F
 
 
 class L1Buffer(nn.Module):
-    """Rolling buffer of last K sentence embeddings with intelligent consolidation.
+    """Rolling buffer of last K sentence embeddings.
 
-    Instead of simple round-robin overwrite, new entries are compared against
-    existing ones by cosine similarity. If a similar entry exists (>0.85 sim),
-    the new embedding is merged via EMA (memory-efficient deduplication).
-    Otherwise, the oldest entry is overwritten.
-
-    This ensures the buffer keeps diverse, representative samples instead of
-    just the most recent K entries (which may be redundant).
+    Simple ring buffer: overwrite oldest slot.
+    Fast, no cosine similarity checks.
     """
-    def __init__(self, D: int, bridge_dim: int, n_slots: int = 3,
-                 consolidate_sim: float = 0.85):
+    def __init__(self, D: int, bridge_dim: int, n_slots: int = 3):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.n_slots = n_slots
-        self._consolidate_sim = consolidate_sim
 
         # Project stored embeddings to bridge space (for keys)
         self.proj = nn.Linear(D, bridge_dim)
@@ -73,38 +72,13 @@ class L1Buffer(nn.Module):
         self.register_buffer('buf', torch.zeros(n_slots, D), persistent=True)
         self.register_buffer('buf_age', torch.zeros(n_slots), persistent=True)
         self._write_idx = 0
-        self._n_merges = 0
         self._n_overwrites = 0
 
     @torch.no_grad()
     def write(self, embedding: torch.Tensor) -> None:
-        """Write sentence embedding to buffer with consolidation.
-
-        If existing entry has cosine similarity > threshold, merge via EMA.
-        Otherwise, overwrite the oldest slot.
-        """
+        """Write sentence embedding to buffer. Overwrites oldest slot."""
         n_filled = min(self._write_idx, self.n_slots)
 
-        if n_filled > 0:
-            # Compare against existing entries
-            existing = self.buf[:n_filled]  # (n_filled, D)
-            emb_n = F.normalize(embedding.unsqueeze(0), dim=-1)  # (1, D)
-            exist_n = F.normalize(existing, dim=-1)  # (n_filled, D)
-            sims = (emb_n @ exist_n.T).squeeze(0)  # (n_filled,)
-            best_sim, best_idx = sims.max(0)
-
-            if best_sim.item() > self._consolidate_sim:
-                # MERGE: EMA update of the most similar entry
-                alpha = 0.3  # momentum: 30% new, 70% old
-                self.buf.data[best_idx] = F.normalize(
-                    self.buf[best_idx] * (1 - alpha) + embedding.float() * alpha,
-                    dim=-1)
-                self.buf_age.data[best_idx] = 0.0
-                self._n_merges += 1
-                self._write_idx += 1
-                return
-
-        # OVERWRITE: pick oldest slot
         if n_filled < self.n_slots:
             slot = n_filled  # fill empty slots first
         else:
@@ -137,7 +111,6 @@ class L1Buffer(nn.Module):
 
     def get_stats(self) -> dict:
         return {
-            'n_merges': self._n_merges,
             'n_overwrites': self._n_overwrites,
             'fill_rate': min(self._write_idx, self.n_slots) / self.n_slots,
         }
@@ -146,27 +119,21 @@ class L1Buffer(nn.Module):
         self.buf.zero_()
         self.buf_age.zero_()
         self._write_idx = 0
-        self._n_merges = 0
         self._n_overwrites = 0
 
 
 class L2Bank(nn.Module):
-    """Learned memory bank with N slots and consolidation.
+    """Learned memory bank with N slots.
 
-    When the bank is full and a new entry arrives:
-    1. Compare against all existing keys by cosine similarity
-    2. If similar (>threshold): merge key+value via EMA
-    3. If not similar: overwrite the oldest/least-used slot
-
-    This prevents unbounded growth and keeps the bank diverse.
+    Simple ring buffer: overwrite oldest or consumed slot.
+    Fast, no cosine similarity checks.
+    Consumed slots (from L3 concept birth) are prioritized for overwrite.
     """
-    def __init__(self, D: int, bridge_dim: int, n_slots: int = 16,
-                 consolidate_sim: float = 0.80):
+    def __init__(self, D: int, bridge_dim: int, n_slots: int = 16):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
         self.n_slots = n_slots
-        self._consolidate_sim = consolidate_sim
 
         self.W_k = nn.Linear(D, bridge_dim)
         self.W_v = nn.Linear(D, bridge_dim)
@@ -187,17 +154,17 @@ class L2Bank(nn.Module):
 
         self.register_buffer('slot_age', torch.zeros(n_slots), persistent=True)
         self.register_buffer('slot_novelty', torch.ones(n_slots), persistent=True)
+        self.register_buffer('slot_consumed', torch.zeros(n_slots, dtype=torch.bool), persistent=True)
         self._write_idx = 0
-        self._n_merges = 0
         self._n_overwrites = 0
+        self._n_consumed = 0
 
     @torch.no_grad()
-    def write(self, embedding: torch.Tensor) -> bool:
-        """Write to bank with consolidation.
+    def write(self, embedding: torch.Tensor) -> int:
+        """Write to bank. Returns slot index that was written.
 
-        If bank is full and entry is similar to existing: merge via EMA.
-        If bank is full and entry is novel: overwrite oldest slot.
-        If bank has space: fill next empty slot.
+        Prioritizes overwriting consumed slots (from L3 concept birth).
+        Falls back to overwriting oldest slot.
         """
         novelty_score = torch.sigmoid(self.novelty_gate(embedding))
 
@@ -207,42 +174,38 @@ class L2Bank(nn.Module):
             new_key = self.W_k(embedding.detach())
             new_val = self.W_v(embedding.detach())
 
-        if n_filled >= self.n_slots:
-            # Bank full — try consolidation first
-            exist_keys = F.normalize(self.keys.data[:n_filled], dim=-1)
-            new_key_n = F.normalize(new_key.unsqueeze(0), dim=-1)
-            sims = (new_key_n @ exist_keys.T).squeeze(0)  # (n_filled,)
-            best_sim, best_idx = sims.max(0)
-
-            if best_sim.item() > self._consolidate_sim:
-                # MERGE: EMA update
-                alpha = 0.3
-                self.keys.data[best_idx] = F.normalize(
-                    self.keys[best_idx] * (1 - alpha) + new_key * alpha, dim=-1)
-                self.vals.data[best_idx] = (
-                    self.vals[best_idx] * (1 - alpha) + new_val * alpha)
-                self.slot_age.data[best_idx] = 0.0
-                self.slot_novelty.data[best_idx] = max(
-                    self.slot_novelty[best_idx].item(), novelty_score.item())
-                self._n_merges += 1
-                self._write_idx += 1
-                return True
-
-            # OVERWRITE: oldest slot
-            slot = int(self.slot_age.argmax().item())
-            self._n_overwrites += 1
-        else:
+        if n_filled < self.n_slots:
             # Fill empty slot
             slot = n_filled
+        else:
+            # Prioritize overwriting consumed slots
+            consumed_mask = self.slot_consumed
+            if consumed_mask.any():
+                # Pick oldest consumed slot
+                consumed_ages = self.slot_age.clone()
+                consumed_ages[~consumed_mask] = -1  # ignore non-consumed
+                slot = int(consumed_ages.argmax().item())
+                self._n_consumed += 1
+            else:
+                # Overwrite oldest slot
+                slot = int(self.slot_age.argmax().item())
 
         self.keys.data[slot] = new_key
         self.vals.data[slot] = new_val
         self.slot_age.data[slot] = 0.0
         self.slot_novelty.data[slot] = novelty_score.item()
+        self.slot_consumed.data[slot] = False  # clear consumed flag
         mask = torch.arange(self.n_slots, device=self.slot_age.device) != slot
         self.slot_age.data[mask] += 1.0
+        self._n_overwrites += 1
         self._write_idx += 1
-        return True
+        return slot
+
+    @torch.no_grad()
+    def mark_consumed(self, slot: int) -> None:
+        """Mark slot as consumed by L3 concept birth."""
+        if 0 <= slot < self.n_slots:
+            self.slot_consumed.data[slot] = True
 
     def read(self, query: torch.Tensor) -> torch.Tensor:
         """Read from bank using attention.
@@ -269,10 +232,11 @@ class L2Bank(nn.Module):
 
     def get_stats(self) -> dict:
         return {
-            'n_merges': self._n_merges,
             'n_overwrites': self._n_overwrites,
+            'n_consumed': self._n_consumed,
             'fill_rate': min(self._write_idx, self.n_slots) / self.n_slots,
             'novelty_mean': self.slot_novelty.mean().item(),
+            'consumed_count': int(self.slot_consumed.sum().item()),
         }
 
     def reset(self) -> None:
@@ -280,9 +244,10 @@ class L2Bank(nn.Module):
         self.vals.data.zero_()
         self.slot_age.zero_()
         self.slot_novelty.zero_()
+        self.slot_consumed.zero_()
         self._write_idx = 0
-        self._n_merges = 0
         self._n_overwrites = 0
+        self._n_consumed = 0
 
 
 class L3Concepts(nn.Module):
@@ -300,6 +265,9 @@ class L3Concepts(nn.Module):
       3. An empty slot is available (or least-used concept is evicted)
 
     Concept death: unused concepts decay via age and get evicted.
+
+    CONSUMES L2 slots: when concept is born/updated, the source L2 slot
+    is marked as consumed (for cleanup in L2).
     """
     def __init__(self, D: int, bridge_dim: int, n_concepts: int = 8,
                  birth_threshold: float = 0.7, update_momentum: float = 0.1):
@@ -432,20 +400,20 @@ class L3Concepts(nn.Module):
 class StreamingMemoryBank(nn.Module):
     """Combined L1 + L2 + L3 memory bank for EVA.
 
+    Flow:
+      L1.write(summary)  -> overwrite oldest (fast)
+      L2.write(summary)  -> overwrite oldest or consumed (fast)
+      L3.write(l2_key)   -> if birth/update, mark L2 slot as consumed
+
     Integration points:
     - forward(h, tokens, step, mat_gate): read from L1+L2+L3 at each position
     - write_boundary(embedding): called at sentence boundaries
     - reset(): clear all memory (for new sequence)
-
-    All levels use consolidation: similar entries are merged via EMA,
-    preventing unbounded growth and keeping diverse representations.
     """
     def __init__(self, D: int, bridge_dim: int,
                  l1_slots: int = 3, l2_slots: int = 16,
                  l3_concepts: int = 8, l3_birth_threshold: float = 0.7,
                  min_write_maturation: float = 0.3,
-                 l1_consolidate_sim: float = 0.85,
-                 l2_consolidate_sim: float = 0.80,
                  cfg=None):
         super().__init__()
         self.D = D
@@ -453,13 +421,11 @@ class StreamingMemoryBank(nn.Module):
         self.cfg = cfg
         self._min_write_maturation = min_write_maturation
 
-        # L1: rolling buffer with consolidation (immediate, ~last K diverse sentences)
-        self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots,
-                           consolidate_sim=l1_consolidate_sim)
+        # L1: rolling buffer (immediate, ~last K diverse sentences)
+        self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots)
 
-        # L2: learned bank with consolidation (short-term, ~N diverse slots)
-        self.l2 = L2Bank(D, bridge_dim, n_slots=l2_slots,
-                         consolidate_sim=l2_consolidate_sim)
+        # L2: learned bank (short-term, ~N diverse slots)
+        self.l2 = L2Bank(D, bridge_dim, n_slots=l2_slots)
 
         # L3: emergent concepts (long-range, ~8 concepts from L2 clustering)
         self.l3 = L3Concepts(D, bridge_dim, n_concepts=l3_concepts,
@@ -510,17 +476,20 @@ class StreamingMemoryBank(nn.Module):
                         if _can_write:
                             self.l1.write(summary)
 
-                        # Write to L2 (novelty-gated, only when allowed)
-                        wrote_l2 = False
+                        # Write to L2 (only when allowed)
+                        l2_slot = -1
                         if _can_write:
-                            wrote_l2 = self.l2.write(summary)
+                            l2_slot = self.l2.write(summary)
 
-                        # Write to L3 (concept clustering from L2 key, only when allowed)
-                        if _can_write and wrote_l2:
-                            last_slot = (self.l2._write_idx - 1) % self.l2.n_slots
-                            l2_key = self.l2.keys[last_slot]  # (bridge_dim,)
-                            conf = self.l2.slot_novelty[last_slot].item()
-                            self.l3.write(l2_key, confidence=conf)
+                        # Write to L3 (concept clustering from L2 key)
+                        # If L3 writes (birth/update), mark L2 slot as consumed
+                        if _can_write and l2_slot >= 0:
+                            l2_key = self.l2.keys[l2_slot]  # (bridge_dim,)
+                            conf = self.l2.slot_novelty[l2_slot].item()
+                            wrote_l3 = self.l3.write(l2_key, confidence=conf)
+                            if wrote_l3:
+                                # L3 consumed this L2 slot — mark for overwrite
+                                self.l2.mark_consumed(l2_slot)
 
                         sent_start = t + 1
 
@@ -555,12 +524,11 @@ class StreamingMemoryBank(nn.Module):
         l3s = self.l3.get_stats()
         return {
             'l1_write_idx': self.l1._write_idx,
-            'l1_merges': l1s['n_merges'],
             'l1_overwrites': l1s['n_overwrites'],
             'l1_fill': l1s['fill_rate'],
             'l2_write_idx': self.l2._write_idx,
-            'l2_merges': l2s['n_merges'],
             'l2_overwrites': l2s['n_overwrites'],
+            'l2_consumed': l2s['n_consumed'],
             'l2_fill': l2s['fill_rate'],
             'l2_novelty_mean': l2s['novelty_mean'],
             'l2_age_mean': self.l2.slot_age.mean().item(),

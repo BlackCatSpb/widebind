@@ -299,8 +299,6 @@ class WideBindConfig:
     mem_l3_birth_threshold: float = 0.7  # cosine sim threshold for concept birth
     mem_min_write_mat: float = 0.3  # min maturation before writes allowed (like private_mem)
     mem_bridge_dim: int = 256       # memory bank bridge dim (matches bridge_dim)
-    mem_l1_consolidate_sim: float = 0.85  # L1: cosine sim threshold for merge (vs overwrite)
-    mem_l2_consolidate_sim: float = 0.80  # L2: cosine sim threshold for merge (vs overwrite)
     concept_birth_novelty_threshold: float = 0.15  # birth only if d_min > threshold (best_sim < 1-threshold)
 
     # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
