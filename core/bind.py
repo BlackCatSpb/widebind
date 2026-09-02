@@ -133,6 +133,7 @@ class BottleneckBind(nn.Module):
         # --- cascade mix ---
         if self.mode == "cascade":
             self.mix_logit = nn.Parameter(fib_sigmoid_init(self.S).log() - (1 - fib_sigmoid_init(self.S)).log())
+            self.log_tau = nn.Parameter(torch.tensor(1.0))  # shared tau for hybrid mixing
 
     def _tie_hook(self, module, inp):
         with torch.no_grad():
@@ -185,10 +186,11 @@ class BottleneckBind(nn.Module):
                 a[n] = F.normalize(crossed + 1e-10, dim=-1) * seed_norm
 
             if getattr(self, 'softmax_free', True):
-                # Режим Б: Фибоначчи-каскад смешивается нормированным
-                # сигмоид-средним (выпуклая комбинация членов развёртки),
-                # а не softmax-конкуренцией. Держит сумму весов = 1.
-                mix = torch.sigmoid(self.mix_logit)
+                # HYBRID: sigmoid (independent) * (1 + softmax (competitive))
+                # Both paths share the same logits — synchronized gradients
+                independent = torch.sigmoid(self.mix_logit)
+                relative = F.softmax(self.mix_logit / torch.exp(self.log_tau), dim=0)
+                mix = independent * (1.0 + relative)
                 mix = mix / mix.sum().clamp(min=1e-6)
             else:
                 mix = torch.softmax(self.mix_logit, dim=0)
@@ -500,6 +502,7 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
 
         # РЅР°РєР»РѕРЅ sigmoid-РіРµР№С‚РѕРІ С‡С‚РµРЅРёСЏ (РѕР±СѓС‡Р°РµРјС‹Р№, VSA вЂ” Р±РµР· softmax/T)
         self.logit_gain = nn.Parameter(torch.tensor(3.0))
+        self.log_tau = nn.Parameter(torch.tensor(1.0))  # shared tau for hybrid attention
 
     @staticmethod
     def _fib_list(max_n):
@@ -606,22 +609,27 @@ class TrajectoryManifoldBind(TrajectorySpiralBind):
         return 1.0 / (1.0 + self._zlen(self._fib_cache, int(age)))
 
     def _manifold_read(self, hp):
-        """Р‘Р°РЅРґР»-С‡С‚РµРЅРёРµ: sigmoid-РіРµР№С‚С‹ РїРѕ СЃС…РѕРґСЃС‚РІСѓ qв†”beam В· Zeck-Р·Р°С‚СѓС…Р°РЅРёРµ.
+        """Бандл-чтение: hybrid attention (sigmoid * (1 + softmax/tau)) по сходству q↔beam · Zeck-затухание.
 
-        РќРёРєР°РєРѕРіРѕ softmax: РєР°Р¶РґС‹Р№ Р»СѓС‡ РіРµР№С‚РёСЂСѓРµС‚СЃСЏ РЅРµР·Р°РІРёСЃРёРјРѕ (СЃРІРѕСЏ СЃРёР»Р°),
-        СЃСѓРјРјР° РЅРѕСЂРјРёСЂСѓРµС‚СЃСЏ вЂ” РЅРѕ СЌС‚Рѕ РЅРµ РєРѕРЅРєСѓСЂРµРЅС‚РЅР°СЏ РЅРѕСЂРјРёСЂРѕРІРєР°, Р° VSA-Р±Р°РЅРґР».
+        Hybrid: sigmoid (independent) * (1 + softmax (competitive)) — synchronized gradients.
         """
         B, L, K = hp.shape
         beam = self.beam_centers  # (n_beams, K)
         n_eff = int(self.beam_counts.clamp(min=0).gt(0).sum().item())
         if n_eff == 0:
             return torch.zeros(B, L, K, device=hp.device, dtype=hp.dtype)
-        hp = hp.float()  # fp32-РїСЂРµС†РёР·РёСЏ РґР»СЏ СЃС‚Р°Р±РёР»СЊРЅС‹С… sigmoid-РіРµР№С‚РѕРІ
+        hp = hp.float()  # fp32-прецизия для стабильных sigmoid-гейтов
         beam = beam[:n_eff] / beam[:n_eff].norm(dim=-1, keepdim=True).clamp(min=1e-10)
         qnorm = hp.norm(dim=-1, keepdim=True).clamp(min=1e-10)
         sims = (hp / qnorm) @ beam.T  # (B, L, n_beams)
+        
+        # Hybrid attention: sigmoid (independent) * (1 + softmax (competitive))
         logit_gain = self.logit_gain.clamp(min=0.1)
-        w = torch.sigmoid(sims * logit_gain)  # (B, L, n_beams) РЅРµР·Р°РІРёСЃРёРјС‹Рµ РіРµР№С‚С‹
+        tau = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
+        independent = torch.sigmoid(sims * logit_gain)  # independent per beam
+        relative = F.softmax(sims * logit_gain / tau, dim=-1)  # competitive relative ranking
+        w = independent * (1.0 + relative)  # combined effect
+        
         now = int(self._trans_idx.item())
         ages = [max(0, now - int(a)) for a in self.beam_age[:n_eff].tolist()]
         decay = torch.tensor([self._zeck_weight(a) for a in ages],

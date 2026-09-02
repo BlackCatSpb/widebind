@@ -51,36 +51,42 @@ import torch.nn.functional as F
 def _memory_attention(q: torch.Tensor, k: torch.Tensor, temp: torch.Tensor,
                       bridge_dim: int, softmax_free: bool = True,
                       age_decay: torch.Tensor = None) -> torch.Tensor:
-    """Compute attention weights for memory bank read.
+    """Compute attention weights for memory bank read using HYBRID approach.
     
-    Supports both sigmoid (softmax-free) and softmax attention modes.
+    Hybrid: gate = sigmoid(scores) * (1 + softmax(scores / tau))
+    
+    This couples sigmoid (independent) and softmax (competitive) paths
+    through shared logits, ensuring synchronized gradient flow.
     
     Args:
         q: (B, L, bridge_dim) — query
         k: (n_slots, bridge_dim) — keys
-        temp: scalar tensor — temperature
+        temp: scalar tensor — temperature (tau)
         bridge_dim: int — dimension for scaling
-        softmax_free: bool — if True, use sigmoid; if False, use softmax
+        softmax_free: bool — if True, use hybrid; if False, use softmax only
         age_decay: (n_slots,) optional — age-based decay for slots
     
     Returns:
         attn: (B, L, n_slots) — attention weights (sums to 1 per position)
     """
-    # Dot product attention
+    # Dot product attention scores
     scores = (q @ k.T) / math.sqrt(bridge_dim) * temp  # (B, L, n_slots)
     
     if softmax_free:
-        # Sigmoid attention (softmax-free, independent per slot)
-        attn = torch.sigmoid(scores)
+        # HYBRID: sigmoid (independent) * (1 + softmax (competitive))
+        # Both paths share the same logits — synchronized gradients
+        independent = torch.sigmoid(scores)  # [0,1] per slot, no competition
+        relative = F.softmax(scores / temp, dim=-1)  # sum=1, relative ranking
+        attn = independent * (1.0 + relative)  # combined effect
     else:
-        # Softmax attention (competitive, sums to 1)
+        # Pure softmax (competitive)
         attn = F.softmax(scores, dim=-1)
     
     # Apply age decay if provided
     if age_decay is not None:
         attn = attn * age_decay.unsqueeze(0).unsqueeze(0)
     
-    # Normalize to sum to 1 (for sigmoid mode; softmax already sums to 1)
+    # Normalize to sum to 1
     attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
     attn = attn / attn_sum
     
@@ -93,6 +99,7 @@ class L1Buffer(nn.Module):
     Simple ring buffer: overwrite oldest slot.
     Fast, no cosine similarity checks.
     Keys normalized via F.normalize for consistent attention with L2/L3.
+    Uses hybrid attention (sigmoid * (1 + softmax/tau)).
     """
     def __init__(self, D: int, bridge_dim: int, n_slots: int = 3,
                  softmax_free: bool = True):
@@ -108,8 +115,8 @@ class L1Buffer(nn.Module):
         self.q_proj = nn.Linear(D, bridge_dim)
         # Output projection: buf is (n_slots, D), read output is (B, L, D)
         self.out_proj = nn.Linear(D, D)
-        # Learnable temperature for attention
-        self.log_temp = nn.Parameter(torch.tensor(1.0))
+        # Learnable temperature for attention (tau)
+        self.log_tau = nn.Parameter(torch.tensor(1.0))
 
         # Persistent buffer: (n_slots, D)
         self.register_buffer('buf', torch.zeros(n_slots, D), persistent=True)
@@ -136,7 +143,7 @@ class L1Buffer(nn.Module):
         self._write_idx += 1
 
     def read(self, query: torch.Tensor) -> torch.Tensor:
-        """Read from buffer using attention.
+        """Read from buffer using hybrid attention.
 
         query: (B, L, D) — current hidden state
         returns: (B, L, D) — memory read output
@@ -146,7 +153,7 @@ class L1Buffer(nn.Module):
         k = F.normalize(self.proj(self.buf), dim=-1)  # (n_slots, bridge_dim) — normalized!
         v = self.out_proj(self.buf)  # (n_slots, D)
 
-        temp = torch.exp(self.log_temp).clamp(min=0.1, max=10.0)
+        temp = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
         age_decay = torch.exp(-0.01 * self.buf_age)  # age-based decay
         attn = _memory_attention(q, k, temp, self.bridge_dim, 
                                  self._softmax_free, age_decay)  # (B, L, n_slots)
@@ -176,6 +183,7 @@ class L2Bank(nn.Module):
     
     Keys normalized via F.normalize + tau-based scaling (hybrid approach).
     Values scaled via tau-based sigmoid (preserves magnitude info).
+    Uses hybrid attention (sigmoid * (1 + softmax/tau)).
     """
     def __init__(self, D: int, bridge_dim: int, n_slots: int = 16,
                  softmax_free: bool = True):
@@ -200,7 +208,7 @@ class L2Bank(nn.Module):
             nn.Linear(bridge_dim, 1),
         )
 
-        self.log_temp = nn.Parameter(torch.tensor(1.0))
+        self.log_tau = nn.Parameter(torch.tensor(1.0))  # shared tau for attention
         
         # Tau-based scaling for keys/vals (hybrid approach)
         # Keys: F.normalize + sigmoid(tau) for stable cosine similarity
@@ -270,7 +278,7 @@ class L2Bank(nn.Module):
             self.slot_consumed.data[slot] = True
 
     def read(self, query: torch.Tensor) -> torch.Tensor:
-        """Read from bank using attention.
+        """Read from bank using hybrid attention.
 
         query: (B, L, D)
         returns: (B, L, D)
@@ -280,7 +288,7 @@ class L2Bank(nn.Module):
         k = self.keys  # (n_slots, bridge_dim)
         v = self.vals  # (n_slots, bridge_dim)
 
-        temp = torch.exp(self.log_temp).clamp(min=0.1, max=10.0)
+        temp = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
         age_decay = torch.exp(-0.01 * self.slot_age)
         attn = _memory_attention(q, k, temp, self.bridge_dim,
                                  self._softmax_free, age_decay)  # (B, L, n_slots)
@@ -350,8 +358,8 @@ class L3Concepts(nn.Module):
         self.q_proj = nn.Linear(D, bridge_dim)
         self.out_proj = nn.Linear(bridge_dim, D)
 
-        # Temperature
-        self.log_temp = nn.Parameter(torch.tensor(1.0))
+        # Temperature (tau)
+        self.log_tau = nn.Parameter(torch.tensor(1.0))
         
         # Tau-based scaling for concept values (hybrid approach)
         # Vals: F.normalize + sigmoid(tau) for stable representation
@@ -436,7 +444,7 @@ class L3Concepts(nn.Module):
         k = self.concept_keys  # (n_concepts, bridge_dim)
         v = self.concept_vals  # (n_concepts, bridge_dim)
 
-        temp = torch.exp(self.log_temp).clamp(min=0.1, max=10.0)
+        temp = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
         age_decay = torch.exp(-0.005 * self.concept_age)  # slower decay than L2 (concepts are long-range)
         attn = _memory_attention(q, k, temp, self.bridge_dim,
                                  self._softmax_free, age_decay)  # (B, L, n_concepts)
