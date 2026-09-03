@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import WideBindConfig
 from .vsa_utils import zeckendorf_codes, sparse_block_codes
+from .adaptive_gate import hybrid_gate
 
 
 class RotaryEmbedding(nn.Module):
@@ -207,16 +208,8 @@ class SigmoidCodedHead(nn.Module):
         return zt
 
     def _su(self, zt):
-        sig = torch.sigmoid(zt)
         tau = torch.exp(self.log_temp).clamp(0.1, 10.0)
-        rel = torch.softmax(zt / tau, dim=-1)
-        gate = sig * (1.0 + rel)
-        gate = gate.clamp(1e-7, 1 - 1e-7)
-        ls = torch.log(gate)
-        lms = torch.log(1 - gate)
-        u = ls - lms
-        base = lms.sum(-1)
-        return u, base
+        return hybrid_gate(zt, tau, log=True)
 
     def forward(self, h, bus_bias=None):
         if h.dim() == 2:
@@ -246,10 +239,8 @@ class SigmoidCodedHead(nn.Module):
             idx = torch.arange(raw.shape[1], device=raw.device)
             return raw[:, idx, targets] + self.token_bias[targets]
         zt = self._gates(h_in, bus_bias=bus_bias)
-        sig = torch.sigmoid(zt)
         tau = torch.exp(self.log_temp).clamp(0.1, 10.0)
-        rel = torch.softmax(zt / tau, dim=-1)
-        gate = sig * (1.0 + rel)
+        gate = hybrid_gate(zt, tau)
         gate = gate.clamp(1e-7, 1 - 1e-7)
         ls = torch.log(gate)
         lms = torch.log(1 - gate)

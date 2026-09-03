@@ -47,17 +47,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from core.adaptive_gate import hybrid_gate
+
 
 def _memory_attention(q: torch.Tensor, k: torch.Tensor, temp: torch.Tensor,
                       bridge_dim: int, softmax_free: bool = True,
                       age_decay: torch.Tensor = None) -> torch.Tensor:
     """Compute attention weights for memory bank read using HYBRID approach.
-    
+
     Hybrid: gate = sigmoid(scores) * (1 + softmax(scores / tau))
-    
-    This couples sigmoid (independent) and softmax (competitive) paths
-    through shared logits, ensuring synchronized gradient flow.
-    
+
     Args:
         q: (B, L, bridge_dim) — query
         k: (n_slots, bridge_dim) — keys
@@ -65,31 +64,23 @@ def _memory_attention(q: torch.Tensor, k: torch.Tensor, temp: torch.Tensor,
         bridge_dim: int — dimension for scaling
         softmax_free: bool — if True, use hybrid; if False, use softmax only
         age_decay: (n_slots,) optional — age-based decay for slots
-    
+
     Returns:
         attn: (B, L, n_slots) — attention weights (sums to 1 per position)
     """
-    # Dot product attention scores
-    scores = (q @ k.T) / math.sqrt(bridge_dim) * temp  # (B, L, n_slots)
-    
+    scores = (q @ k.T) / math.sqrt(bridge_dim) * temp
+
     if softmax_free:
-        # HYBRID: sigmoid (independent) * (1 + softmax (competitive))
-        # Both paths share the same logits — synchronized gradients
-        independent = torch.sigmoid(scores)  # [0,1] per slot, no competition
-        relative = F.softmax(scores / temp, dim=-1)  # sum=1, relative ranking
-        attn = independent * (1.0 + relative)  # combined effect
+        attn = hybrid_gate(scores, temp)
     else:
-        # Pure softmax (competitive)
         attn = F.softmax(scores, dim=-1)
-    
-    # Apply age decay if provided
+
     if age_decay is not None:
         attn = attn * age_decay.unsqueeze(0).unsqueeze(0)
-    
-    # Normalize to sum to 1
+
     attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
     attn = attn / attn_sum
-    
+
     return attn
 
 

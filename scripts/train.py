@@ -51,16 +51,6 @@ class TokenStream:
         return x.long(), y.long(), offset + batch_size * seq_len
 
 
-def create_lr_scheduler(optimizer, warmup, max_steps, lr):
-    """Linear warmup + cosine decay (returns multiplier 0..1 for LambdaLR)."""
-    def get_lr_mult(step):
-        if step < warmup:
-            return step / max(warmup, 1)
-        progress = (step - warmup) / max(max_steps - warmup, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_mult)
-
-
 def _opt_param_names(model, optimizer):
     names = {id(p): n for n, p in model.named_parameters()}
     return [names[id(p)] for g in optimizer.param_groups for p in g['params']]

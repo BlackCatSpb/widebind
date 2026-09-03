@@ -7,7 +7,6 @@ from .mlp import GroupedMLP
 from .block import WideBindBlock
 from .stack import WideBindStack, AdaptiveController, MirrorLRScheduler
 from .live_inference import LiveInference, MirrorMonitor
-from .curriculum import CurriculumTracker
 
 # Backward compat
 CognitiveMirror = GroupedCognitiveMirror

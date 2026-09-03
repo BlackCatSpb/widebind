@@ -198,9 +198,15 @@ class WideBindStack(nn.Module):
         # ─── Adaptive gate biases from mirror stats (per-layer) ───
         if adaptive:
             with torch.no_grad():
-                expl_raw, diff = AdaptiveController.stats(self.layers,
-                    expl_thresh=self.cfg.exploration_threshold,
-                    diff_thresh=self.cfg.differentiation_threshold)
+                # Cache per-layer stats to avoid double computation
+                _layer_stats_cache = {}
+                for i, layer in enumerate(self.layers):
+                    _layer_stats_cache[i] = AdaptiveController.layer_stats(layer,
+                        expl_thresh=self.cfg.exploration_threshold,
+                        diff_thresh=self.cfg.differentiation_threshold)
+
+                expl_raw = sum(e for e, _ in _layer_stats_cache.values()) / n_layers
+                diff = sum(d for _, d in _layer_stats_cache.values()) / n_layers
                 self._expl_ema.mul_(0.998).add_(expl_raw * (1.0 - 0.998))
                 global_expl = self._expl_ema.clamp(0.0, 1.0).item()
                 
@@ -209,9 +215,7 @@ class WideBindStack(nn.Module):
                         min_val=0.05, max_val=0.3))
                 
                 for i, layer in enumerate(self.layers):
-                    l_expl, l_diff = AdaptiveController.layer_stats(layer,
-                        expl_thresh=self.cfg.exploration_threshold,
-                        diff_thresh=self.cfg.differentiation_threshold)
+                    l_expl, l_diff = _layer_stats_cache[i]
                     lf = i / max(len(self.layers) - 1, 1)
                     dev = torch.tanh(self._tau_l_dev[i])
                     tau_l_val = (tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))).item()

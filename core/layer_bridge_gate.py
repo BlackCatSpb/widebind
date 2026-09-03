@@ -16,40 +16,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from core.adaptive_gate import hybrid_gate
+
 
 class SpectrumGate(nn.Module):
     """Sigmoid-Softmax hybrid gate.
-    
+
     gate = sigmoid(logits) * (1 + softmax(logits / tau))
-    
+
     - sigmoid: independent activation per feature (no zero-sum)
     - softmax: relative emphasis among features
     - tau controls the blend (high=diversity, low=precision)
-    
+
     tau can be:
     - Learnable (log_tau parameter) — model learns the blend
     - External (from maturation) — self-regulation through system tau
     """
-    
+
     def __init__(self, n_features: int, tau_init: float = 1.0):
         super().__init__()
         self.n_features = n_features
         self.log_tau = nn.Parameter(torch.tensor(math.log(tau_init)))
-    
+
     def forward(self, logits: torch.Tensor, tau_external: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Args:
-            logits: (*, n_features) — raw feature scores
-            tau_external: (*) — external tau (e.g., from maturation). If provided, overrides learnable tau.
-        """
         if tau_external is not None:
-            tau = tau_external.clamp(0.1, 10.0).unsqueeze(-1)  # (*, 1)
+            tau = tau_external.clamp(0.1, 10.0).unsqueeze(-1)
         else:
             tau = torch.exp(self.log_tau).clamp(0.1, 10.0)
-        independent = torch.sigmoid(logits)
-        relative = F.softmax(logits / tau, dim=-1)
-        return independent * (1.0 + relative)
-    
+        return hybrid_gate(logits, tau)
+
     @property
     def tau(self) -> torch.Tensor:
         return torch.exp(self.log_tau).clamp(0.1, 10.0)
