@@ -1107,7 +1107,7 @@ class WideBindStack(nn.Module):
                     _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
                     if _gr:
                         _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
-                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
+                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l].detach(), tau_external=_mat_tau)
                         _gate_outputs.append(_gated.mean())
                         _gates_items.append(_gated.mean().item())
                         _taus_items.append(_mat_tau.item())

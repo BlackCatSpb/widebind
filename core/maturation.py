@@ -105,7 +105,10 @@ class MaturationController(nn.Module):
         """
         if self.tau_config is not None:
             # Use tau_config's normalized tau (bilateral, learnable)
-            self.tau_norm.copy_(self.tau_config.tau_norm)
+            # .data.copy_() avoids creating CopyBackwards grad_fn on the buffer;
+            # grad_fn from the previous step's graph would be carried into the
+            # next forward pass, causing "backward through graph a second time".
+            self.tau_norm.data.copy_(self.tau_config.tau_norm.detach())
         elif tau_dev is not None:
             self._update_tau_norm(tau_dev)
         t = float(step)
@@ -113,10 +116,10 @@ class MaturationController(nn.Module):
         # Per-layer effective T0: deep layers (tau_norm≈1) → T_eff = T0
         # shallow layers (tau_norm≈0) → T_eff = T0 + T_delay
         gate = torch.sigmoid(
-            (t - (self.T0 + self.alpha * (1.0 - self.tau_norm) * self.T_delay)) / self.delta_t)
+            (t - (self.T0 + self.alpha * (1.0 - self.tau_norm.detach()) * self.T_delay)) / self.delta_t)
 
-        self.gate.copy_(gate)
-        return gate
+        self.gate.data.copy_(gate)
+        return self.gate
 
     @property
     def global_ready(self) -> bool:
