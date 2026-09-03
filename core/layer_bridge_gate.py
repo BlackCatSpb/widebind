@@ -40,7 +40,10 @@ class SpectrumGate(nn.Module):
 
     def forward(self, logits: torch.Tensor, tau_external: torch.Tensor | None = None) -> torch.Tensor:
         if tau_external is not None:
-            tau = tau_external.clamp(0.1, 10.0).unsqueeze(-1)
+            # P0 FIX: tau = effective_tau * exp(log_tau) instead of just tau_external
+            # This allows learnable deviation from the maturation-driven baseline
+            tau = tau_external.clamp(0.1, 10.0) * torch.exp(self.log_tau).clamp(0.1, 10.0)
+            tau = tau.clamp(0.1, 10.0)
         else:
             tau = torch.exp(self.log_tau).clamp(0.1, 10.0)
         return hybrid_gate(logits, tau)

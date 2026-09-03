@@ -45,11 +45,12 @@ import torch.nn as nn
 
 
 class MaturationController(nn.Module):
-    def __init__(self, n_layers, tau_min, tau_max, cfg):
+    def __init__(self, n_layers, tau_min, tau_max, cfg, tau_config=None):
         super().__init__()
         self.n_layers = int(n_layers)
         self.tau_min = float(tau_min)
         self.tau_max = float(tau_max)
+        self.tau_config = tau_config  # unified τ-field (if provided, replaces manual tau_norm)
         lf = torch.linspace(0.0, 1.0, self.n_layers)
         self.register_buffer("_lf", lf)
         self.register_buffer("tau_norm", torch.zeros(self.n_layers))
@@ -72,7 +73,11 @@ class MaturationController(nn.Module):
         self.bridge_control_threshold = float(
             getattr(cfg, "matur_bridge_control_threshold", 0.1))
 
-        self._update_tau_norm(torch.zeros(self.n_layers))  # dev = 0 initially
+        if self.tau_config is None:
+            self._update_tau_norm(torch.zeros(self.n_layers))  # dev = 0 initially
+        else:
+            self.tau_config.update()
+            self.tau_norm.copy_(self.tau_config.tau_norm)
 
     def _update_tau_norm(self, dev):
         log_tau = math.log(self.tau_min) + (
@@ -93,12 +98,15 @@ class MaturationController(nn.Module):
 
         Args:
             step: current training step
-            tau_dev: (n_layers,) deviation from base tau ladder (optional)
+            tau_dev: (n_layers,) deviation from base tau ladder (optional, legacy)
 
         Returns:
             gate: (n_layers,) per-layer maturation values in [0, 1]
         """
-        if tau_dev is not None:
+        if self.tau_config is not None:
+            # Use tau_config's normalized tau (bilateral, learnable)
+            self.tau_norm.copy_(self.tau_config.tau_norm)
+        elif tau_dev is not None:
             self._update_tau_norm(tau_dev)
         t = float(step)
 

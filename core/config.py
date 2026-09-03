@@ -320,6 +320,15 @@ class WideBindConfig:
                                     # 1.0 = instant overwrite (old behavior)
     vsa_b_lr_mult: float = 0.1      # optimizer LR multiplier for b_d/b_i
 
+    # ─── Unified τ-field (TauConfig) ───
+    # All τ-dependent quantities derived from ONE set of parameters.
+    tau_enabled: bool = True          # use unified tau_config (replaces _vsa_log_param + _tau_l_dev + _tau_intent_dev)
+    tau_min: float = 8.0              # fastest layer (shallow)
+    tau_max: float = 512.0            # slowest layer (deep)
+    tau_dev_max: float = 0.3          # max bilateral deviation from base ladder
+    tau_llrd_gamma: float = 0.3       # LLRD exponent: lr_l ∝ (tau_l / tau_ref)^(-gamma)
+    tau_mem_ref: float = 64.0         # reference τ for memory bank temperatures
+
     # ─── Qwen3-inspired upgrades ───
     bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)
     rope_theta: float = 1000000.0        # RoPE base frequency (Qwen3: 1e6)

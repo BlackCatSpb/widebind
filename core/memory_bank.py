@@ -93,7 +93,7 @@ class L1Buffer(nn.Module):
     Uses hybrid attention (sigmoid * (1 + softmax/tau)).
     """
     def __init__(self, D: int, bridge_dim: int, n_slots: int = 3,
-                 softmax_free: bool = True):
+                 softmax_free: bool = True, tau_prior: float = 0.5):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
@@ -107,7 +107,9 @@ class L1Buffer(nn.Module):
         # Output projection: buf is (n_slots, D), read output is (B, L, D)
         self.out_proj = nn.Linear(D, D)
         # Learnable temperature for attention (tau)
-        self.log_tau = nn.Parameter(torch.tensor(1.0))
+        # P0 FIX: initialize from τ-prior instead of frozen=1.0
+        # L1 = fastest: low tau → more precision
+        self.log_tau = nn.Parameter(torch.tensor(math.log(max(tau_prior, 0.1))))
 
         # Persistent buffer: (n_slots, D)
         self.register_buffer('buf', torch.zeros(n_slots, D), persistent=True)
@@ -177,7 +179,7 @@ class L2Bank(nn.Module):
     Uses hybrid attention (sigmoid * (1 + softmax/tau)).
     """
     def __init__(self, D: int, bridge_dim: int, n_slots: int = 16,
-                 softmax_free: bool = True):
+                 softmax_free: bool = True, tau_prior: float = 1.0):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
@@ -202,7 +204,9 @@ class L2Bank(nn.Module):
             nn.Linear(bridge_dim, 1),
         )
 
-        self.log_tau = nn.Parameter(torch.tensor(1.0))  # shared tau for attention
+        # P0 FIX: initialize from τ-prior instead of frozen=1.0
+        # L2 = medium: balanced tau
+        self.log_tau = nn.Parameter(torch.tensor(math.log(max(tau_prior, 0.1))))
         
         # Tau-based scaling for keys/vals (hybrid approach)
         # Keys: F.normalize + sigmoid(tau) for stable cosine similarity
@@ -335,7 +339,7 @@ class L3Concepts(nn.Module):
     """
     def __init__(self, D: int, bridge_dim: int, n_concepts: int = 8,
                  birth_threshold: float = 0.7, update_momentum: float = 0.1,
-                 softmax_free: bool = True):
+                 softmax_free: bool = True, tau_prior: float = 2.0):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
@@ -353,7 +357,9 @@ class L3Concepts(nn.Module):
         self.out_proj = nn.Linear(bridge_dim, D)
 
         # Temperature (tau)
-        self.log_tau = nn.Parameter(torch.tensor(1.0))
+        # P0 FIX: initialize from τ-prior instead of frozen=1.0
+        # L3 = slowest: high tau → more diversity (broader attention over concepts)
+        self.log_tau = nn.Parameter(torch.tensor(math.log(max(tau_prior, 0.1))))
         
         # Tau-based scaling for concept values (hybrid approach)
         # Vals: F.normalize + sigmoid(tau) for stable representation
@@ -487,7 +493,8 @@ class StreamingMemoryBank(nn.Module):
                  l3_concepts: int = 8, l3_birth_threshold: float = 0.7,
                  min_write_maturation: float = 0.3,
                  softmax_free: bool = True,
-                 cfg=None):
+                 cfg=None,
+                 tau_config=None):
         super().__init__()
         self.D = D
         self.bridge_dim = bridge_dim
@@ -495,15 +502,30 @@ class StreamingMemoryBank(nn.Module):
         self._min_write_maturation = min_write_maturation
         self._softmax_free = softmax_free
 
+        # Compute τ-priors from tau_config if available
+        if tau_config is not None:
+            mem_tau = tau_config.mem_tau  # (3,) — [L1_tau, L2_tau, L3_tau]
+            # Normalize to reasonable range for hybrid_gate temperature
+            l1_tau_prior = (mem_tau[0] / tau_config.mem_tau_ref).clamp(0.1, 5.0).item()
+            l2_tau_prior = (mem_tau[1] / tau_config.mem_tau_ref).clamp(0.1, 5.0).item()
+            l3_tau_prior = (mem_tau[2] / tau_config.mem_tau_ref).clamp(0.1, 5.0).item()
+        else:
+            l1_tau_prior = 0.5  # L1 = fast (low tau → precision)
+            l2_tau_prior = 1.0  # L2 = balanced
+            l3_tau_prior = 2.0  # L3 = slow (high tau → diversity)
+
         # L1: rolling buffer (immediate, ~last K diverse sentences)
-        self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots, softmax_free=softmax_free)
+        self.l1 = L1Buffer(D, bridge_dim, n_slots=l1_slots, softmax_free=softmax_free,
+                           tau_prior=l1_tau_prior)
 
         # L2: learned bank (short-term, ~N diverse slots)
-        self.l2 = L2Bank(D, bridge_dim, n_slots=l2_slots, softmax_free=softmax_free)
+        self.l2 = L2Bank(D, bridge_dim, n_slots=l2_slots, softmax_free=softmax_free,
+                         tau_prior=l2_tau_prior)
 
         # L3: emergent concepts (long-range, ~8 concepts from L2 clustering)
         self.l3 = L3Concepts(D, bridge_dim, n_concepts=l3_concepts,
-                             birth_threshold=l3_birth_threshold, softmax_free=softmax_free)
+                             birth_threshold=l3_birth_threshold, softmax_free=softmax_free,
+                             tau_prior=l3_tau_prior)
 
         # Fusion gate: combine L1 + L2 + L3 + current state
         self.fusion = nn.Sequential(

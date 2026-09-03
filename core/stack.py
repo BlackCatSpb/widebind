@@ -13,6 +13,7 @@ from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCod
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 from .memory_bank import StreamingMemoryBank
+from .tau_config import TauConfig
 
 class WideBindStack(nn.Module):
     """Stack of WideBindBlock layers with embedding and lm_head."""
@@ -96,13 +97,23 @@ class WideBindStack(nn.Module):
             cfg.n_layers,
             health_features=6,
         ) if getattr(cfg, 'bridge_conn', 0.0) > 0.0 else None
-        # ─── Idea 1: Learnable VSA timescales ───
+        # ─── Unified τ-field (TauConfig) ───
+        # Replaces _vsa_log_param + _tau_l_dev + _tau_intent_dev with ONE source of truth.
+        self.tau_config = TauConfig(
+            n_layers=cfg.n_layers,
+            tau_min=getattr(cfg, 'tau_min', 8.0),
+            tau_max=getattr(cfg, 'tau_max', 512.0),
+            dev_max=getattr(cfg, 'tau_dev_max', 0.3),
+            T0=getattr(cfg, 'matur_T0', 8000.0),
+            T_delay=getattr(cfg, 'matur_T_delay', 8000.0),
+            delta_t=getattr(cfg, 'matur_delta', 4000.0),
+            llrd_gamma=getattr(cfg, 'tau_llrd_gamma', 0.3),
+            mem_tau_ref=getattr(cfg, 'tau_mem_ref', 64.0),
+        )
+        # Legacy params kept for checkpoint compat — aliased to tau_config
+        # (training from scratch: tau_config._tau_dev replaces these)
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
-        # ─── Idea 4: Per-layer τ_l deviation ───
-        self._tau_l_dev = nn.Parameter(torch.zeros(cfg.n_layers))
-        # ─── Intent Bridge: own τ-ladder for context integration ───
-        # Мост контекста получает выделенный горизонт интеграции (отдельный от
-        # памяти), чтобы работать на всех диапазонах τ системы.
+        self._tau_l_dev = self.tau_config._tau_dev  # alias — shared gradient
         self._tau_intent_dev = nn.Parameter(torch.zeros(cfg.n_layers))
         # ─── Streaming Memory Bank (hierarchical L1+L2) ───
         # After embedding, before first layer. Read at every token position.
@@ -116,22 +127,23 @@ class WideBindStack(nn.Module):
             l3_birth_threshold=getattr(cfg, 'mem_l3_birth_threshold', 0.7),
             min_write_maturation=getattr(cfg, 'mem_min_write_mat', 0.3),
             cfg=cfg,
+            tau_config=self.tau_config,
         ) if getattr(cfg, 'memory_bank', False) else None
-        # c_ema: global state EMA rate = write_rate * tau_mid
-        tau_s = self.layers[0]._tau_s
-        tau_mid = math.sqrt(tau_s[0].item() * tau_s[-1].item())
+        # ─── τ-derived values (computed from tau_config) ───
+        self.tau_config.update()  # initial computation (mat_gate=None → defaults)
+        tau_l = self.tau_config.tau_l
+        tau_mid = math.sqrt(tau_l[0].item() * tau_l[-1].item())
         write_rate = 1.0 / math.sqrt(cfg.D)
         self._c_ema_value = write_rate * tau_mid
-        self._tau_min_value = tau_s[0].item()
-        self._tau_max_value = tau_s[-1].item()
+        self._tau_min_value = tau_l[0].item()
+        self._tau_max_value = tau_l[-1].item()
         self._tau_mid_value = tau_mid
         # ─── Maturation controller (unified wake-up gate) ───
-        # Replaces pm_write_delay / pm_coh_gate_std / bridge scale=0 crutches with
-        # one principled per-layer maturity M_l(t) gating live BridgeGLU, memory
-        # write, bridge injection and the intent bus. Created only when enabled.
+        # Uses tau_config.mat_delay for per-layer timing.
         if getattr(cfg, 'maturation_enabled', True):
             self.maturation = MaturationController(
-                cfg.n_layers, tau_s[0].item(), tau_s[-1].item(), cfg)
+                cfg.n_layers, tau_l[0].item(), tau_l[-1].item(), cfg,
+                tau_config=self.tau_config)
         else:
             self.maturation = None
         # EMA for exploration (smoothed over ~500 steps)
@@ -187,10 +199,17 @@ class WideBindStack(nn.Module):
                 reasoning_buffer = None
                 reasoning_count = None
         
-        # ─── Learnable VSA scales (Idea 1) — moved before AdaptiveController loop ───
-        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
-        tau_min = vsa_tau[0]
-        tau_max = vsa_tau[-1]
+        # ─── Unified τ-field: update all τ-derived values ───
+        mat_gate_for_tau = None
+        if self.maturation is not None and step is not None:
+            mat_gate_for_tau = self.maturation.gate  # use current gate values
+        self.tau_config.update(mat_gate_for_tau)
+        # Per-layer tau from tau_config (for maturation, intent, LLRD, diagnostics)
+        tau_l = self.tau_config.tau_l  # (n_layers,) — per-layer temporal scale
+        # Per-scale tau from _vsa_log_param (for block-level VSA memory, S=4)
+        vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0  # (4,) — per-scale
+        tau_min = tau_l[0]
+        tau_max = tau_l[-1]
         tau_mid = (tau_min * tau_max).sqrt()
         c_ema = (1.0 / math.sqrt(self.cfg.D)) * tau_mid
         n_layers = len(self.layers)
@@ -217,8 +236,7 @@ class WideBindStack(nn.Module):
                 for i, layer in enumerate(self.layers):
                     l_expl, l_diff = _layer_stats_cache[i]
                     lf = i / max(len(self.layers) - 1, 1)
-                    dev = torch.tanh(self._tau_l_dev[i])
-                    tau_l_val = (tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))).item()
+                    tau_l_val = self.tau_config.tau_l[i].item()
                     b_i_val = AdaptiveController.layer_b_i(layer, expl=l_expl, tau_l=tau_l_val)
                     b_d_max = getattr(self.cfg, 'vsa_b_d_max', 12.0)
                     b_d_val = AdaptiveController.layer_b_d(layer, expl=l_expl,
@@ -350,10 +368,6 @@ class WideBindStack(nn.Module):
             # so only local_intent (probe) contributes gradient — no cross-step BPTT.
             intent_i = None
             if self.intent_bridge:
-                _lf = i / max(n_layers - 1, 1)
-                _dev_i = torch.tanh(self._tau_intent_dev[i])
-                _tau_i = tau_min * (tau_max / tau_min) ** (_lf * (1.0 + 0.1 * _dev_i))
-                _alpha_i = torch.clamp(1.0 - c_ema / _tau_i, min=0.0)
                 _ki = self.layers[i].mirror.k
                 probe_out = self.intent_probe(h).reshape(
                     h.shape[0], h.shape[1], self._n_experts, self._K_max)  # (B,L,G,Kmax)
@@ -365,6 +379,8 @@ class WideBindStack(nn.Module):
                     # the head). (B,L,1) -> (B,L,1,1) broadcasts over (G,Kmax).
                     probe_out = probe_out * self._last_salience.unsqueeze(-1)
                 fresh_i = probe_out.mean(dim=(0, 1), keepdim=True)  # (1,1,G,Kmax), grad
+                # Use tau_config.intent_alpha instead of manual _tau_intent_dev
+                _alpha_i = self.tau_config.intent_alpha[i].detach()
                 intent_streams[i] = _alpha_i * _bus_carried[i] + (1.0 - _alpha_i) * fresh_i.detach()
                 # Streaming cross-layer bus (Bus): network-wide gist = mean over
                 # layers; FRESH for j<=i, CARRIED for j>i. Self-term (fresh_i)
@@ -493,11 +509,8 @@ class WideBindStack(nn.Module):
                 S = mem_flat.shape[-1] // layer.D
                 if S == 0:
                     S = 1
-                # Per-layer tau from VSA timescales + per-layer deviation (Idea 4)
-                lf = i / max(n_layers - 1, 1)
-                dev = torch.tanh(self._tau_l_dev[i])
-                tau_l = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
-                alpha_l = torch.clamp(1.0 - c_ema / tau_l, min=0.0)
+                # Per-layer tau from unified τ-field (tau_config)
+                alpha_l = self.tau_config.intent_alpha[i]
                 # (intent tau now computed before the block; see intent_i setup above)
                 # Weighted combination of scales для global state
                 w = torch.sigmoid(layer.scale_w)  # (S, D), per-channel independent
@@ -948,12 +961,8 @@ class WideBindStack(nn.Module):
                 wm = getattr(layer, 'w_mem2v', None)
                 if wm is not None:
                     lf = i / max(len(self.layers) - 1, 1)
-                    vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
-                    tau_min_t = vsa_tau[0]
-                    tau_max_t = vsa_tau[-1]
-                    tau_mid_t = (tau_min_t * tau_max_t).sqrt()
-                    dev = torch.tanh(self._tau_l_dev[i])
-                    tau_l_t = tau_min_t * (tau_max_t / tau_min_t) ** (lf * (1.0 + 0.1 * dev))
+                    tau_l_t = self.tau_config.tau_l[i]
+                    tau_mid_t = (self.tau_config.tau_l[0] * self.tau_config.tau_l[-1]).sqrt()
                     target = getattr(self.cfg, 'w_m2v_hierarchy_target', 1.0)
                     target_m2v = target / (1.0 + torch.exp(-(tau_l_t.log() - tau_mid_t.log())))
                     w_m2v_loss = w_m2v_loss + (wm.mean().detach() - target_m2v).pow(2)
@@ -964,15 +973,10 @@ class WideBindStack(nn.Module):
         intent_tau_loss = 0.0
         n_it = 0
         if self.intent_bridge and getattr(self.cfg, 'intent_tau_hierarchy_weight', 0.0) > 0:
-            vsa_tau = torch.exp(torch.cumsum(F.softplus(self._vsa_log_param), dim=0)) + 1.0
-            tau_min_t = vsa_tau[0]
-            tau_max_t = vsa_tau[-1]
-            tau_mid_t = (tau_min_t * tau_max_t).sqrt()
+            tau_mid_t = (self.tau_config.tau_l[0] * self.tau_config.tau_l[-1]).sqrt()
             c_ema_t = (1.0 / math.sqrt(self.cfg.D)) * tau_mid_t
             for i in range(len(self.layers)):
-                lf = i / max(len(self.layers) - 1, 1)
-                dev = torch.tanh(self._tau_intent_dev[i])
-                tau_intent_l = tau_min_t * (tau_max_t / tau_min_t) ** (lf * (1.0 + 0.1 * dev))
+                tau_intent_l = self.tau_config.tau_l[i]
                 actual_alpha = torch.clamp(1.0 - c_ema_t / tau_intent_l, min=0.0)
                 tgt = getattr(self.cfg, 'intent_tau_hierarchy_target', 0.3)
                 target_alpha = tgt / (1.0 + torch.exp(-(tau_intent_l.log() - tau_mid_t.log())))
@@ -1328,6 +1332,9 @@ class WideBindStack(nn.Module):
                     groups[k]['params'].append(p)
                 elif '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                     groups['vsa']['params'].append(p)
+                elif 'tau_config.' in name:
+                    # Unified τ-field: gate-like LR (fast adaptation for τ-deviation)
+                    groups['gate']['params'].append(p)
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
                     groups[k]['params'].append(p)

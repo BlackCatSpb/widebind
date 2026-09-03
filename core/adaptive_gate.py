@@ -100,8 +100,13 @@ class AdaptiveGate(nn.Module):
         self.register_buffer('_last_relative_entropy', torch.tensor(0.0))
         self.register_buffer('_last_gate_std', torch.tensor(0.0))
 
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        tau = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
+    def forward(self, logits: torch.Tensor, tau_prior: torch.Tensor | None = None) -> torch.Tensor:
+        if tau_prior is not None:
+            # P0 FIX: tau = tau_prior * exp(log_tau) — prior from τ-field, learnable deviation
+            tau = tau_prior.clamp(min=0.1, max=10.0) * torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
+            tau = tau.clamp(min=0.1, max=10.0)
+        else:
+            tau = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
         gate = hybrid_gate(logits, tau)
 
         # Update diagnostics
