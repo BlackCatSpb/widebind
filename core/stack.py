@@ -112,6 +112,9 @@ class WideBindStack(nn.Module):
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         self._tau_l_dev = self.tau_config._tau_dev  # alias — shared gradient
         # _tau_intent_dev removed: tau_config.intent_alpha replaces it entirely
+        # ─── τ-derived values (computed from tau_config) ───
+        self.tau_config.update()  # initial computation (mat_gate=None → defaults)
+        tau_l = self.tau_config.tau_l
         # ─── Streaming Memory Bank (hierarchical L1+L2) ───
         # After embedding, before first layer. Read at every token position.
         # Write at sentence boundaries. Writes gated by maturation (like private_mem).
@@ -126,9 +129,6 @@ class WideBindStack(nn.Module):
             cfg=cfg,
             tau_config=self.tau_config,
         ) if getattr(cfg, 'memory_bank', False) else None
-        # ─── τ-derived values (computed from tau_config) ───
-        self.tau_config.update()  # initial computation (mat_gate=None → defaults)
-        tau_l = self.tau_config.tau_l
         tau_mid = math.sqrt(tau_l[0].item() * tau_l[-1].item())
         write_rate = 1.0 / math.sqrt(cfg.D)
         self._c_ema_value = write_rate * tau_mid
@@ -1092,34 +1092,38 @@ class WideBindStack(nn.Module):
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
         }
         # ─── Layer Bridge Gate: log per-layer gate weights (SpectrumGate) ───
+        # Also compute a differentiable diversity aux loss so log_tau gets gradient.
         _lbg_aux = {}
+        _lbg_diversity_loss = 0.0
         if self.layer_bridge_gate is not None and self._layer_diagnostics:
-            with torch.no_grad():
-                _gates = []
-                _taus = []
-                _gr = False
-                if getattr(self, 'maturation', None) is not None:
-                    _gr = self.maturation.global_ready
-                for l in range(len(self.layers)):
-                    if l in self._layer_diagnostics:
-                        _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
-                        if _gr:
-                            _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
-                            _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
-                            _gates.append(_gated.mean().item())
-                            _taus.append(_mat_tau.item())
-                        else:
-                            _gates.append(_mat.item())
-                            _taus.append(self.layer_bridge_gate.tau_max)
+            _gr = False
+            if getattr(self, 'maturation', None) is not None:
+                _gr = self.maturation.global_ready
+            _gates_items = []
+            _taus_items = []
+            _gate_outputs = []  # differentiable
+            for l in range(len(self.layers)):
+                if l in self._layer_diagnostics:
+                    _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
+                    if _gr:
+                        _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
+                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l], tau_external=_mat_tau)
+                        _gate_outputs.append(_gated.mean())
+                        _gates_items.append(_gated.mean().item())
+                        _taus_items.append(_mat_tau.item())
                     else:
-                        _gates.append(0.5)
-                        _taus.append(1.0)
-                _gates_t = torch.tensor(_gates)
+                        _gates_items.append(_mat.item())
+                        _taus_items.append(self.layer_bridge_gate.tau_max)
+                else:
+                    _gates_items.append(0.5)
+                    _taus_items.append(1.0)
+            with torch.no_grad():
+                _gates_t = torch.tensor(_gates_items)
                 self._cached_losses['lbg_mean'] = _gates_t.mean().item()
                 self._cached_losses['lbg_std'] = _gates_t.std().item()
                 self._cached_losses['lbg_min'] = _gates_t.min().item()
                 self._cached_losses['lbg_max'] = _gates_t.max().item()
-                self._cached_losses['lbg_tau'] = sum(_taus) / len(_taus)
+                self._cached_losses['lbg_tau'] = sum(_taus_items) / len(_taus_items) if _taus_items else 0.0
                 self._cached_losses['lbg_global_ready'] = 1.0 if _gr else 0.0
                 _lbg_aux = {
                     'layer_gate_mean': _gates_t.mean().item(),
@@ -1128,6 +1132,14 @@ class WideBindStack(nn.Module):
                     'layer_gate_max': _gates_t.max().item(),
                     'lbg_global_ready': 1.0 if _gr else 0.0,
                 }
+            # Diversity loss: encourage gate weights to spread across layers
+            # (negative entropy = collapse to one layer = bad)
+            if _gate_outputs and _gr:
+                _gate_stack = torch.stack(_gate_outputs)
+                _gate_p = torch.softmax(_gate_stack, dim=0)
+                _gate_entropy = -(_gate_p * (_gate_p + 1e-8).log()).sum()
+                _max_ent = math.log(len(_gate_outputs))
+                _lbg_diversity_loss = (_max_ent - _gate_entropy).clamp(min=0) / _max_ent
             self._layer_diagnostics = {}  # reset for next step
         # ─── Memory Bank diagnostics (consolidation stats) ───
         if self.memory_bank is not None:
@@ -1221,6 +1233,18 @@ class WideBindStack(nn.Module):
             _bl = self.bridge.loss(targets, self.embed)
             if _bl is not None:
                 aux_dict['bridge_conn'] = _bl
+        # ─── _tau_dev regularization: prevent one-sided collapse ───
+        # Soft centering keeps the tau ladder near-uniform unless gradient
+        # strongly prefers compression. Without this, optimizer pushes dev
+        # negative (all tau shorter), collapsing the hierarchy.
+        if hasattr(self, 'tau_config') and self.tau_config is not None:
+            dev = self.tau_config._tau_dev
+            if dev.requires_grad:
+                # L2 penalty toward zero (uniform ladder)
+                _tau_dev_reg = dev.pow(2).mean() * 0.01
+                aux_dict['tau_dev_reg'] = _tau_dev_reg
+        if _lbg_diversity_loss != 0:
+            aux_dict['lbg_diversity'] = _lbg_diversity_loss
         return ce_loss, aux_dict
     
     @staticmethod

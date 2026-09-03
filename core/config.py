@@ -191,7 +191,7 @@ class WideBindConfig:
     lambda_lr_hierarchy: bool = True  # True = LR mult по степеням λ_d^p
 
     # Optimizer hardening / progressive unfreeze (anti-collapse guard)
-    llrd: float = 0.9              # layer-wise LR decay per depth (deeper => smaller LR)
+    llrd: float = 0.9              # DEPRECATED: index-based LR decay (replaced by tau_llrd_gamma)
     init_active_layers: int = 8    # blocks trainable from step 0 (rest frozen at init)
     stage_steps: int = 15000       # fixed backstop: unlock next block every N steps
     readiness_full: float = 0.6    # meta-maturity (differentiation) that unlocks deepest block

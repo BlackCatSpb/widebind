@@ -504,6 +504,7 @@ class StreamingMemoryBank(nn.Module):
         self.cfg = cfg
         self._min_write_maturation = min_write_maturation
         self._softmax_free = softmax_free
+        self.tau_config = tau_config
 
         # Compute τ-priors from tau_config if available
         if tau_config is not None:
