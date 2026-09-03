@@ -98,7 +98,6 @@ class WideBindStack(nn.Module):
             health_features=6,
         ) if getattr(cfg, 'bridge_conn', 0.0) > 0.0 else None
         # ─── Unified τ-field (TauConfig) ───
-        # Replaces _vsa_log_param + _tau_l_dev + _tau_intent_dev with ONE source of truth.
         self.tau_config = TauConfig(
             n_layers=cfg.n_layers,
             tau_min=getattr(cfg, 'tau_min', 8.0),
@@ -107,14 +106,12 @@ class WideBindStack(nn.Module):
             T0=getattr(cfg, 'matur_T0', 8000.0),
             T_delay=getattr(cfg, 'matur_T_delay', 8000.0),
             delta_t=getattr(cfg, 'matur_delta', 4000.0),
-            llrd_gamma=getattr(cfg, 'tau_llrd_gamma', 0.3),
+            llrd_gamma=getattr(cfg, 'tau_llrd_gamma', 0.65),
             mem_tau_ref=getattr(cfg, 'tau_mem_ref', 64.0),
         )
-        # Legacy params kept for checkpoint compat — aliased to tau_config
-        # (training from scratch: tau_config._tau_dev replaces these)
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         self._tau_l_dev = self.tau_config._tau_dev  # alias — shared gradient
-        self._tau_intent_dev = nn.Parameter(torch.zeros(cfg.n_layers))
+        # _tau_intent_dev removed: tau_config.intent_alpha replaces it entirely
         # ─── Streaming Memory Bank (hierarchical L1+L2) ───
         # After embedding, before first layer. Read at every token position.
         # Write at sentence boundaries. Writes gated by maturation (like private_mem).
@@ -339,9 +336,7 @@ class WideBindStack(nn.Module):
             self.bridge.start_forward()
         for i, (layer, s) in enumerate(zip(self.layers, state)):
             if adaptive:
-                l_expl, l_diff = AdaptiveController.layer_stats(layer,
-                    expl_thresh=self.cfg.exploration_threshold,
-                    diff_thresh=self.cfg.differentiation_threshold)
+                l_expl, l_diff = _layer_stats_cache[i]
                 mem2v_scale = AdaptiveController.layer_w_mem2v_scale(layer,
                     min_val=self.cfg.w_mem2v_scale_min, max_val=self.cfg.w_mem2v_scale_max,
                     diff=l_diff)
@@ -379,9 +374,10 @@ class WideBindStack(nn.Module):
                     # the head). (B,L,1) -> (B,L,1,1) broadcasts over (G,Kmax).
                     probe_out = probe_out * self._last_salience.unsqueeze(-1)
                 fresh_i = probe_out.mean(dim=(0, 1), keepdim=True)  # (1,1,G,Kmax), grad
-                # Use tau_config.intent_alpha instead of manual _tau_intent_dev
+                # Use tau_config.intent_alpha — v2 formula: 1 − exp(−tau_l/tau_min)
+                # fresh_i keeps gradient (probe is trainable via CE); bus is detached (cross-step).
                 _alpha_i = self.tau_config.intent_alpha[i].detach()
-                intent_streams[i] = _alpha_i * _bus_carried[i] + (1.0 - _alpha_i) * fresh_i.detach()
+                intent_streams[i] = _alpha_i * _bus_carried[i] + (1.0 - _alpha_i) * fresh_i
                 # Streaming cross-layer bus (Bus): network-wide gist = mean over
                 # layers; FRESH for j<=i, CARRIED for j>i. Self-term (fresh_i)
                 # keeps the probe trainable; others give cross-layer communication.
@@ -433,9 +429,9 @@ class WideBindStack(nn.Module):
                 self.bridge.update_stream(i, _s_l)
 
             # ─── Streaming Memory Bank: per-layer read/write ───
-            # Only active on mature layers (mat_gate[i] >= threshold).
-            # Writes AND reads gated by per-layer maturation.
-            if self.memory_bank is not None and tokens is not None:
+            # Skip when maturation too low — pure waste of compute
+            if (self.memory_bank is not None and tokens is not None
+                    and (mat_gate is None or mat_gate[i].item() >= self.memory_bank._min_write_maturation)):
                 _mb_mat_i = mat_gate[i].item() if mat_gate is not None else 1.0
                 h = self.memory_bank(h, tokens, step=step, mat_gate=_mb_mat_i)
 
@@ -814,7 +810,7 @@ class WideBindStack(nn.Module):
         # to mean 1 => relative per-position weighting in O(1), robust to the head's
         # output scale (log-prob norms are ~0.01-0.5, far smaller than the old h-based
         # ~15-25). Detached => no gradient feedback loop; the intent path is instead
-        # regularized via _tau_intent_dev.
+        # regularized via tau_config.intent_alpha.
         s = logits.sigmoid().norm(dim=-1, keepdim=True)  # (B, L, 1)
         return s / s.mean().clamp_min(1e-6)
 
@@ -960,23 +956,23 @@ class WideBindStack(nn.Module):
             for i, layer in enumerate(self.layers):
                 wm = getattr(layer, 'w_mem2v', None)
                 if wm is not None:
-                    lf = i / max(len(self.layers) - 1, 1)
-                    tau_l_t = self.tau_config.tau_l[i]
-                    tau_mid_t = (self.tau_config.tau_l[0] * self.tau_config.tau_l[-1]).sqrt()
+                    # Detach target: prevent co-adaptation with _tau_dev
+                    tau_l_t = self.tau_config.tau_l[i].detach()
+                    tau_mid_t = (self.tau_config.tau_l[0].detach() * self.tau_config.tau_l[-1].detach()).sqrt()
                     target = getattr(self.cfg, 'w_m2v_hierarchy_target', 1.0)
                     target_m2v = target / (1.0 + torch.exp(-(tau_l_t.log() - tau_mid_t.log())))
                     w_m2v_loss = w_m2v_loss + (wm.mean().detach() - target_m2v).pow(2)
                     n_m2v = n_m2v + 1
             if n_m2v > 0:
                 w_m2v_loss = w_m2v_loss / n_m2v
-        # Intent Bridge: own tau-ladder regularization (gives _tau_intent_dev a gradient)
+        # Intent Bridge: τ-ladder regularization (targets DETACHED to prevent co-adaptation)
         intent_tau_loss = 0.0
         n_it = 0
         if self.intent_bridge and getattr(self.cfg, 'intent_tau_hierarchy_weight', 0.0) > 0:
-            tau_mid_t = (self.tau_config.tau_l[0] * self.tau_config.tau_l[-1]).sqrt()
+            tau_mid_t = (self.tau_config.tau_l[0].detach() * self.tau_config.tau_l[-1].detach()).sqrt()
             c_ema_t = (1.0 / math.sqrt(self.cfg.D)) * tau_mid_t
             for i in range(len(self.layers)):
-                tau_intent_l = self.tau_config.tau_l[i]
+                tau_intent_l = self.tau_config.tau_l[i].detach()
                 actual_alpha = torch.clamp(1.0 - c_ema_t / tau_intent_l, min=0.0)
                 tgt = getattr(self.cfg, 'intent_tau_hierarchy_target', 0.3)
                 target_alpha = tgt / (1.0 + torch.exp(-(tau_intent_l.log() - tau_mid_t.log())))
@@ -1198,6 +1194,25 @@ class WideBindStack(nn.Module):
             aux_dict['signal_ent'] = signal_entropy
         if log_scale_reg != 0:
             aux_dict['ls_reg'] = log_scale_reg
+        # ─── Memory bank log_tau: regularize toward prior + enforce L1 < L2 < L3 ───
+        mem_tau_reg = 0.0
+        if self.memory_bank is not None:
+            for level_name, mem_level in [('l1', self.memory_bank.l1),
+                                           ('l2', self.memory_bank.l2),
+                                           ('l3', self.memory_bank.l3)]:
+                if hasattr(mem_level, 'log_tau') and mem_level.log_tau.requires_grad:
+                    # Soft weight-decay toward the initialized prior
+                    if hasattr(mem_level, '_init_log_tau'):
+                        mem_tau_reg = mem_tau_reg + (mem_level.log_tau - mem_level._init_log_tau).pow(2).mean()
+                    else:
+                        mem_tau_reg = mem_tau_reg + mem_level.log_tau.pow(2).mean() * 0.01
+            # Soft penalty: L1_tau should not exceed L3_tau (inversion = broken hierarchy)
+            if (hasattr(self.memory_bank.l1, 'log_tau') and hasattr(self.memory_bank.l3, 'log_tau')
+                    and self.memory_bank.l1.log_tau.requires_grad and self.memory_bank.l3.log_tau.requires_grad):
+                inversions = F.relu(self.memory_bank.l1.log_tau - self.memory_bank.l3.log_tau)
+                mem_tau_reg = mem_tau_reg + inversions.mean() * 0.1
+        if mem_tau_reg != 0:
+            aux_dict['mem_tau_reg'] = mem_tau_reg
         # ─── Semantic Bridge aux loss (per-layer next-token embedding prediction) ───
         # Each layer's probe is self-supervised to predict the next token's
         # embedding (cosine). Dense, well-distributed gradient at every depth;
@@ -1317,6 +1332,7 @@ class WideBindStack(nn.Module):
                 'gate':     {'params': [], 'lr': lr * mlr['gate'],  'weight_decay': 0},
                 'gate_wd':  {'params': [], 'lr': lr * mlr['gate'],  'weight_decay': wd},
                 'vsa':      {'params': [], 'lr': lr * mlr['vsa'],   'weight_decay': 0},
+                'tau_dev':  {'params': [], 'lr': lr * getattr(cfg, 'tau_dev_lr_mult', 0.2), 'weight_decay': 0},
                 'bridge':   {'params': [], 'lr': bridge_lr,          'weight_decay': wd},
                 'bridge_nd':{'params': [], 'lr': bridge_lr,          'weight_decay': 0},
                 'default':  {'params': [], 'lr': lr,                'weight_decay': 0},
@@ -1333,8 +1349,11 @@ class WideBindStack(nn.Module):
                 elif '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                     groups['vsa']['params'].append(p)
                 elif 'tau_config.' in name:
-                    # Unified τ-field: gate-like LR (fast adaptation for τ-deviation)
-                    groups['gate']['params'].append(p)
+                    if '_tau_dev' in name:
+                        # System-lever: dedicated low-LR group for τ-deviation
+                        groups['tau_dev']['params'].append(p)
+                    else:
+                        groups['gate']['params'].append(p)
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
                     groups[k]['params'].append(p)

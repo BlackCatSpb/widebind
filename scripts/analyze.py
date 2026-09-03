@@ -115,10 +115,7 @@ def run_static(ckpt, cfg, model, missing, unexpected, tok=None):
     print(f'\nVSA TAU: tau[0]={vsa_tau[0].item():.2f}  tau[-1]={vsa_tau[-1].item():.2f}  '
           f'ratio={vsa_tau[-1].item() / vsa_tau[0].item():.1f}x  '
           f'tau_l_dev={td.mean().item():.4f} (std {td.std().item():.4f})')
-    ti = model._tau_intent_dev.data if hasattr(model, '_tau_intent_dev') else None
-    if ti is not None:
-        print(f'  tau_intent_dev: mean={ti.mean().item():.4f} std={ti.std().item():.4f} '
-              f'range=[{ti.min().item():.4f}, {ti.max().item():.4f}]')
+    # _tau_intent_dev removed: tau_config.intent_alpha is the single source of truth
     if b_d is not None:
         print(f'  b_d: mean={b_d.mean().item():.4f} range=[{b_d.min().item():.4f}, {b_d.max().item():.4f}]')
     if b_i is not None:
@@ -896,17 +893,18 @@ def run_bridge(model, cfg, batch=1, seq=128):
     tau_min, tau_max = vsa_tau[0], vsa_tau[-1]
     c_ema = (1.0 / math.sqrt(cfg.D)) * (tau_min * tau_max).sqrt()
     n = len(model.layers)
-    taus, alphas = [], []
-    for i in range(n):
-        lf = i / max(n - 1, 1)
-        dev = torch.tanh(model._tau_intent_dev[i])
-        tau_i = tau_min * (tau_max / tau_min) ** (lf * (1.0 + 0.1 * dev))
-        alpha_i = torch.clamp(1.0 - c_ema / tau_i, min=0.0)
-        taus.append(tau_i.item())
-        alphas.append(alpha_i.item())
+    # Use tau_config.intent_alpha (v2 formula: 1 − exp(−tau_l/tau_min))
+    if hasattr(model, 'tau_config'):
+        taus = model.tau_config._tau_l_cache.tolist()
+        alphas = model.tau_config._alpha_cache.tolist()
+    else:
+        taus, alphas = [], []
+        for i in range(n):
+            taus.append(0.0)
+            alphas.append(0.0)
     print(f'  TAU LADDER (intent): tau[0]={taus[0]:.3f} tau[-1]={taus[-1]:.3f} '
           f'alpha[0]={alphas[0]:.4f} alpha[-1]={alphas[-1]:.4f} '
-          f'(alpha = доля свежего intent в EMA)')
+          f'(alpha = доля carried intent в EMA)')
 
     return {
         'salience': {'mean': sal.mean().item(), 'min': sal.min().item(),
@@ -1204,8 +1202,8 @@ def save_html_report(ckpt, cfg, model, wake, live, head, anomaly=None, bridge=No
     if hasattr(model.layers[0].mirror, 'w_sal'):
         w_sal_val = torch.stack([torch.sigmoid(l.mirror.w_sal.data).mean()
                                  for l in model.layers]).mean().item()
-    tau_intent_dev_val = (model._tau_intent_dev.data.mean().item()
-                           if hasattr(model, '_tau_intent_dev') else None)
+    tau_intent_dev_val = (model.tau_config._tau_dev.data.mean().item()
+                          if hasattr(model, 'tau_config') else None)
 
     if live is None:
         live = {'ce_random': float('nan'), 'pred': float('nan'), 'tau_l_dev': float('nan'),

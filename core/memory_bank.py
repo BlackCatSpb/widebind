@@ -110,6 +110,7 @@ class L1Buffer(nn.Module):
         # P0 FIX: initialize from τ-prior instead of frozen=1.0
         # L1 = fastest: low tau → more precision
         self.log_tau = nn.Parameter(torch.tensor(math.log(max(tau_prior, 0.1))))
+        self._init_log_tau = self.log_tau.data.clone()  # prior for regularization
 
         # Persistent buffer: (n_slots, D)
         self.register_buffer('buf', torch.zeros(n_slots, D), persistent=True)
@@ -207,6 +208,7 @@ class L2Bank(nn.Module):
         # P0 FIX: initialize from τ-prior instead of frozen=1.0
         # L2 = medium: balanced tau
         self.log_tau = nn.Parameter(torch.tensor(math.log(max(tau_prior, 0.1))))
+        self._init_log_tau = self.log_tau.data.clone()  # prior for regularization
         
         # Tau-based scaling for keys/vals (hybrid approach)
         # Keys: F.normalize + sigmoid(tau) for stable cosine similarity
@@ -360,6 +362,7 @@ class L3Concepts(nn.Module):
         # P0 FIX: initialize from τ-prior instead of frozen=1.0
         # L3 = slowest: high tau → more diversity (broader attention over concepts)
         self.log_tau = nn.Parameter(torch.tensor(math.log(max(tau_prior, 0.1))))
+        self._init_log_tau = self.log_tau.data.clone()  # prior for regularization
         
         # Tau-based scaling for concept values (hybrid approach)
         # Vals: F.normalize + sigmoid(tau) for stable representation

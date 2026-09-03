@@ -204,9 +204,9 @@ class WideBindConfig:
     w_m2v_hierarchy_target: float = 1.0  # m — max target for deep layers
     w_m2v_hierarchy_weight: float = 0.01  # λ_weight for w_m2v regularisation (drives _tau_l_dev adaptation)
 
-    # Intent Bridge: own τ-ladder by τ (context integration timescale, separate from memory)
+    # Intent Bridge: τ-ladder regularization (targets are DETACHED to prevent co-adaptation)
     intent_tau_hierarchy_target: float = 0.3  # desired integration rate alpha for intent_state
-    intent_tau_hierarchy_weight: float = 0.01  # λ_weight for intent-τ regularisation (drives _tau_intent_dev adaptation)
+    intent_tau_hierarchy_weight: float = 0.01  # λ_weight for intent-τ regularisation
 
     # Init stds
     w_d_init_std: float = 0.1
@@ -322,12 +322,14 @@ class WideBindConfig:
 
     # ─── Unified τ-field (TauConfig) ───
     # All τ-dependent quantities derived from ONE set of parameters.
-    tau_enabled: bool = True          # use unified tau_config (replaces _vsa_log_param + _tau_l_dev + _tau_intent_dev)
+    tau_enabled: bool = True          # use unified tau_config (replaces _vsa_log_param + _tau_l_dev)
     tau_min: float = 8.0              # fastest layer (shallow)
     tau_max: float = 512.0            # slowest layer (deep)
-    tau_dev_max: float = 0.3          # max bilateral deviation from base ladder
-    tau_llrd_gamma: float = 0.3       # LLRD exponent: lr_l ∝ (tau_l / tau_ref)^(-gamma)
+    tau_dev_max: float = 0.3          # max deviation of log-space increments (cumsum → monotonic tau)
+    tau_llrd_gamma: float = 0.65      # LLRD exponent: lr_l ∝ (tau_l / tau_ref)^(-gamma)  (γ=0.65 → ~5× spread)
     tau_mem_ref: float = 64.0         # reference τ for memory bank temperatures
+    tau_dev_lr_mult: float = 0.2      # LR multiplier for _tau_dev (system-lever: conservative update)
+    tau_gate_clamp: float = 2.0       # unified clamp for adaptive tau deviation in gates
 
     # ─── Qwen3-inspired upgrades ───
     bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)

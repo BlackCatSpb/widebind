@@ -74,10 +74,9 @@ class SpectrumGate(nn.Module):
             return 'final_precision'
 
     def forward(self, logits: torch.Tensor, tau_external: torch.Tensor | None = None) -> torch.Tensor:
+        _DEV_CLAMP = 2.0  # unified deviation multiplier clamp (0.5..2.0)
         if tau_external is not None:
-            # P0 FIX: tau = effective_tau * exp(log_tau) instead of just tau_external
-            # This allows learnable deviation from the maturation-driven baseline
-            tau = tau_external.clamp(self.tau_min, self.tau_max) * torch.exp(self.log_tau).clamp(self.tau_min, self.tau_max)
+            tau = tau_external.clamp(self.tau_min, self.tau_max) * torch.exp(self.log_tau).clamp(1.0/_DEV_CLAMP, _DEV_CLAMP)
             tau = tau.clamp(self.tau_min, self.tau_max)
         else:
             tau = self.tau

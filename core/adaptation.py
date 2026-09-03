@@ -405,7 +405,7 @@ class GradientClipper:
             p_norm = p.norm()
             # Skip near-zero-init params (‖θ‖≈0): AGC would otherwise set
             # g ← g·(c·‖θ‖/(‖g‖+eps)) = 0, permanently killing zero-init modules
-            # (Intent Bridge w_intent/b_intent/w_sal, _tau_l_dev, _tau_intent_dev).
+            # (Intent Bridge w_intent/b_intent/w_sal, _tau_l_dev).
             # These can't explode, so they need no clipping until they grow.
             if p_norm < self.eps:
                 continue

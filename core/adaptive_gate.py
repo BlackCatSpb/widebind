@@ -101,9 +101,9 @@ class AdaptiveGate(nn.Module):
         self.register_buffer('_last_gate_std', torch.tensor(0.0))
 
     def forward(self, logits: torch.Tensor, tau_prior: torch.Tensor | None = None) -> torch.Tensor:
+        _DEV_CLAMP = 2.0  # unified deviation multiplier clamp (0.5..2.0)
         if tau_prior is not None:
-            # P0 FIX: tau = tau_prior * exp(log_tau) — prior from τ-field, learnable deviation
-            tau = tau_prior.clamp(min=0.1, max=10.0) * torch.exp(self.log_tau).clamp(min=0.1, max=10.0)
+            tau = tau_prior.clamp(min=0.1, max=10.0) * torch.exp(self.log_tau).clamp(min=1.0/_DEV_CLAMP, max=_DEV_CLAMP)
             tau = tau.clamp(min=0.1, max=10.0)
         else:
             tau = torch.exp(self.log_tau).clamp(min=0.1, max=10.0)

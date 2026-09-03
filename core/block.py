@@ -11,6 +11,47 @@ from .concept_layer import CollectiveConceptLayer
 from .mlp import GroupedMLP
 from .vsa_utils import dct_basis, fib_sigmoid_init
 
+# ─── Module-level prefix scan (hoisted from WideBindBlock.forward) ───
+
+_EPS_SCAN = 1e-6
+
+def _scan_chunk(b_chunk, d_chunk):
+    """Parallel chunk scan from zero state.
+    Returns intra-chunk VSA (B, chunk_len, S*D), final state (B, 1, S*D),
+    cumulative decay (B, chunk_len, S*D).
+    """
+    log_a = torch.log(d_chunk.clamp(min=_EPS_SCAN))
+    log_cum = torch.cumsum(log_a, dim=1)
+    cum_decay = torch.exp(log_cum)
+    inv_cum = (1.0 / cum_decay.clamp(min=_EPS_SCAN)).clamp(max=1e6)
+    weighted = b_chunk * inv_cum
+    cum_w = torch.cumsum(weighted, dim=1)
+    intra = cum_decay * cum_w
+    final = intra[:, -1:]
+    return intra, final, cum_decay
+
+def _combine_chunks(chunk_data, initial_state):
+    """2nd-level: cross-chunk prefix scan over K chunk states.
+    Returns combined (B, L, S*D), final_state (B, S*D), leaf (B, L, S*D).
+    """
+    inter_decay = torch.cat([cd[:, -1:] for _, _, cd in chunk_data], dim=1)
+    inter_input = torch.cat([f for _, f, _ in chunk_data], dim=1)
+    s = initial_state.clone() if initial_state is not None else torch.zeros_like(inter_input[:, 0])
+    cross_states = []
+    for k in range(len(chunk_data)):
+        cross_states.append(s.unsqueeze(1))
+        s = inter_decay[:, k] * s + inter_input[:, k]
+    cross = torch.cat(cross_states, dim=1)
+    combined_pieces = []
+    leaf_pieces = []
+    for k, (intra_k, _, cum_decay_k) in enumerate(chunk_data):
+        cross_k = cross[:, k:k+1]
+        combined_pieces.append(cross_k * cum_decay_k + intra_k)
+        leaf_pieces.append(intra_k)
+    combined = torch.cat(combined_pieces, dim=1)
+    leaf = torch.cat(leaf_pieces, dim=1)
+    return combined, combined[:, -1], leaf
+
 
 class PrecisionGate(nn.Module):
     def __init__(self, D):
@@ -317,7 +358,6 @@ class WideBindBlock(nn.Module):
         CHUNK = 32
         
         # fp32 guard for log-space scan (critical under AMP for long memory)
-        # NOTE: when already fp32, .float() would be a full copy — keep the reference
         _dtype = decay.dtype
         decay_f32 = decay.float() if decay.dtype != torch.float32 else decay
         input_vec_f32 = input_vec.float() if input_vec.dtype != torch.float32 else input_vec
@@ -326,45 +366,7 @@ class WideBindBlock(nn.Module):
         else:
             mem_state_f32 = None
         
-        def _scan_chunk(b_chunk, d_chunk):
-            """Parallel chunk scan from zero state.
-            Returns intra-chunk VSA (B, chunk_len, S*D), final state (B, 1, S*D),
-            cumulative decay (B, chunk_len, S*D).
-            """
-            log_a = torch.log(d_chunk.clamp(min=eps))
-            log_cum = torch.cumsum(log_a, dim=1)
-            cum_decay = torch.exp(log_cum)
-            inv_cum = (1.0 / cum_decay.clamp(min=eps)).clamp(max=1e6)
-            weighted = b_chunk * inv_cum
-            cum_w = torch.cumsum(weighted, dim=1)
-            intra = cum_decay * cum_w
-            final = intra[:, -1:]
-            return intra, final, cum_decay
-        
-        def _combine_chunks(chunk_data, initial_state):
-            """2nd-level: cross-chunk prefix scan over K chunk states.
-            chunk_data: list of (intra, final, cum_decay) per chunk
-            Returns combined (B, L, S*D), final_state (B, S*D), leaf (B, L, S*D).
-            """
-            inter_decay = torch.cat([cd[:, -1:] for _, _, cd in chunk_data], dim=1)
-            inter_input = torch.cat([f for _, f, _ in chunk_data], dim=1)
-            s = initial_state.clone() if initial_state is not None else torch.zeros_like(inter_input[:, 0])
-            cross_states = []
-            for k in range(len(chunk_data)):
-                cross_states.append(s.unsqueeze(1))  # state at start of chunk k
-                s = inter_decay[:, k] * s + inter_input[:, k]  # state at end of chunk k
-            cross = torch.cat(cross_states, dim=1)
-            combined_pieces = []
-            leaf_pieces = []
-            for k, (intra_k, _, cum_decay_k) in enumerate(chunk_data):
-                cross_k = cross[:, k:k+1]
-                combined_pieces.append(cross_k * cum_decay_k + intra_k)
-                leaf_pieces.append(intra_k)
-            combined = torch.cat(combined_pieces, dim=1)
-            leaf = torch.cat(leaf_pieces, dim=1)
-            return combined, combined[:, -1], leaf
-        
-        # Level 1: parallel chunk scans from zero
+        # Level 1: parallel chunk scans from zero (module-level _scan_chunk)
         chunks = []
         for start in range(0, L, CHUNK):
             end = min(start + CHUNK, L)
