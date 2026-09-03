@@ -1363,21 +1363,18 @@ class WideBindStack(nn.Module):
                 'default_wd':{'params': [], 'lr': lr,               'weight_decay': wd},
             }
             for name, p in self.named_parameters():
+                # τ-config params: dedicated groups (check BEFORE bridge to avoid misrouting)
+                if 'tau_config.' in name or '_tau_l_dev' in name:
+                    # τ-deviation: dedicated low-LR group (0.2x)
+                    groups['tau_dev']['params'].append(p)
                 # Bridge params: bridge.*, bridge_glu_net.*, intent_probe, bus_head_proj
-                is_bridge = ('bridge.' in name or 'bridge_glu_net' in name
-                             or 'intent_probe' in name or 'bus_head_proj' in name
-                             or 'layer_bridge_gate.' in name)
-                if is_bridge:
+                elif ('bridge.' in name or 'bridge_glu_net' in name
+                      or 'intent_probe' in name or 'bus_head_proj' in name
+                      or 'layer_bridge_gate.' in name):
                     k = 'bridge' if p.ndim >= 2 else 'bridge_nd'
                     groups[k]['params'].append(p)
                 elif '.b_d' in name or '.b_i' in name or '.scale_w' in name:
                     groups['vsa']['params'].append(p)
-                elif 'tau_config.' in name:
-                    if '_tau_dev' in name:
-                        # System-lever: dedicated low-LR group for τ-deviation
-                        groups['tau_dev']['params'].append(p)
-                    else:
-                        groups['gate']['params'].append(p)
                 elif name.startswith('embed.') or name.startswith('lm_head.readout') or name.startswith('lm_head.proj'):
                     k = 'embed_wd' if p.ndim >= 2 else 'embed'
                     groups[k]['params'].append(p)
