@@ -258,3 +258,32 @@
 2. **Ждать concept birth** — maturation 0.713, порог 0.75
 3. **При val<5000** — сделать inference тест
 4. **Investigate lbg_diversity=0** — все gates одинаковые
+
+---
+
+## τ-Gated Ranking — F4 (2026-09-05)
+
+### Проблема
+Ranking loss монотонно рос: 3917→7970 за 700 шагов (×2), загрязняя `aux_total` и доминируя в `||g_aux||`.
+
+### Решение
+τ-gated ranking: `ranking *= sigmoid(tau_rank * (ls_spread - threshold))`
+- `log_tau_ranking` — learnable param (expponential gate)
+- `ranking_threshold` — learnable threshold
+- Gate автоматически выключает ranking при низком ls_spread (модель стабильна)
+- Gate включает ranking при высоком ls_spread (нужен порядок)
+
+### Результаты (smoke test)
+| Config | ranking |
+|--------|---------|
+| τ-gated (default) | 648 |
+| Unbounded (gate=1) | 672 |
+| Gated-off (gate≈0) | 391 |
+| Gradients | log_tau_ranking: 76.0, ranking_threshold: -23.0 |
+
+### Изменения в коде
+- `stack.py:114-119`: Added `log_tau_ranking` and `ranking_threshold` params
+- `stack.py:1024-1039`: Ranking loss gated by `sigmoid(tau_rank * (ls_spread - rank_thresh))`
+- `stack.py:1128-1130`: `_cached_losses` includes `tau_rank_gate` and `ranking_threshold` diagnostics
+- `stack.py:1289-1292`: L2 reg on `log_tau_ranking` (0.01)
+- `stack.py:1418-1419`: Routed to `tau_dev` param group (0.2× LR)

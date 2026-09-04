@@ -112,6 +112,11 @@ class WideBindStack(nn.Module):
         )
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         self._tau_l_dev = self.tau_config._tau_dev  # alias — shared gradient
+        # ─── τ-Gated Ranking: adaptive ranking via learnable threshold ───
+        # ranking_loss is active only when ls_spread > threshold (τ-gated).
+        # Prevents unbounded growth while preserving ordering signal when needed.
+        self.log_tau_ranking = nn.Parameter(torch.tensor(0.0))  # exp(0)=1.0 at init
+        self.ranking_threshold = nn.Parameter(torch.tensor(0.5))  # sigmoid(0.5)≈0.62
         # _tau_intent_dev removed: tau_config.intent_alpha replaces it entirely
         # ─── τ-derived values (computed from tau_config) ───
         self.tau_config.update()  # initial computation (mat_gate=None → defaults)
@@ -1023,14 +1028,20 @@ class WideBindStack(nn.Module):
         
         ranking_loss = 0.0
         if getattr(self.cfg, 'ranking_weight', 0.0) > 0:
+            tau_rank = torch.exp(self.log_tau_ranking).clamp(0.1, 10.0)
+            rank_thresh = self.ranking_threshold.clamp(-2.0, 2.0)
             for layer in self.layers:
                 gu = getattr(layer.mirror, '_cached_gate_usage', None)
                 if gu is not None:
                     ls = layer.mirror.log_scale
-                    ls_mean = ls.mean(dim=-1)
+                    ls_mean = ls.mean(dim=-1)  # (G,)
+                    # τ-gate: active only when ls_spread > threshold
+                    ls_spread = ls_mean.std()  # scalar — how spread the scales are
+                    rank_gate = torch.sigmoid(tau_rank * (ls_spread - rank_thresh))
                     gate_diff = gu.unsqueeze(1) - gu.unsqueeze(0)
                     ls_diff = ls_mean.unsqueeze(1) - ls_mean.unsqueeze(0)
-                    ranking_loss = ranking_loss + (F.relu(-ls_diff) * (gate_diff > 0).float()).sum()
+                    layer_ranking = (F.relu(-ls_diff) * (gate_diff > 0).float()).sum()
+                    ranking_loss = ranking_loss + layer_ranking * rank_gate
         
         signal_entropy = 0.0
         n_sig = 0
@@ -1115,6 +1126,8 @@ class WideBindStack(nn.Module):
             'gate_repulse': gate_repulse_loss.item() if isinstance(gate_repulse_loss, torch.Tensor) else gate_repulse_loss,
             'alpha_novelty': alpha_novelty_loss.item() if isinstance(alpha_novelty_loss, torch.Tensor) else alpha_novelty_loss,
             'ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
+            'tau_rank_gate': torch.sigmoid(self.log_tau_ranking).item(),  # τ-gating diagnostic
+            'ranking_threshold': self.ranking_threshold.item(),
             'signal_ent': signal_entropy.item() if isinstance(signal_entropy, torch.Tensor) else signal_entropy,
             'ls_reg': log_scale_reg.item() if isinstance(log_scale_reg, torch.Tensor) else log_scale_reg,
             'decorr': decorr_loss.item() if isinstance(decorr_loss, torch.Tensor) else decorr_loss,
@@ -1273,6 +1286,12 @@ class WideBindStack(nn.Module):
                 # L2 penalty toward zero (uniform ladder)
                 _tau_dev_reg = dev.pow(2).mean() * 0.01
                 aux_dict['tau_dev_reg'] = _tau_dev_reg
+        # ─── τ-gated ranking params: soft centering ───
+        # Prevent tau_ranking from collapsing to 0 (always off) or ∞ (always on).
+        # Threshold is soft-clamped in the ranking computation itself.
+        if hasattr(self, 'log_tau_ranking'):
+            _ranking_tau_reg = self.log_tau_ranking.pow(2).mean() * 0.01
+            aux_dict['ranking_tau_reg'] = _ranking_tau_reg
         if _lbg_diversity_loss != 0:
             aux_dict['lbg_diversity'] = _lbg_diversity_loss
         return ce_loss, aux_dict
@@ -1395,6 +1414,9 @@ class WideBindStack(nn.Module):
             for name, p in self.named_parameters():
                 # τ-config params: dedicated groups (check BEFORE bridge to avoid misrouting)
                 if 'tau_config.' in name or '_tau_l_dev' in name:
+                    groups['tau_dev']['params'].append(p)
+                elif name in ('log_tau_ranking', 'ranking_threshold'):
+                    groups['tau_dev']['params'].append(p)
                     # τ-deviation: dedicated low-LR group (0.2x)
                     groups['tau_dev']['params'].append(p)
                 # Bridge params: bridge.*, bridge_glu_net.*, intent_probe, bus_head_proj
