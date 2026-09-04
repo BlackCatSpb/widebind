@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from .config import WideBindConfig
 from .bind import BottleneckBind, SpiralBind, TrajectorySpiralBind, TrajectoryManifoldBind
 from .mirror import GroupedCognitiveMirror
-from .concept_layer import CollectiveConceptLayer
+from .concept_layer import UnifiedConceptLayer
 from .mlp import GroupedMLP
 from .vsa_utils import dct_basis, fib_sigmoid_init
 
@@ -221,23 +221,8 @@ class WideBindBlock(nn.Module):
         self.variable_precision = getattr(cfg, 'variable_precision', False)
         self.precision_threshold = getattr(cfg, 'precision_threshold', 0.3)
 
+        # Collective concept layer moved to stack.py (UnifiedConceptLayer — global)
         self.collective = None
-        col_idx = getattr(cfg, 'collective_layer_idx', None)
-        if getattr(cfg, 'collective_layer', False) and (col_idx is None or layer_idx == col_idx):
-            self.collective = CollectiveConceptLayer(
-                cfg.D, self.mirror.k,
-                S=getattr(cfg, 'collective_S', 8),
-                uncert_theta=getattr(cfg, 'collective_uncert_theta', 0.5),
-                uncert_kappa=getattr(cfg, 'collective_uncert_kappa', 3.0),
-                contra_thresh=getattr(cfg, 'collective_contra_thresh', -0.1),
-                contra_gain=getattr(cfg, 'collective_contra_gain', 6.0),
-                birth_gap=getattr(cfg, 'collective_birth_gap', 0.55),
-                maturity_thresh=getattr(cfg, 'collective_maturity_thresh', 0.12),
-                seed=7 * (layer_idx + 1),
-                cfg=cfg,
-                softmax_free=getattr(cfg, 'softmax_free', True),
-                novelty_threshold=getattr(cfg, 'concept_birth_novelty_threshold', 0.15),
-            )
     
     def forward(self, h, state=None, global_state=None,
                 mem2v_scale=1.0, diff=None, noise_scale=0.0,
@@ -441,17 +426,7 @@ class WideBindBlock(nn.Module):
         bind_gated = (bind_out.reshape(B, L, g, d) * mm * bind_gate.unsqueeze(-1)).reshape(B, L, D)
         enhanced_base = bind_gated + mem_modulated * self.w_mem2v * mem2v_scale
         enhanced = enhanced_base + mirror
-        if self.collective is not None:
-            hp_c = hp
-            pen_c = self.mirror._cached_pred_error_norm
-            if hp_c is not None and pen_c is not None:
-                col_out = self.collective(
-                    h, hp_c, pen_c,
-                    resvar=self.mirror._residual_var_ema.mean(),
-                    allow_write=self.training,
-                    gate=self.mirror._cached_gate)
-                if col_out is not None:
-                    enhanced = enhanced + col_out
+        # Concept layer moved to stack.py (UnifiedConceptLayer — global, after embedding)
         if _chk(enhanced, 'enhanced'): return h * NaN, (_nan_mem, _nan_mem, _nan_conv, None, None)
         if self.training:
             self._cache_bind_out = enhanced_base  # for branch_loss (with grad)

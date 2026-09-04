@@ -115,13 +115,13 @@ class L1Buffer(nn.Module):
         # Persistent buffer: (n_slots, D)
         self.register_buffer('buf', torch.zeros(n_slots, D), persistent=True)
         self.register_buffer('buf_age', torch.zeros(n_slots), persistent=True)
-        self._write_idx = 0
+        self.register_buffer('_write_idx', torch.zeros(1, dtype=torch.long), persistent=True)
         self._n_overwrites = 0
 
     @torch.no_grad()
     def write(self, embedding: torch.Tensor) -> None:
         """Write sentence embedding to buffer. Overwrites oldest slot."""
-        n_filled = min(self._write_idx, self.n_slots)
+        n_filled = min(self._write_idx.item(), self.n_slots)
 
         if n_filled < self.n_slots:
             slot = n_filled  # fill empty slots first
@@ -158,13 +158,13 @@ class L1Buffer(nn.Module):
     def get_stats(self) -> dict:
         return {
             'n_overwrites': self._n_overwrites,
-            'fill_rate': min(self._write_idx, self.n_slots) / self.n_slots,
+            'fill_rate': min(self._write_idx.item(), self.n_slots) / self.n_slots,
         }
 
     def reset(self) -> None:
         self.buf.zero_()
         self.buf_age.zero_()
-        self._write_idx = 0
+        self._write_idx.zero_()
         self._n_overwrites = 0
 
 
@@ -219,7 +219,7 @@ class L2Bank(nn.Module):
         self.register_buffer('slot_age', torch.zeros(n_slots), persistent=True)
         self.register_buffer('slot_novelty', torch.ones(n_slots), persistent=True)
         self.register_buffer('slot_consumed', torch.zeros(n_slots, dtype=torch.bool), persistent=True)
-        self._write_idx = 0
+        self.register_buffer('_write_idx', torch.zeros(1, dtype=torch.long), persistent=True)
         self._n_overwrites = 0
         self._n_consumed = 0
 
@@ -232,7 +232,7 @@ class L2Bank(nn.Module):
         """
         novelty_score = torch.sigmoid(self.novelty_gate(embedding))
 
-        n_filled = min(self._write_idx, self.n_slots)
+        n_filled = min(self._write_idx.item(), self.n_slots)
 
         with torch.no_grad():
             # Hybrid normalization: F.normalize + tau-based scaling
@@ -300,7 +300,7 @@ class L2Bank(nn.Module):
         return {
             'n_overwrites': self._n_overwrites,
             'n_consumed': self._n_consumed,
-            'fill_rate': min(self._write_idx, self.n_slots) / self.n_slots,
+            'fill_rate': min(self._write_idx.item(), self.n_slots) / self.n_slots,
             'novelty_mean': self.slot_novelty.mean().item(),
             'consumed_count': int(self.slot_consumed.sum().item()),
             'key_scale': torch.sigmoid(self.key_log_scale).item(),
@@ -313,7 +313,7 @@ class L2Bank(nn.Module):
         self.slot_age.zero_()
         self.slot_novelty.zero_()
         self.slot_consumed.zero_()
-        self._write_idx = 0
+        self._write_idx.zero_()
         self._n_overwrites = 0
         self._n_consumed = 0
 

@@ -147,7 +147,7 @@ class WideBindConfig:
 
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
     orth_weight: float = 0.0  # ortho-gran loss; 0=off (32x D²=4096² gram graphs cost 2GB+ VRAM)
-    div_weight: float = 50.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
+    div_weight: float = 10.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
     ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
     gate_repulse_weight: float = 0.3  # push gate variance up (inverse of balance, bypasses spectral)
     alpha_novelty_weight: float = 0.05  # push per-expert alpha apart (heuristic, no spectral)
@@ -304,6 +304,10 @@ class WideBindConfig:
     mem_min_write_mat: float = 0.3  # min maturation before writes allowed (like private_mem)
     mem_bridge_dim: int = 256       # memory bank bridge dim (matches bridge_dim)
     concept_birth_novelty_threshold: float = 0.15  # birth only if d_min > threshold (best_sim < 1-threshold)
+
+    # ─── Unified Concept Layer (replaces per-block CollectiveConceptLayer + L3Concepts) ───
+    unified_concept_layer: bool = True  # enable unified concept layer (global, after embedding)
+    unified_concept_S: int = 8          # number of concept prototypes
 
     # ─── Режим Б (открытое сознание): отказ от softmax-свёртки ───
     # Все точки комбинации смыслов используют нормированное сигмоид-среднее

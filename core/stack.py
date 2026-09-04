@@ -13,6 +13,7 @@ from .embedding import PartitionedEmbedding, LmHead, PartitionedHead, SigmoidCod
 from .reasoning import ReasoningMemory, ThinkingTokenHead, ReasoningTokens, ReasoningGate
 from .vsa_utils import dct_basis, zeckendorf_codes, sparse_block_codes, vsa_prefix_scan
 from .memory_bank import StreamingMemoryBank
+from .concept_layer import UnifiedConceptLayer
 from .tau_config import TauConfig
 
 class WideBindStack(nn.Module):
@@ -129,6 +130,18 @@ class WideBindStack(nn.Module):
             cfg=cfg,
             tau_config=self.tau_config,
         ) if getattr(cfg, 'memory_bank', False) else None
+        # ─── Unified Concept Layer (replaces per-block CollectiveConceptLayer + L3Concepts) ───
+        # Global concept layer: sits after embedding, reads/writes concepts from expert K-space.
+        # τ-driven thresholds, continuous maturity, gradient flow through writes.
+        self.concept_layer = UnifiedConceptLayer(
+            D=cfg.D,
+            k=int(self.layers[0].mirror.k),  # match first layer's expert K-space
+            bridge_dim=getattr(cfg, 'bridge_dim', 256),
+            S=getattr(cfg, 'unified_concept_S', 8),
+            seed=42,
+            cfg=cfg,
+            softmax_free=getattr(cfg, 'softmax_free', True),
+        ) if getattr(cfg, 'unified_concept_layer', True) else None
         tau_mid = math.sqrt(tau_l[0].item() * tau_l[-1].item())
         write_rate = 1.0 / math.sqrt(cfg.D)
         self._c_ema_value = write_rate * tau_mid
@@ -458,6 +471,22 @@ class WideBindStack(nn.Module):
                                  context_mem=context_mem, allow_write=allow_write,
                                   tau_s=vsa_tau, step=step, intent=intent_i, salience=_sal,
                                    maturity=(mat_gate[i] if mat_gate is not None else None))
+            # ─── Unified Concept Layer (global, after first layer provides hp) ───
+            # Called once after first layer to read/write concepts from expert K-space.
+            # Injects concept-augmented signal into h for all subsequent layers.
+            if (self.concept_layer is not None and i == 0
+                    and hasattr(layer.mirror, '_cached_hp')
+                    and layer.mirror._cached_hp is not None):
+                _hp = layer.mirror._cached_hp
+                _pen = layer.mirror._cached_pred_error_norm
+                _resvar = layer.mirror._residual_var_ema.mean() if hasattr(layer.mirror, '_residual_var_ema') else None
+                _mat = mat_gate[0].item() if mat_gate is not None else 1.0
+                _col_out = self.concept_layer(
+                    h, hp=_hp, pen=_pen, resvar=_resvar,
+                    mat_gate=_mat, allow_write=self.training,
+                    gate=layer.mirror._cached_gate,
+                )
+                h = h + _col_out
             if self.maturation is not None:
                 _pe = layer.mirror._cached_pred_error_norm
                 if _pe is not None:
@@ -467,22 +496,17 @@ class WideBindStack(nn.Module):
                 with torch.no_grad():
                     mir = layer.mirror
                     _diag = torch.zeros(6, device=h.device, dtype=h.dtype)
-                    # 0. pred_error_norm (низкая = хорошо)
                     _pe = getattr(mir, '_cached_pred_error_norm', None)
                     if _pe is not None:
                         _diag[0] = _pe.detach().mean().clamp(0.0, 1.0)
-                    # 1. gate_l1 (низкая = стабильно)
                     _gl = getattr(mir, '_cached_gate_l1', None)
                     if _gl is not None:
                         _diag[1] = _gl.detach().clamp(0.0, 1.0)
-                    # 2. mirror_norm (умеренная = хорошо)
                     _mp = getattr(mir, '_cached_pred_k', None)
                     if _mp is not None:
                         _mn = _mp.detach().norm()
                         _diag[2] = (_mn / 1000.0).clamp(0.0, 1.0)
-                    # 3. bridge_contribution (placeholder — обновится после bridge)
                     _diag[3] = 0.5
-                    # 4. expert_entropy (умеренная = хорошо)
                     _hp = getattr(mir, '_cached_hp', None)
                     if _hp is not None:
                         _hp_det = _hp.detach()
@@ -491,7 +515,6 @@ class WideBindStack(nn.Module):
                         _entropy = -(_hp_norm * _hp_norm.clamp_min(1e-9).log()).sum()
                         _max_entropy = math.log(_hp_det.shape[-1])
                         _diag[4] = (_entropy / _max_entropy).clamp(0.0, 1.0)
-                    # 5. diversity (умеренная = хорошо)
                     _gl2 = getattr(mir, '_cached_gate_l1', None)
                     if _gl2 is not None:
                         _diag[5] = (1.0 - _gl2).clamp(0.0, 1.0)
@@ -1049,7 +1072,12 @@ class WideBindStack(nn.Module):
             for layer in self.layers:
                 gate_usage = getattr(layer.mirror, '_cached_gate_usage', None)
                 if gate_usage is not None:
-                    gate_repulse_loss = gate_repulse_loss - gate_usage.var()
+                    # P2 FIX: use negative entropy instead of -var
+                    # -var pushes all experts to same activation (could be all-zero).
+                    # -entropy pushes toward uniform distribution over experts.
+                    gate_p = F.softmax(gate_usage, dim=0)
+                    gate_entropy = -(gate_p * (gate_p + 1e-8).log()).sum()
+                    gate_repulse_loss = gate_repulse_loss - gate_entropy
                     n_rp += 1
             if n_rp > 0:
                 gate_repulse_loss = gate_repulse_loss / n_rp
@@ -1101,13 +1129,15 @@ class WideBindStack(nn.Module):
                 _gr = self.maturation.global_ready
             _gates_items = []
             _taus_items = []
-            _gate_outputs = []  # differentiable
+            _gate_outputs = []  # differentiable — diversity loss needs grad through LBG params
             for l in range(len(self.layers)):
                 if l in self._layer_diagnostics:
                     _mat = self.maturation.gate[l] if getattr(self, 'maturation', None) is not None else torch.ones(1)
                     if _gr:
                         _mat_tau = self.layer_bridge_gate._effective_tau(_mat)
-                        _gated = self.layer_bridge_gate.gates[l](self._layer_diagnostics[l].detach(), tau_external=_mat_tau)
+                        # Clone diagnostics with grad so gate output carries grad through log_tau
+                        _diag_grad = self._layer_diagnostics[l].clone().detach().requires_grad_(True)
+                        _gated = self.layer_bridge_gate.gates[l](_diag_grad, tau_external=_mat_tau)
                         _gate_outputs.append(_gated.mean())
                         _gates_items.append(_gated.mean().item())
                         _taus_items.append(_mat_tau.item())
@@ -1800,15 +1830,28 @@ class MirrorLRScheduler:
             self._loss_lr_factor = 1.0
             self._val_ema = val_loss
             self._val_improving = False
+            self._lr_damp_steps = 0
         regress_rel = getattr(self.cfg, 'lr_regress_rel', 0.05)
         improve_thresh = getattr(self.cfg, 'lr_improve_thresh', 0.98)
         if val_loss > self._best_val_loss * (1.0 + regress_rel):
             # genuine divergence relative to best -> damp
             self._loss_lr_factor = max(0.05, self._loss_lr_factor * 0.5)
+            self._lr_damp_steps = 0  # reset counter on damp
         elif val_loss < self._best_val_loss * improve_thresh:
             # genuine improvement -> restore base LR
             self._best_val_loss = val_loss
             self._loss_lr_factor = 1.0
+            self._lr_damp_steps = 0
+        else:
+            # Plateau zone: neither regression nor improvement.
+            # Warm-restart: gradually restore LR over time (τ-gated, no magic constant).
+            if self._loss_lr_factor < 1.0:
+                self._lr_damp_steps += 1
+                # Restore rate: 1/τ_damp_steps per step → smooth exponential approach
+                # τ_damp = 200 steps (default) — reaches 0.95 in ~600 steps
+                tau_damp = getattr(self.cfg, 'lr_warm_restart_tau', 200)
+                restore_rate = 1.0 / tau_damp
+                self._loss_lr_factor = min(1.0, self._loss_lr_factor + restore_rate)
         # Downtrend detector (the "is learning actually happening?" signal that
         # gates the upward LR path). Retained between evals (hysteresis) so a boost
         # window stays open for a while after an improving eval. Small tolerance

@@ -175,7 +175,7 @@ class GroupedCognitiveMirror(nn.Module):
             self.w_sal = nn.Parameter(torch.zeros(G))  # zero-init => checkpoint-safe
 
         # External gradient cache (устанавливается hook'ом после backward)
-        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=False)
+        self.register_buffer('_prev_grad_norm', torch.zeros(G), persistent=True)
         self._expert_asymmetry = expert_asymmetry
         self._meta_trust = meta_trust
         # Private memory bank: expert confident K-space states (cross-expert recall)
@@ -198,15 +198,15 @@ class GroupedCognitiveMirror(nn.Module):
             self.w_help = nn.Parameter(torch.full((G, 1), math.log(3.0)))  # per-expert scale for recalled help
             self.w_contra = nn.Parameter(torch.full((G,), 0.01))  # small positive: disagreement opens gate by default
             # Expert knowledge graph: concept similarity, behavior divergence, trust
-            self.register_buffer('_concept_sim_ema', torch.eye(G), persistent=False)   # (G, G) — who shares concepts
-            self.register_buffer('_behavior_div_ema', torch.zeros(G, G), persistent=False)  # (G, G) — who behaves differently
+            self.register_buffer('_concept_sim_ema', torch.eye(G), persistent=True)   # (G, G) — who shares concepts
+            self.register_buffer('_behavior_div_ema', torch.zeros(G, G), persistent=True)  # (G, G) — who behaves differently
             self.register_buffer('_trust_matrix', torch.eye(G) * 0.5, persistent=False)     # (G, G) — who helps whom
             if meta_trust:
                 self.register_buffer('_prev_trust_matrix', torch.eye(G) * 0.5, persistent=False)
                 self.register_buffer('_meta_private_mem', torch.zeros(G), persistent=False)
         self.register_buffer('_hp_grad', torch.zeros(G), persistent=False)
-        self.register_buffer('_delta_var', torch.zeros(G), persistent=False)
-        self.register_buffer('_fwd_count', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_delta_var', torch.zeros(G), persistent=True)
+        self.register_buffer('_fwd_count', torch.zeros(1, dtype=torch.long), persistent=True)
         self.register_buffer('_last_magnitude', torch.zeros(1), persistent=False)
         self.register_buffer('_last_gates', torch.zeros(G), persistent=False)
         self.register_buffer('_last_h_pool', torch.zeros(G, self.d), persistent=False)
@@ -235,7 +235,7 @@ class GroupedCognitiveMirror(nn.Module):
         self._cached_dominance = None
         self._cached_isolation = None
         # Residual variance EMA for adaptive tau (self-organizing timescales)
-        self.register_buffer('_residual_var_ema', torch.ones(G, k) * 0.1, persistent=False)
+        self.register_buffer('_residual_var_ema', torch.ones(G, k) * 0.1, persistent=True)
         
         # ─── Per-expert learned modulation ───
         # skip_alpha: uniform init 0 → exp(0)=1 (tanh(linear)+linear).

@@ -252,6 +252,12 @@ def train(cfg=None, resume_path=None):
                 layer.mirror.hybrid_gate.log_tau.data.fill_(math.log(tau_val))
             print(f'  reopened cognitive gate: mlp_gate_b -> {cfg.mlp_gate_b_init}, '
                   f'hybrid_gate tau -> {tau_val:.3f}')
+        # P0 FIX: Reset _loss_lr_factor on resume to prevent stuck half-LR
+        if hasattr(model, '_loss_lr_factor'):
+            old_f = model._loss_lr_factor
+            model._loss_lr_factor = 1.0
+            if old_f != 1.0:
+                print(f'  Reset _loss_lr_factor: {old_f:.4f} -> 1.0')
         if missing:
             print(f'  Missing keys (new arch): {len(missing)}')
         if unexpected:
@@ -327,7 +333,19 @@ def train(cfg=None, resume_path=None):
             # L=64 (П„в‰¤32, РѕРєС‚Р°РІС‹ 0вЂ“13): 7/9 С€Р°РіРѕРІ
             # L=256 (П„в‰¤92, РѕРєС‚Р°РІС‹ 14вЂ“23): 1/9 С€Р°РіРѕРІ
             # L=512 (П„в‰¤149, РѕРєС‚Р°РІС‹ 24вЂ“31): 1/9 С€Р°РіРѕРІ
-            seq_pool = [64, 64, 64, 64, 64, 64, 64, 256, 512]
+            # Multi-scale seq curriculum: τ-driven progression to longer sequences
+            # Phase 1 (step < τ_short): short only (64) — stabilize basics
+            # Phase 2 (τ_short ≤ step < τ_long): mix short + medium (64–256)
+            # Phase 3 (step ≥ τ_long): full range (64–512) — long-range patterns
+            tau_short = getattr(cfg, 'seq_curriculum_tau_short', 32000)
+            tau_long = getattr(cfg, 'seq_curriculum_tau_long', 96000)
+            if step < tau_short:
+                seq_max = 64
+            elif step < tau_long:
+                seq_max = 256
+            else:
+                seq_max = 512
+            seq_pool = [s for s in [64, 128, 256, 512] if s <= seq_max]
             seq_len = seq_pool[step % len(seq_pool)]
             
             stream = streams[stream_idx]
@@ -396,6 +414,15 @@ def train(cfg=None, resume_path=None):
             # no per-loss magic constants, and the aux gradient is bounded by
             # ||g_CE|| so it can never hijack the update. Under AMP the losses are
             # scaled so the grads survive GradScaler.unscale_/step.
+            # P1 FIX: Anneal noisy auxiliary losses over training (τ-gated timescale)
+            # ranking, branch, diversity add 3-5k noise early → mask real signal.
+            # Warm-restart: linearly ramp from 0→1 over τ_anneal steps (default 5000).
+            if global_step > 0:
+                _anneal_tau = getattr(cfg, 'aux_anneal_tau', 5000)
+                _anneal = min(1.0, global_step / _anneal_tau)
+                for _k in ('ranking', 'branch', 'diversity'):
+                    if _k in aux_dict and isinstance(aux_dict[_k], torch.Tensor):
+                        aux_dict[_k] = aux_dict[_k] * _anneal
             gscale = scaler.get_scale() if use_amp else 1.0
             ce_s = ce_loss * gscale
             aux_s = {k: (v * gscale if isinstance(v, torch.Tensor) else v)
@@ -535,8 +562,8 @@ def evaluate(model, streams, cfg, device):
     total_steps = 0
     state = None
     
-    # Use first stream for eval (or hold-out)
-    stream = streams[0]
+    # Use last stream for eval (hold-out, not used in training)
+    stream = streams[-1]
     offset = max(len(stream) // 2, cfg.batch_size * cfg.seq_len + 1)
     
     for _ in range(min(100, stream.len // (cfg.batch_size * cfg.seq_len))):
