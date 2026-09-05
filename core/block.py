@@ -151,7 +151,9 @@ class WideBindBlock(nn.Module):
             bridge_glu=getattr(cfg, 'bridge_glu', False),
             bridge_glu_beta=getattr(cfg, 'bridge_glu_beta', 0.25),
             pm_write_delay=getattr(cfg, 'pm_write_delay', 5000),
-            pm_coh_gate_std=getattr(cfg, 'pm_coh_gate_std', 0.02))
+            pm_coh_gate_std=getattr(cfg, 'pm_coh_gate_std', 0.02),
+            mirror_tau_min=getattr(cfg, 'mirror_tau_min', 2.0),
+            mirror_tau_max=getattr(cfg, 'mirror_tau_max', 200.0))
         
         # ─── VSA Memory (multi-scale VSA: S=4 фиксированных τ) ───
         self._n_scales = 4

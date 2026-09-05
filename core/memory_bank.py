@@ -240,9 +240,9 @@ class L2Bank(nn.Module):
             raw_key = self.W_k(embedding.detach())
             new_key = F.normalize(raw_key, dim=-1) * torch.sigmoid(self.key_log_scale)
             
-            # Vals: tau-scaled (val_norm applied at read time for stability)
+            # Vals: normalized + tau-scaled (matches key normalization for stable attention)
             raw_val = self.W_v(embedding.detach())
-            new_val = raw_val * torch.sigmoid(self.val_log_scale)
+            new_val = F.normalize(raw_val, dim=-1) * torch.sigmoid(self.val_log_scale)
 
         if n_filled < self.n_slots:
             # Fill empty slot

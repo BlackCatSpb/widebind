@@ -425,9 +425,9 @@ def train(cfg=None, resume_path=None):
             # P1 FIX: Anneal noisy auxiliary losses over training (τ-gated timescale)
             # branch, diversity add noise early → mask real signal.
             # Warm-restart: linearly ramp from 0→1 over τ_anneal steps (default 5000).
-            if global_step > 0:
+            if step > 0:
                 _anneal_tau = getattr(cfg, 'aux_anneal_tau', 5000)
-                _anneal = min(1.0, global_step / _anneal_tau)
+                _anneal = min(1.0, step / _anneal_tau)
                 for _k in ('branch', 'diversity'):
                     if _k in aux_dict and isinstance(aux_dict[_k], torch.Tensor):
                         aux_dict[_k] = aux_dict[_k] * _anneal

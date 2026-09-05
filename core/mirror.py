@@ -78,7 +78,8 @@ class GroupedCognitiveMirror(nn.Module):
                     intent_bridge=False, bridge_glu=False,
                     bridge_glu_beta=0.25,
                     pm_write_delay=5000, pm_coh_gate_std=0.02,
-                    matur_write_thr=0.3):
+                    matur_write_thr=0.3,
+                    mirror_tau_min=2.0, mirror_tau_max=200.0):
         super().__init__()
         assert D % G == 0
         self.D = D
@@ -125,11 +126,11 @@ class GroupedCognitiveMirror(nn.Module):
         
         # Predictive mirror: per-dim alpha per expert
         # pred_k = alpha_kg * hp_prev, per K-dimension timescale
-        # Tau hierarchy: K-dimensions span exponential range [tau_min, tau_max]
-        #   τ_k = tau_min * (tau_max/tau_min)^(k/(K-1))
+        # Tau hierarchy: K-dimensions span exponential range [mirror_tau_min, mirror_tau_max]
+        #   τ_k = mirror_tau_min * (mirror_tau_max/mirror_tau_min)^(k/(K-1))
         #   α_k = exp(-1/τ_k)
         # Each expert inherits the same tau distribution (learnable divergence)
-        tau_min, tau_max = 2.0, 200.0
+        tau_min, tau_max = mirror_tau_min, mirror_tau_max
         if k > 1:
             frac = torch.arange(k, dtype=torch.float32) / (k - 1)
             tau_k = tau_min * (tau_max / tau_min) ** frac

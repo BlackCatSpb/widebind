@@ -63,6 +63,8 @@ class WideBindConfig:
 
     mirror_k: int = 32
     mirror_k_staircase: bool = True  # True = k_l∈{8,16,32} по третям глубины
+    mirror_tau_min: float = 2.0     # min τ for per-K-dimension alpha init (predictive mirror)
+    mirror_tau_max: float = 200.0   # max τ for per-K-dimension alpha init (predictive mirror)
     w_pred_scale_init: float = 3.0
     log_scale_init_std: float = 0.05
     mlp_groups: int = 32
@@ -296,9 +298,9 @@ class WideBindConfig:
     # ─── Streaming Memory Bank (hierarchical L1+L2+L3) ───
     memory_bank: bool = False       # enable streaming memory bank
     mem_l1_slots: int = 3           # L1 rolling buffer slots (immediate)
-    mem_l2_slots: int = 16          # L2 learned bank slots (short-term)
+    mem_l2_slots: int = 32          # L2 learned bank slots (short-term)
     mem_l3_concepts: int = 8        # L3 emergent concept slots (long-range)
-    mem_l3_birth_threshold: float = 0.7  # cosine sim threshold for concept birth
+    mem_l3_birth_threshold: float = 0.85  # cosine sim threshold for concept birth
     mem_min_write_mat: float = 0.3  # min maturation before writes allowed (like private_mem)
     mem_bridge_dim: int = 256       # memory bank bridge dim (matches bridge_dim)
     concept_birth_novelty_threshold: float = 0.15  # birth only if d_min > threshold (best_sim < 1-threshold)
@@ -332,6 +334,8 @@ class WideBindConfig:
     tau_mem_ref: float = 64.0         # reference τ for memory bank temperatures
     tau_dev_lr_mult: float = 0.2      # LR multiplier for _tau_dev (system-lever: conservative update)
     tau_gate_clamp: float = 2.0       # unified clamp for adaptive tau deviation in gates
+    gate_tau_min: float = 0.3         # min temperature for SpectrumGate (mature → precision)
+    gate_tau_max: float = 5.0         # max temperature for SpectrumGate (immature → diversity)
 
     # ─── Qwen3-inspired upgrades ───
     bind_qk_norm: bool = True            # RMSNorm on hp before bottleneck cross (≈QK-Norm)

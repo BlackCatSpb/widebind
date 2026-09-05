@@ -109,6 +109,8 @@ class WideBindStack(nn.Module):
             delta_t=getattr(cfg, 'matur_delta', 4000.0),
             llrd_gamma=getattr(cfg, 'tau_llrd_gamma', 0.65),
             mem_tau_ref=getattr(cfg, 'tau_mem_ref', 64.0),
+            gate_tau_min=getattr(cfg, 'gate_tau_min', 0.3),
+            gate_tau_max=getattr(cfg, 'gate_tau_max', 5.0),
         )
         self._vsa_log_param = nn.Parameter(torch.tensor([1.7918, 1.2321, 1.1304, 1.1065]))
         self._tau_l_dev = self.tau_config._tau_dev  # alias — shared gradient
@@ -1201,7 +1203,7 @@ class WideBindStack(nn.Module):
         if diversity_loss != 0:
             aux_dict['diversity'] = diversity_loss
         if nuc_loss != 0:
-            aux_dict['nuc'] = nuc_loss
+            aux_dict['nuc'] = nuc_loss * getattr(self.cfg, 'nuclear_weight', 1e-5)
         if orth_loss != 0:
             aux_dict['orth'] = orth_loss
         if w_m2v_loss != 0:
