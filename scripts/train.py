@@ -12,6 +12,14 @@ import numpy as np
 from torch.serialization import add_safe_globals
 
 from core import WideBindConfig, WideBindStack, MirrorLRScheduler
+
+
+def _save_checkpoint_safely(state, path):
+    """Write checkpoint to temp file then rename — prevents corruption on interrupt."""
+    import tempfile, shutil
+    tmp = path + '.tmp'
+    torch.save(state, tmp)
+    shutil.move(tmp, path)
 try:
     from analyze import save_html_report as generate_report
 except Exception:
@@ -530,7 +538,7 @@ def train(cfg=None, resume_path=None):
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_path = os.path.join(cfg.save_dir, f'best.pt')
-                    torch.save({
+                    _save_checkpoint_safely({
                         'step': step,
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict() if not args.no_save_optimizer else None,
