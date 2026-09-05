@@ -1,7 +1,8 @@
 # WideBind — языковая модель без transformer
 
-**Векторная память (VSA) + Cognitive Mirror + GroupedMLP. D=2560, ~191M
-параметров, 24 слоя. Без attention, без softmax-матриц, без KV-cache.**
+**Векторная память (VSA) + Cognitive Mirror + GroupedMLP + Unified τ-field.
+D=2560, ~191M параметров, 24 слоя. Без attention, без softmax-матриц,
+без KV-cache.**
 
 Память — это вектор (VSA-суперпозиция), а не матрица. Информация
 «скрещивается» биллинейно в узком буферном пространстве и
@@ -12,6 +13,7 @@
   ┌───────────────────────────────────────────────────────────────┐
   │                     WideBind / EVA                            │
   │   VSA-память · Bind-скрещивание · Cognitive Mirror            │
+  │   Unified τ-field · SemanticBridge · MemoryBank L1/L2/L3      │
   │   D=2560 · ~191M params · 24 layers                           │
   │   нет attention · нет softmax-матриц · без KV-cache           │
   └───────────────────────────────────────────────────────────────┘
@@ -71,25 +73,26 @@ WideBind ещё не продукт и не готовая система — э
    - [VSA-память](#53-vsa-память)
    - [Когнитивный mirror](#54-когнитивный-mirror)
    - [Первый момент](#55-первый-момент)
-   - [Коллективный концепт-слой](#56-коллективный-концепт-слой)
+   - [Unified Concept Layer](#56-unified-concept-layer)
    - [Переменная точность](#57-переменная-точность)
    - [Спектральный слой и MLP](#58-спектральный-слой-и-mlp)
     - [Эксплицитное рассуждение (Explicit Reasoning)](#59-эксплицитное-рассуждение-explicit-reasoning)
     - [BridgeGLU — живая семантическая модуляция MLP и мост связности](#511-bridgeglu--живая-семантическая-модуляция-mlp-и-мост-связности)
  6. [Голова: SigmoidCodedHead](#6-голова-sigmoidcodedhead)
-7. [Λ_d иерархия](#7-λ_d-иерархия)
+7. [Unified τ-field (TauConfig)](#7-unified-τ-field-tauconfig)
 8. [Группы параметров и LR](#8-группы-параметров-и-lr)
 9. [AdaptiveController](#9-adaptivecontroller)
 10. [MirrorLR-планировщик](#10-mirrorlr-планировщик)
 11. [Функции потерь](#11-функции-потерь)
 12. [Градиентная механика](#12-градиентная-механика)
-13. [Инференс-интерфейс](#13-инференс-интерфейс)
-14. [Мост намерений (Intent Bridge) — неограниченный контекст](#14-мост-намерений-intent-bridge--неограниченный-контекст)
-15. [Streaming Memory Bank — иерархическая память L1+L2+L3](#15-streaming-memory-bank--иерархическая-память-l1l2l3)
-16. [Структура репозитория](#16-структура-репозитория)
-17. [Лицензия и статус](#17-лицензия-и-статус)
-18. [Механизмы созревания и замыкания Триады](#18-механизмы-созревания-и-замыкания-триады)
-19. [Текущий статус обучения](#19-текущий-статус-обучения)
+13. [Унифицированный адаптивный модуль (adaptation.py)](#13-унифицированный-адаптивный-модуль-adaptationpy)
+14. [Инференс-интерфейс](#14-инференс-интерфейс)
+15. [Мост намерений (Intent Bridge) — неограниченный контекст](#15-мост-намерений-intent-bridge--неограниченный-контекст)
+16. [Streaming Memory Bank — иерархическая память L1+L2+L3](#16-streaming-memory-bank--иерархическая-память-l1l2l3)
+17. [Структура репозитория](#17-структура-репозитория)
+18. [Лицензия и статус](#18-лицензия-и-статус)
+19. [Механизмы созревания и замыкания Триады](#19-механизмы-созревания-и-замыкания-триады)
+20. [Текущий статус обучения](#20-текущий-статус-обучения)
 
 ---
 
@@ -473,7 +476,7 @@ L(n/3)..2n/3   → k=16  (средний)
   `conf = σ(−‖Δ‖)` — преимущество у редких и уверенных состояний;
 - **Интеллектуальный (когнитивный) гейт записи — единый показатель зрелости.**
   Запись в `_private_mem` управляется **одним** показателем зрелости слоя
-   `M_l(t) = max(time/τ-рамп, bridge_readiness)` (см. §18.1). Если `maturity is not
+   `M_l(t) = max(time/τ-рамп, bridge_readiness)` (см. §19.1). Если `maturity is not
   None`, запись открывается **только** когда `maturity ≥ cfg.matur_write_thr`
   (по умолчанию `0.3`):
   ```
@@ -488,7 +491,7 @@ L(n/3)..2n/3   → k=16  (средний)
   `step ≥ pm_write_delay` **ИЛИ** `std(mlp_mod) ≥ pm_coh_gate_std=0.02`.
 
 - **Единый контроллер созревания (MaturationController, замена костылей).**
-  См. §18.1. Все «wake-up» сигналы (live-модуляция BridgeGLU, запись в
+  См. §19.1. Все «wake-up» сигналы (live-модуляция BridgeGLU, запись в
   `_private_mem`, injection семантического моста, intent-шина) масштабируются
   **одной** настраиваемой зрелостью слоя `M_l(t) ∈ [0,1]` =
   `max(time_ramp, bridge_readiness)`. При `M_l≈0` ветви закрыты, НО замороженный
@@ -509,21 +512,57 @@ L(n/3)..2n/3   → k=16  (средний)
 Совместно с VSA-памятью даёт две характеристики (центр и распределение),
 что стабилизирует чтение дальнего контекста.
 
-### 5.6 Коллективный концепт-слой
+### 5.6 Unified Concept Layer
 
-`CollectiveConceptLayer` — эмуляция «понятийных групп»:
+`UnifiedConceptLayer` (`core/concept_layer.py`) — единый концепт-слой,
+заменяющий `CollectiveConceptLayer` + `L3Concepts`. Ключевые принципы:
 
-- M: S=8 нормализованных центроидов в K-пространстве;
-- **адаптивная зрелость:** пока `cv = стд(residual)/сред` не опустится
-  ниже 1/λ в течение λ шагов подряд, слой не пишет (детектор новизны);
-- запись уверенных состояний: комбинация новизны (d_min > birth_gap*0.2)
-  и уверенности (conf > median);
-- чтение: softmax с температурой `_temp` по центроидам × occupation-веса
-  → линейная проекция `W_o` (ортогональная инициализация), ворота
-  `sigmoid(U-kappa·(pen-θ))` и `sigmoid(C·(cos − thresh))` — выход
-  гасится, пока модель неуверенна;
-- интегрируется во все слои (по умолчанию `collective_layer_idx=None`)
-  или только в один указанный слой.
+- **Все пороги через τ-field**: новизна, уверенность, момент обновления,
+  зрелость — никаких магических чисел
+- **Непрерывная зрелость**: sigmoid, не бинарный порог
+- **Градиент через путь записи**: нет `@torch.no_grad` на записях
+- **Per-expert внимание**: сохраняет ансамблевое разнообразие зеркала
+- **τ-driven novelty, confidence, update momentum**
+
+### Архитектура
+
+```
+S concept slots (keys в bridge_dim, vals в D)
+  ↓
+Per-expert similarity: (B, L, G, S) → gate-weighted → read (B, L, D)
+  ↓
+Write at sentence boundaries with τ-gated novelty
+  ↓
+Continuous maturity from residual variance CV
+```
+
+### Параметры
+
+| Параметр | Формула | Назначение |
+|---|---|---|
+| `log_tau_novelty` | `sigmoid(τ_novelty · (1 - best_sim))` | Вероятность "новизны" |
+| `log_tau_birth` | `sigmoid(τ_birth · confidence)` | Порог рождения |
+| `log_tau_update` | `α = 1/τ_update` | Скорость обновления |
+| `log_tau_maturity` | `sigmoid((1/cv - λ) · τ_mat)` | Непрерывная зрелость |
+| `log_tau_read` | temperature attention | Острота внимания при чтении |
+| `log_tau_gate` | `sigmoid(τ_gate · (gap - best_sim))` | Вероятность рождения |
+
+### Ключевые свойства
+
+- **S=8 концепт-слотов** (нормализованные ключи в bridge_dim, значения в D)
+- **Write path**: `hp expert K-space (B,L,G,k) → shared (B,L,k)`
+- **Read path**: `h D-space (B,L,D) → concept attention → out_proj`
+- **Maturity**: `sigmoid((1/cv - λ) · τ_mat)` — непрерывная зрелость
+- **Birth gate**: `sigmoid(τ_gate · (gap - best_sim))` — вероятность рождения
+- **Update momentum**: `α = 1/τ_update` — чем выше τ, тем медленнее обновление
+
+### Отличия от CollectiveConceptLayer
+
+1. **UnifiedConceptLayer** использует τ-field для всех порогов
+2. **Непрерывная зрелость** вместо бинарного порога
+3. **Градиент через путь записи** — нет `@torch.no_grad`
+4. **Per-expert внимание** — сохраняет ансамблевое разнообразие
+5. **Единый глобальный экземпляр** в стеке, вызывается после эмбеддинга
 
 ### 5.7 Переменная точность
 
@@ -659,7 +698,7 @@ cids  = proj.concept_spans(concept_id, write_event)  # id концепта на 
 зеркала/моста**: пер-экспертный гейт `mlp_mod` становится *живой функцией
 семантического состояния моста*, но **модулирует (не заменяет) замороженный
 стабильный бейзлайн** `sigmoid(mod_scale_mlp) ≈ 0.667`. Это сохраняет устойчивый
-MLP-пол (~0.667·usefulness) под тяжёлым aux-набором (`ranking~1e4`), который иначе
+MLP-пол (~0.667·usefulness) под тяжёлым aux-набором, который иначе
 расходился, когда BridgeGLU выбрасывал бейзлайн (cold-start `mlp_mod≈0.09`).
 
 ### 5.11.1 Ядро BridgeGLU (в ядре модели)
@@ -759,36 +798,49 @@ logprobs(target) = Σ актив. битов log σ(z̅) + Σ неактив. lo
 
 ---
 
-## 7. Λ_d иерархия
+## 7. Unified τ-field (TauConfig)
 
-Все «магические» константы системы — пороги, интервалы, множители LR —
-выводятся из одного числа λ_d:
+`TauConfig` (`core/tau_config.py`) — единое τ-поле, из которого выводятся
+**все** τ-зависимые величины архитектуры: временные масштабы VSA-памяти,
+задержки созревания, температуры гейтов, альфа-лестницы intent-потока,
+температуры memory bank и LLRD.
+
+### Формула (v2)
 
 ```
-λ_d — положительный корень уравнения  x^d = x^{d−1} + … + 1
-λ₂ = φ ≈ 1.618;  λ₃ ≈ 1.839;  λ_d → 2 при d → ∞
+log_tau = log(tau_min) + log(tau_max/tau_min) * (lf * (1 + 0.3 * dev) + 0.05)
+lf(l)  = l / (n_layers - 1)  ∈ [0, 1]
+dev(l) = tanh(_tau_dev[l])   ∈ [-1, +1]
+tau_l  = exp(log_tau)
 ```
 
-| Свойство | Формула | d=3 (λ≈1.839) |
+### Выводимые величины
+
+Из `tau_l` выводятся **ВСЕ** остальные τ-зависимые параметры:
+
+| Величина | Формула | Назначение |
 |---|---|---|
-| exploration threshold | `λ⁻²` | 0.296 |
-| differentiation threshold | `λ⁻⁴` | 0.087 |
-| b_i (ворота записи, expl=0/1) | −(λ+λ⁻¹) / −λ⁻¹ | −2.38 / −0.54 |
-| b_d (долгота памяти) | λ±1/λ | 2.38 / 1.29 |
-| w_mem2v_scale | λ⁻¹…1 | 0.544…1.0 |
-| EMA alpha | 1−λ⁻⁶ … 1−λ⁻⁸ | 0.974 … 0.992 |
-| noise_scale | λ⁻⁸ … λ⁻⁶ | 7.6e-3 … 2.6e-2 |
-| delta_var EMA | 1−λ⁻⁴ … 1−λ⁻⁸ | 0.913 … 0.992 |
-| gate_lr_mult | λ²/(λ−1) | ≈4.02 |
-| warmup_steps | F₁₀·λ | ≈101 |
-| eval_interval | F₁₃ | 233 |
-| save_interval | F₁₆ | 987 |
-| max_decay_steps | F₁₈ | 2584 |
-| log_scale_init_std | λ⁻⁴ | 0.087 |
+| `tau_norm_l` | `(log(tau_l) - log(tau_min)) / (log(tau_max) - log(tau_min))` | Нормализованный τ для созревания |
+| `mat_delay_l` | `T0 + (1 - tau_norm_l) * T_delay` | Задержка созревания слоя |
+| `gate_tau_l` | `tau_max_gate * (tau_min_gate / tau_max_gate) ^ mat_gate_l` | Температура гейтов (diversity vs precision) |
+| `alpha_l` | `1 - exp(-tau_l / tau_min)` | Скорость EMA интеграции |
+| `lr_mult_l` | `(tau_l / tau_ref) ^ (-gamma)` | Множитель LR по глубине (LLRD) |
+| `mem_tau_l` | `percentiles(tau_l)` | Температуры memory bank (L1=быстрый, L3=медленный) |
 
-Реализация: `core/lambda_utils.py` (`lambda_d`, `LambdaConfig`) и
-`WideBindConfig.__post_init__` → `_apply_lambda_d()` (галочка
-`lambda_d_enabled=True`).
+### Ключевые свойства
+
+- **Один обучаемый параметр** `_tau_dev` (n_layers) управляет всей
+  τ-геометрией: `dev(l) = tanh(_tau_dev[l])` ∈ [-1, +1]
+- **Мёртвая зона устранена**: добавлен `_LF_FLOOR=0.05` в формулу `lf`,
+  поэтому даже самый мелкий слой (lf=0) получает `tau_l ≈ tau_min * 1.03`
+  и имеет градиент
+- **Двусторонняя настройка**: `dev` может как ускорять (dev<0 → tau уменьшается),
+  так и замедлять (dev>0 → tau увеличивается) интеграцию по слоям
+- **Все пороги через sigmoid(τ·x)**: новизна, уверенность, момент обновления,
+  зрелость — никаких магических чисел
+
+Реализация: `core/tau_config.py` (`TauConfig`). Используется в `WideBindStack`
+как `self.tau_config`, интегрирован с `MaturationController` и `UnifiedConceptLayer`.
 
 ---
 
@@ -875,6 +927,10 @@ mult = (var_ratio × α_ratio × gate_ratio)^(1/3) · mag_factor · loss_lr_fact
 
 ### Вспомогательные (aux)
 
+Все значения возвращаются **сырыми (unweighted)** в `aux_dict`. Веса применяются
+**LossBalancer** (`core/adaptation.py`) — спектральное выравнивание (align mode)
+или масштабирование по величине (balance mode). Никаких магических весов в ядре.
+
 | Имя | Вес (deflt) | Формула/смысл |
 |---|---|---|
 | `pred` | 0.01 | ошибка предсказания α (hp_pred−hp), учит α-векторы |
@@ -888,14 +944,17 @@ mult = (var_ratio × α_ratio × gate_ratio)^(1/3) · mag_factor · loss_lr_fact
 | `w_m2v` | 0.01 | иерархия вклада памяти по τ слоёв (Proposal IV): обучаемый `_tau_l_dev[i]` тянет глубокие слои к бóльшему вкладу VSA-памяти |
 | `intent_tau` | 0.01 | собственный τ моста намерений: обучаемый `_tau_intent_dev[i]` тянет α intent-потока к иерархической цели (глубокие слои интегрируют intent сильнее); градиент в мост |
 | `branch` | 0 (по умолч.) | равенство лог-дисперсий ветвей (conv/bind/mirror) |
-| `div` | 50 | разнобразие log_scale: −(var(σ(ls),по экспертам) + √(d/G)·var(σ(ls),по каналам)) |
+| `div` | 10.0 | разнобразие log_scale: −(var(σ(ls),по экспертам) + √(d/G)·var(σ(ls),по каналам)) |
 | `gate_repulse` | 0.3 | поднятие дисперсии gates (−var(gate_usage)) |
 | `alpha_novelty` | 0.05 | разнообразие α по экспертам (var(α)) |
-| `ranking` | 0.01 | согласованность ранга: высокий ls ↔ высокий usage |
 | `decorr` | 0.01 | попарная ортогонализация сигналов зеркала |
 | `signal_ent` | 0.01 | энтропия весов сигналов (анти-равенство) |
 | `ls_reg` | 0.01 | L2 на log_scale выше 2.3 (анти-взрыв) |
 | `bridge_conn` | 0.1 (ноутбук) | **in-core** SemanticBridge (§5.11.2): разделяемая per-layer probe-голова на КАЖДОМ слое предсказывает эмбеддинг **следующего** токена; `loss = mean_l(1 − cos(s_l[:, :-1], emb_proj(embed_tokens(y[:,1:]))))`. Учит мост «правилам связи» без 168M softmax-головы; плотный градиент по глубине держит BridgeGLU-гейт живым (см. §5.11). Возвращается ядром (`Stack.compute_losses`). |
+| `mem_tau_reg` | — | регуляризация τ memory bank: soft weight-decay к prior + штраф за инверсию L1>L3 |
+| `tau_dev_reg` | 0.01 | L2 penalty на `_tau_dev` к нулю (центрирование τ-лестники) |
+| `lbg_diversity` | — | энтропия gate weights по слоям (анти-коллапс в один слой) |
+| `pred_w` | — | MSE(pred_w, I) — ортогональность матрицы предсказания |
 
 > **Примечание.** `bridge_conn` — единственная строка, появляющаяся только при
 > `cfg.bridge_conn > 0`; все остальные строки из ядра независимо от моста.
@@ -911,7 +970,6 @@ mult = (var_ratio × α_ratio × gate_ratio)^(1/3) · mag_factor · loss_lr_fact
 
 ```python
 branch:   Σ_пар (log var(‖conv‖) − log var(‖other‖))²
-ranking:  Σ relu(−(ls_i−ls_j)) · (gate_usage_i > gate_usage_j)
 div:      −(var_G(σ(ls)) + √(d/G)·var_k(σ(ls)))
 ls_reg:   mean(max(0, ls − 2.3)²)
 ```
@@ -924,17 +982,17 @@ ls_reg:   mean(max(0, ls − 2.3)²)
 
 1. **forward** (fp32/optional AMP) → `ce_loss, aux_dict`;
 2. **CE-градиенты**: полный `torch.autograd.grad` (retain);
-3. **Спектральное выравнивание** для Aligned aux:
-   `scale = clip(cos_sim(g_CE, g_aux), 0, 10) · ‖g_CE‖/‖g_aux‖` —
-   вся вспомогательная масса никогда не доминирует над CE-градиентом;
-4. **Bypass-потери** (div/gate_repulse/alpha_novelty/ranking/w_m2v/intent_tau) —
-   прибавляются в градиент БЕЗ масштабирования (сильный контроллер);
-5. **Phase-ratio** per-слой: `ratio = ‖g_mirror‖/‖g_base‖` →
+3. **LossBalancer** (`core/adaptation.py`):
+   - **Align mode (по умолчанию):** градиент aux проецируется на направление CE
+     (cosine-similarity gate) — aux никогда не доминирует над CE;
+   - **Balance mode:** каждый aux нормализуется по自己的 EMA-величине;
+4. **Phase-ratio** per-слой: `ratio = ‖g_mirror‖/‖g_base‖` →
    `irm = sigmoid((ratio−EMA)/std)` → умножается на все параметры
    зеркала слоя (0.2×…2.0×) — «развитие фазы»;
-6. **grad_clip** по норме параметров модели 0.5;
-7. **AdamW** (β=(0.9,0.95)), lr из групп (§8) + MirrorLR (§10);
-8. **Reasoning-петля** — чистый CE-контур: aux-потерь нет, её гейты
+5. **GradientClipper (AGC)**: адаптивный clip по соотношению ‖g‖/‖θ‖
+   (пропускает zero-init параметры);
+6. **AdamW** (β=(0.9,0.95)), lr из групп (§8) + MirrorLR (§10);
+7. **Reasoning-петля** — чистый CE-контур: aux-потерь нет, её гейты
    (`reasoning_gate`) обучаются в быстрой gate-группе (×λ¹, без decay);
    ramp `s = 1−exp(−t/1000)` подключает петлю плавно, straight-through
     держит градиенты гейтов живыми при закрытых шагах.
@@ -957,7 +1015,81 @@ best-anchored достижимые пороги (без «запирания» L
 
 ---
 
-## 13. Инференс-интерфейс
+## 13. Унифицированный адаптивный модуль (adaptation.py)
+
+`core/adaptation.py` — **единый принципиальный модуль** вместо разбросанных
+эмпирических костылей. Все контроллеры grounded в известных методах и
+используют данные вместо магических чисел.
+
+### Контроллеры
+
+| Контроллер | Метод | Описание |
+|---|---|---|
+| **LossBalancer** | PCGrad/GradDrop + GradNorm | Multi-task aux balancing без per-loss весов |
+| **DepthController** | Progressive unfreezing | Разморозка слоёв по плато val_loss |
+| **LRController** | Warmup + MirrorLR + ReduceLROnPlateau | Адаптивный LR с rewind при регрессе |
+| **FailureDetector** | SPC 3σ rule | Детекция взрыва CE, rollback к best.pt |
+| **GradientClipper** | AGC (Brock et al., 2021) | Адаптивный grad clip по соотношению ‖g‖/‖θ‖ |
+
+### LossBalancer — два режима
+
+**1. Align mode (по умолчанию):**
+```python
+# Градиент aux проецируется на направление CE
+scale = clip(cos_sim(g_CE, g_aux), 0, 10) * ‖g_CE‖ / ‖g_aux‖
+g_aux_aligned = scale * g_aux
+# Гарантия: aux никогда не доминирует над CE
+```
+
+**2. Balance mode:**
+```python
+# Каждый aux нормализуется по自己的 EMA-величине
+g_aux_balanced = g_aux / ema(|g_aux|) * budget
+# Budget адаптивно追踪|CE|
+```
+
+### DepthController — прогрессивная разморозка
+
+```python
+# Размораживаем следующий блок когда val_loss стагнирует
+slope = val_loss - prev_val_loss
+if slope > -k_sigma * std:  # стагнация
+    active_depth += unfreeze_inc
+```
+
+### FailureDetector — статистический детектор
+
+```python
+# SPC 3σ rule: CE > mean + k_sigma * std И ещё растёт
+if CE > ema + k_sigma * std and CE > prev_CE:
+    rollback_to_best()
+    rebuild_adam()
+    rewind_lr()
+```
+
+### GradientClipper (AGC)
+
+```python
+# Адаптивный clip: clip только если ‖g‖ > c * ‖θ‖
+for p in model.parameters():
+    if p.grad is None: continue
+    p_norm = p.data.norm()
+    g_norm = p.grad.data.norm()
+    if p_norm > eps:  # пропускаем zero-init параметры
+        clip_coef = max_norm / (g_norm / p_norm + 1e-6)
+        p.grad.data.mul_(min(clip_coef, 1.0))
+```
+
+### Ключевые принципы
+
+1. **Отказ от магических чисел**: все пороги/множители выводятся из λ_d
+2. **Данные вместо эврик**: LossBalancer использует статистику градиентов
+3. **Безопасность**: GradientClipper пропускает zero-init параметры
+4. **Восстановление**: FailureDetector делает rollback и rebuild Adam
+
+---
+
+## 14. Инференс-интерфейс
 
 ```python
 from core import LiveInference, MirrorMonitor
@@ -981,7 +1113,7 @@ summary = monitor.summary(50)         # последние 50 шагов
 состояния — векторы, не матрицы.
 
 ---
-## 14. Мост намерений (Intent Bridge) — неограниченный контекст
+## 15. Мост намерений (Intent Bridge) — неограниченный контекст
 
 `cfg.intent_bridge = True` включает **перетекающий по глубине per-head поток
 намерений** — кросс-слойный сигнал, по которому эксперты зеркала «ловят»
@@ -1069,7 +1201,7 @@ EMA `alpha_intent_l`. Глубокие слои (lf→1) получают бóл
 
 ---
 
-## 15. Streaming Memory Bank — иерархическая память L1+L2+L3
+## 16. Streaming Memory Bank — иерархическая память L1+L2+L3
 
 `cfg.memory_bank = True` включает **трёхуровневую стриминговую память**,
 сидящую ПОСЛЕ эмбеддинга и ПЕРЕД первым слоем. Память работает всегда
@@ -1182,25 +1314,30 @@ L1=258 L2=258 L3=1(1b) scale=-0.964
 
 ---
 
-## 16. Структура репозитория
+## 17. Структура репозитория
 
 ```
 WideBind/
 ├── core/                       # архитектура: весь код модели
 │   ├── config.py               # WideBindConfig + λ-иерархия
+│   ├── tau_config.py           # TauConfig: единое τ-поле (все τ-зависимые величины)
+│   ├── adaptation.py           # LossBalancer, DepthController, FailureDetector, AGC
 │   ├── compression.py          # FCF-CPR: сжатие/декомпрессия чекпоинтов (~8–16×)
 │   ├── lambda_utils.py         # LambdaConfig, λ_d, fib, производные
 │   ├── block.py                # WideBindBlock (пре-kernel)
-│   ├── stack.py                # WideBindStack, AdaptiveController,
-│   │                           #   MirrorLRScheduler, param_groups
+│   ├── stack.py                # WideBindStack, compute_losses, param_groups
 │   ├── bind.py                 # Bottleneck/Spiral/Trajectory(-Manifold)Bind,
 │   │                           #   когерентность спиралей (|Z|, freq_scale)
-│   ├── mirror.py               # GroupedCognitiveMirror (32 эксперта)
+│   ├── mirror.py               # GroupedCognitiveMirror (32 эксперта), BridgeGLU
+│   ├── bridge.py               # SemanticBridge: per-layer, depth+time, self-supervised
+│   ├── maturation.py           # MaturationController: единый time/τ-рамп созревания
+│   ├── concept_layer.py        # UnifiedConceptLayer: τ-driven концепты (замена CollectiveConceptLayer)
 │   ├── embedding.py            # PartitionedEmbedding, SigmoidCodedHead,
 │   │                           #   CognitiveCodedHead, LmHead…
-│   ├── concept_layer.py        # CollectiveConceptLayer
 │   ├── projector.py            # Projector — чтение слов из скрытого состояния
 │   ├── mlp.py                  # GroupedMLP (SwiGLU, G групп)
+│   ├── adaptive_gate.py        # hybrid_gate: sigmoid × softmax
+│   ├── layer_bridge_gate.py    # LayerBridgeGate, SpectrumGate
 │   ├── migrate.py              # migrate_state_dict: старые чекпоинты →
 │   │                           #   когерентность (W_out +K, gate=0, freq_scale=1)
 │   ├── vsa_utils.py            # DCT, Zeckendorf, sparse_codes, prefix-scan
@@ -1260,6 +1397,8 @@ cfg = WideBindConfig(D=2560, n_layers=24, bind_K=32, vocab=65536,
                      explicit_reasoning=True, use_amp=False,
                      intent_bridge=True, bridge_glu=True,
                      memory_bank=True,  # L1+L2+L3 streaming memory
+                     maturation_enabled=True,  # единый wake-up контроллер
+                     triad_reason=True,  # Рассудок-участник
                      mem_l1_slots=3, mem_l2_slots=16, mem_l3_concepts=8)
 model = WideBindStack(cfg).to('cuda')
 print(model.param_count())   # 191,372,273 (191.37M)
@@ -1273,7 +1412,7 @@ print(model.param_count())   # 191,372,273 (191.37M)
    (статика, wake-вердикт, live-разбор, head-анализ, сравнение нескольких чекпоинтов — одним вызовом).
    Дополнительно анализатор дампит **все мета-когнитивные буферы** (зрелость
    `mat_gate`/`mat_readiness` по слоям, `bridge_readiness`, `pen_init`/`pen_ema`)
-   в HTML-отчёт (`analyze_report.html`, секция META-COGNITION) — см. §18.
+   в HTML-отчёт (`analyze_report.html`, секция META-COGNITION) — см. §19.
 - **Дашборд лога обучения**: `python scripts/analyze.py --log logs/colab_run.txt`
    парсит лог Colab/ноутбука и строит HTML-дашборд **всех** метрик (20 SVG-спарклайнов
    + полная таблица + блоки EVAL/DepthController). Удобно для отслеживания
@@ -1287,7 +1426,7 @@ print(model.param_count())   # 191,372,273 (191.37M)
 
 ---
 
-## 17. Лицензия и статус
+## 18. Лицензия и статус
 
 **Экспериментально.** Архитектура активно развивается; API/конфиги могут
 меняться; чекпоинты совместимы между версиями только при строгой
@@ -1302,9 +1441,9 @@ print(model.param_count())   # 191,372,273 (191.37M)
 
 ---
 
-## 18. Механизмы созревания и замыкания Триады
+## 19. Механизмы созревания и замыкания Триады
 
-### 18.1 MaturationController — единый «wake-up» гейт по компетентности моста
+### 19.1 MaturationController — единый «wake-up» гейт по компетентности моста
 
 Живые ветви должны быть закрыты, пока веса нетренированы. Диагноз
 математический: блок `h_{l+1}=h_l+R_l(h_l)`, `R_l=Σ ветвей` (MLP в т.ч.),
@@ -1349,7 +1488,7 @@ M_l(t) = max(gate_l(t), bridge_readiness)                       # ветви о�
 Проверено на mini/smoke: `mat_gate≈0` в фазе warm, `mlp_mod` здоров (~0.33 =
 базовый гейт·usefulness, НЕ схлопнут), CE ограничен клиппером.
 
-### 18.2 SpectrumGate — гибрид sigmoid × softmax
+### 19.2 SpectrumGate — гибрид sigmoid × softmax
 
 `LayerBridgeGate` (`core/layer_bridge_gate.py`) управляет вкладом каждого слоя
 в семантический мост. Ключевая идея — **гибрид sigmoid × softmax**, который
@@ -1391,7 +1530,7 @@ gating). После — полный SpectrumGate с per-layer tau-driven divers
 Результат (fresh start 3, step 0→2097): val 11.07→10.64, CE(random) 68→25,
 maturation 0.055→0.088, все слои равномерно активны.
 
-### 18.3 Triad: Рассудок как участник (замыкание Триады)
+### 19.3 Triad: Рассудок как участник (замыкание Триады)
 
 Манифест требует, чтобы Рассудок не просто верифицировал готовый ствол, а
 **участвовал** в его формировании. Реализовано в `core/stack.py` как
@@ -1409,12 +1548,16 @@ maturation 0.055→0.088, все слои равномерно активны.
   пассивного читателя в активного участника петли самокоррекции (Рассудок =
   субъект, а не судья).
 
-## 19. Текущий статус обучения
+## 20. Текущий статус обучения
 
 Актуальный контрольный контур — `notebooks/colab.ipynb` (Colab T4, fp32,
 `use_amp=False`).
 
 **Ключевые изменения архитектуры:**
+- **Unified τ-field (TauConfig)** — единое τ-поле для всех τ-зависимых величин
+- **MaturationController** — единый time/τ-рамп созревания вместо костылей
+- **UnifiedConceptLayer** — замена CollectiveConceptLayer + L3Concepts, τ-driven
+- **LossBalancer** — LossBalancer (PCGrad/GradDrop) вместо эмпирических весов
 - **Hybrid attention везде** — `_memory_attention()`, cascade mixing, manifold beam read: `gate = sigmoid(scores) * (1 + softmax(scores/tau))`
 - `log_temp` → `log_tau` (единое имя параметров в memory_bank.py)
 - L2 keys: `F.normalize() + sigmoid(key_log_scale)`
