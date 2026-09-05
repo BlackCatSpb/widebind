@@ -242,7 +242,15 @@ def train(cfg=None, resume_path=None):
         sd, n_migrated = migrate_state_dict(sd, model)
         if n_migrated:
             print(f'  MIGRATED {n_migrated} keys (W_out +K, bind_coh_gate=0, freq_scale=1.0) — старое поведение сохранено')
-        missing, unexpected = model.load_state_dict(sd, strict=False)
+        # Filter size-mismatched keys (e.g. L2 slots changed 16->32)
+        _model_sd = model.state_dict()
+        _filtered = {}
+        for k, v in sd.items():
+            if k in _model_sd and _model_sd[k].shape != v.shape:
+                print(f'  SKIP size-mismatch: {k} ckpt={list(v.shape)} model={list(_model_sd[k].shape)}')
+            else:
+                _filtered[k] = v
+        missing, unexpected = model.load_state_dict(_filtered, strict=False)
         if getattr(cfg, 'reset_skip_alpha', False):
             nzero = 0
             for layer in model.layers:
