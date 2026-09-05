@@ -948,7 +948,7 @@ def parse_training_log(path):
       aux   : {metric: [val,...]}             — ВСЕ aux: ключи (alpha_novelty, balance,
                                                 branch, bridge_conn, decorr, div, diversity,
                                                 gate_l1, gate_repulse, gradalign, intent_tau,
-                                                ls_reg, nuc, pred, ranking, reinforce,
+                                                 ls_reg, nuc, pred, reinforce,
                                                 signal_ent, w_m2v, ...)
       eval  : [(step, val_loss, val_ppl), ...]
       depth : [(step, active, total), ...]
@@ -1076,7 +1076,7 @@ def render_log_html(data, outpath):
     chart_metrics = [('ce', '#ff7b72'), ('mat', '#79c0ff'), ('mat_min', '#a5d6ff'),
                      ('mod_mlp', '#7ee787'), ('bridge_conn', '#d2a8ff'), ('branch', '#e3b341'),
                      ('pred', '#ffa657'), ('gradalign', '#56d364'), ('diversity', '#79c0ff'),
-                     ('ranking', '#f0883e'), ('gate_l1', '#58a6ff'), ('intent_w', '#ff7b72'),
+                     ('gate_l1', '#58a6ff'), ('intent_w', '#ff7b72'),
                      ('usef', '#7ee787'), ('div', '#e3b341'), ('decorr', '#79c0ff'),
                      ('reinforce', '#d2a8ff'), ('ls_reg', '#56d364'), ('nuc', '#f0883e'),
                      ('tok_s', '#8b949e'), ('lr', '#a5d6ff')]

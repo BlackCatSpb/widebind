@@ -436,7 +436,6 @@ Maturation gate M_l(t) per layer
 |------|--------|---------|
 | CE | 1.0 | Main language modeling |
 | bridge_conn | 0.1 | Bridge next-token prediction |
-| ranking | 0.01 | Expert gate ordering |
 | diversity | 0.001 | Decorrelate expert outputs |
 | balance | 0.026 | Load balancing across experts |
 | gate_repulse | 0.3 | Push gate variance up |

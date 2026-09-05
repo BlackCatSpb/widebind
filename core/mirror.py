@@ -285,9 +285,8 @@ class GroupedCognitiveMirror(nn.Module):
         self.bridge_glu_net = BridgeGLU(self.G, self.k) if bridge_glu else None
         # BridgeGLU modulation strength around the FROZEN stable baseline. The
         # learnable gate must MODULATE the proven-stable sigmoid(mod_scale_mlp)
-        # anchor, not replace it — otherwise the stable ~0.667 MLP floor vanishes
-        # and the heavy aux suite (ranking~1e4) diverges the run. Centre-zero so
-        # init mlp_mod ≈ baseline; live semantic gate modulates ±beta around it.
+        # anchor, not replace it — otherwise the stable ~0.667 MLP floor vanishes.
+        # Centre-zero so init mlp_mod ≈ baseline; live semantic gate modulates ±beta around it.
         self.bridge_glu_beta = bridge_glu_beta
         # Softmax temperature: >1 = softer (uniform), <1 = sharper (winner-take-all)
         self.register_buffer('_usefulness_temp', torch.tensor(2.0), persistent=False)

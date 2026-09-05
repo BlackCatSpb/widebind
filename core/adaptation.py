@@ -16,8 +16,7 @@ Controllers
         a la PCGrad (Yu et al., 2020) / GradDrop.  The aux gradient added to
         parameters is bounded by ``||g_CE||`` and only applied when it agrees
         with the main-task direction.  This *guarantees* aux losses cannot
-        hijack the update (the exact failure we hit: ``ranking`` ~200 dominated
-        and diverged CE).
+        hijack the update.
       - ``mode='balance'``: each aux is divided by a running EMA of its own
         magnitude (dimensionless/unit scale) and the block scaled by an adaptive
         budget so it tracks ``|CE|`` (scale-invariant balancing, cf. Kendall &
@@ -427,8 +426,8 @@ class LossBalancer:
         scale      = clamp(cos, 0, cap) · ||g_CE|| / (||g_aux|| + ε)
         g_final    = g_CE + scale · g_aux
       Adding aux only along the CE direction, and only when cos>0, *bounds* the
-      aux contribution by ||g_CE|| — aux losses can never hijack the update
-      (the ``ranking``~200 dominance bug).  This is gradient surgery
+      aux contribution by ||g_CE|| — aux losses can never hijack the update.
+      This is gradient surgery
       (PCGrad/Yu et al. 2020); the combined-aux variant keeps it O(1) backward.
 
     ``mode='balance'``: dimensionless per-aux normalisation by a running EMA of

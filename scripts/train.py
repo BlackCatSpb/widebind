@@ -415,12 +415,12 @@ def train(cfg=None, resume_path=None):
             # ||g_CE|| so it can never hijack the update. Under AMP the losses are
             # scaled so the grads survive GradScaler.unscale_/step.
             # P1 FIX: Anneal noisy auxiliary losses over training (τ-gated timescale)
-            # ranking, branch, diversity add 3-5k noise early → mask real signal.
+            # branch, diversity add noise early → mask real signal.
             # Warm-restart: linearly ramp from 0→1 over τ_anneal steps (default 5000).
             if global_step > 0:
                 _anneal_tau = getattr(cfg, 'aux_anneal_tau', 5000)
                 _anneal = min(1.0, global_step / _anneal_tau)
-                for _k in ('ranking', 'branch', 'diversity'):
+                for _k in ('branch', 'diversity'):
                     if _k in aux_dict and isinstance(aux_dict[_k], torch.Tensor):
                         aux_dict[_k] = aux_dict[_k] * _anneal
             gscale = scaler.get_scale() if use_amp else 1.0

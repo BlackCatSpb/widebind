@@ -267,11 +267,10 @@
 Ranking loss монотонно рос: 3917→7970 за 700 шагов (×2), загрязняя `aux_total` и доминируя в `||g_aux||`.
 
 ### Решение
-τ-gated ranking: `ranking *= sigmoid(tau_rank * (ls_spread - threshold))`
-- `log_tau_ranking` — learnable param (expponential gate)
-- `ranking_threshold` — learnable threshold
-- Gate автоматически выключает ranking при низком ls_spread (модель стабильна)
-- Gate включает ranking при высоком ls_spread (нужен порядок)
+~~τ-gated ranking~~ **REMOVED** (ranking_weight=0.0). Ranking loss was unbounded,
+grew 4000→15000+ while CE stayed 7-9, τ-gating stuck at 0.5. Effective contribution
+was dominated by LossBalancer spectral alignment. div + gate_repulse + signal_ent
+provide equivalent regularization (all bounded). Ranking added no unique signal.
 
 ### Результаты (smoke test)
 | Config | ranking |

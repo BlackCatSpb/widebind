@@ -148,7 +148,6 @@ class WideBindConfig:
     log_scale_l2_weight: float = 0.01  # L2 on exp(log_scale) > 10 to prevent gradient explosion
     orth_weight: float = 0.0  # ortho-gran loss; 0=off (32x D²=4096² gram graphs cost 2GB+ VRAM)
     div_weight: float = 10.0   # sigmoid-bounded log_scale divergence (bypasses spectral alignment)
-    ranking_weight: float = 0.01  # pairwise order ls_mean by gate_usage (bypasses spectral alignment)
     gate_repulse_weight: float = 0.3  # push gate variance up (inverse of balance, bypasses spectral)
     alpha_novelty_weight: float = 0.05  # push per-expert alpha apart (heuristic, no spectral)
     gate_bias_scale: float = 2.0  # linspace init for gate bias per expert [-scale, scale]
@@ -274,8 +273,7 @@ class WideBindConfig:
     # bridge_glu_beta: modulation strength of the live BridgeGLU gate AROUND the
     # frozen stable baseline (sigmoid(mod_scale_mlp) ~ 0.667). BridgeGLU MODULATES
     # the baseline (mlp_mod = base * (1 + beta*(2*glu-1))); it does NOT replace it.
-    # This keeps the run stable under the heavy aux suite (ranking~1e4) while the
-    # gate stays input/semantic-live. 0.25 = sane default.
+    # This keeps the run stable while the gate stays input/semantic-live. 0.25 = sane default.
     bridge_glu_beta: float = 0.25
 
     # bridge_conn: weight of the per-layer in-pipeline semantic bridge aux loss.
